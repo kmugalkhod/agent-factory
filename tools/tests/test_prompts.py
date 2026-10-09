@@ -87,10 +87,16 @@ def test_prompt_reads_intent(role: str) -> None:
 
 
 @pytest.mark.parametrize("role", ROLES)
-def test_prompt_leaves_push_rebase_and_merge_to_the_engine(role: str) -> None:
+def test_prompt_forbids_every_git_command(role: str) -> None:
+    """Agents never run git; the engine commits after each passing stage gate."""
     text = prompt(role)
-    for command in ("git push", "rebase", "merge"):
-        assert command in text
+    assert "Never run `git`" in text
+    assert "The engine commits" in text
+
+
+@pytest.mark.parametrize("name", [*ROLES, "bootstrap"])
+def test_prompt_never_suggests_a_git_command(name: str) -> None:
+    assert re.findall(r"`git[^`]*`", prompt(name)) in ([], ["`git`"])
 
 
 def test_tester_requires_tests_that_fail_before_the_build() -> None:

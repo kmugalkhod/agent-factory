@@ -40,7 +40,8 @@ Shell commands: none
 - `review.md` in the run folder is your only output. It also serves as your handoff, so you
   write no separate handoff file.
 - You don't run tests; the engine already did. Read files and the diff only.
-- Never run `git push`, rebase, merge, `reset --hard` or delete branches.
+- Never run `git`, not even to look or commit. The engine commits your work once your stage's
+  gate passes, and does every push, rebase and merge.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish
