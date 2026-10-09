@@ -68,7 +68,7 @@ Goal: the files every stage writes and reads exist, the role prompts and factory
 - **Tests:** `tools/tests/test_dev.py` checks part selection, the skip message for missing parts, and that a non-zero exit is propagated (using a stub runner).
 - **Depends on:** S.1, S.2
 
-### [ ] 1.2 Run document templates
+### [x] 1.2 Run document templates
 
 - **What:** Write `intent.md`, `plan.md`, `handoff.md`, `review.md` and `report.md`, each at most one page. Fix the exact headings the engine gates will parse later, and document them in `templates/README.md`.
 - **Touches:** `templates/`, `tools/tests/`
