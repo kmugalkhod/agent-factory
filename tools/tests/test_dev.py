@@ -178,19 +178,22 @@ def test_bad_arguments_exit_with_usage_error(tmp_path: Path, argv: tuple[str, ..
 
 
 class FakeProc:
-    """Stands in for subprocess.Popen; `wait` returns `code` or raises `wait_error` once."""
+    """Stands in for a started process; `wait` returns `code` or raises `wait_error` once."""
 
-    instances: list["FakeProc"] = []
-
-    def __init__(self, args: list[str], **kwargs: object) -> None:
+    def __init__(
+        self,
+        args: list[str],
+        kwargs: dict[str, object],
+        code: int,
+        wait_error: BaseException | None,
+    ) -> None:
         self.args = args
         self.kwargs = kwargs
         self.pid = 4242
-        self.code = 0
-        self.wait_error: BaseException | None = None
+        self.code = code
+        self.wait_error = wait_error
         self.waits = 0
         self.killed = False
-        FakeProc.instances.append(self)
 
     def kill(self) -> None:
         self.killed = True
@@ -203,32 +206,49 @@ class FakeProc:
         return self.code
 
 
+class FakePopen:
+    """Replaces subprocess.Popen for one test and records every process it starts."""
+
+    def __init__(self) -> None:
+        self.procs: list[FakeProc] = []
+        self.code = 0
+        self.wait_error: BaseException | None = None
+        self.start_error: Callable[[list[str]], OSError | None] = lambda args: None
+
+    def __call__(self, args: list[str], **kwargs: object) -> FakeProc:
+        error = self.start_error(args)
+        if error is not None:
+            raise error
+        proc = FakeProc(args, kwargs, self.code, self.wait_error)
+        self.procs.append(proc)
+        return proc
+
+
 @pytest.fixture
-def fake_popen(monkeypatch: pytest.MonkeyPatch) -> type[FakeProc]:
-    FakeProc.instances = []
+def fake_popen(monkeypatch: pytest.MonkeyPatch) -> FakePopen:
+    popen = FakePopen()
     monkeypatch.setattr(dev.shutil, "which", lambda name: f"C:/bin/{name}.exe")
-    monkeypatch.setattr(dev.subprocess, "Popen", FakeProc)
-    return FakeProc
+    monkeypatch.setattr(dev.subprocess, "Popen", popen)
+    return popen
 
 
 def test_real_runner_reports_a_missing_tool(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    fake_popen: FakePopen,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
-    started: list[object] = []
     monkeypatch.setattr(dev.shutil, "which", lambda name: None)
-    monkeypatch.setattr(dev.subprocess, "Popen", lambda *a, **k: started.append(a))
     code = dev.run_command(["pnpm", "test"], tmp_path)
     assert code != 0
-    assert started == []
+    assert fake_popen.procs == []
     assert "pnpm not found" in capsys.readouterr().err
 
 
-def test_real_runner_starts_the_resolved_tool_safely(
-    fake_popen: type[FakeProc], tmp_path: Path
-) -> None:
+def test_real_runner_starts_the_resolved_tool_safely(fake_popen: FakePopen, tmp_path: Path) -> None:
     code = dev.run_command(["uv", "run", "pytest"], tmp_path)
     assert code == 0
-    (proc,) = fake_popen.instances
+    (proc,) = fake_popen.procs
     assert proc.args == ["C:/bin/uv.exe", "run", "pytest"]
     assert proc.kwargs["cwd"] == tmp_path
     assert proc.kwargs["encoding"] == "utf-8"
@@ -236,70 +256,71 @@ def test_real_runner_starts_the_resolved_tool_safely(
     assert not proc.kwargs.get("shell")
 
 
-def test_real_runner_returns_the_child_exit_code(
-    fake_popen: type[FakeProc], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    def failing(args: list[str], **kwargs: object) -> FakeProc:
-        proc = FakeProc(args, **kwargs)
-        proc.code = 3
-        return proc
-
-    monkeypatch.setattr(dev.subprocess, "Popen", failing)
+def test_real_runner_returns_the_child_exit_code(fake_popen: FakePopen, tmp_path: Path) -> None:
+    fake_popen.code = 3
     assert dev.run_command(["uv", "sync"], tmp_path) == 3
 
 
 def test_real_runner_reports_a_tool_that_cannot_start(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    fake_popen: FakePopen, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    def broken(*args: object, **kwargs: object) -> None:
-        raise OSError("bad interpreter")
-
-    monkeypatch.setattr(dev.shutil, "which", lambda name: f"C:/bin/{name}.exe")
-    monkeypatch.setattr(dev.subprocess, "Popen", broken)
+    fake_popen.start_error = lambda args: OSError("bad interpreter")
     code = dev.run_command(["uv", "sync"], tmp_path)
     assert code != 0
     assert "bad interpreter" in capsys.readouterr().err
 
 
 def test_a_tool_that_cannot_start_does_not_stop_later_checks(
-    fake_popen: type[FakeProc], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    fake_popen: FakePopen, tmp_path: Path
 ) -> None:
-    def first_breaks(args: list[str], **kwargs: object) -> FakeProc:
-        if "engine/tests" in args:
-            raise OSError("bad interpreter")
-        return FakeProc(args, **kwargs)
-
-    monkeypatch.setattr(dev.subprocess, "Popen", first_breaks)
+    fake_popen.start_error = lambda args: OSError("bad") if "engine/tests" in args else None
     root = make_repo(tmp_path, PY_PARTS)
     code = dev.main(["test"], root=root)
     assert code != 0
-    assert [p.args[-1] for p in fake_popen.instances] == ["cli/tests", "tools/tests"]
+    assert [p.args[-1] for p in fake_popen.procs] == ["cli/tests", "tools/tests"]
 
 
 def test_timeout_stops_the_whole_process_tree(
-    fake_popen: type[FakeProc],
+    fake_popen: FakePopen,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    def hangs(args: list[str], **kwargs: object) -> FakeProc:
-        proc = FakeProc(args, **kwargs)
-        proc.wait_error = dev.subprocess.TimeoutExpired(args, dev.TIMEOUT_SECONDS)
-        return proc
-
+    fake_popen.wait_error = dev.subprocess.TimeoutExpired("uv", dev.TIMEOUT_SECONDS)
     stopped: list[FakeProc] = []
-    monkeypatch.setattr(dev.subprocess, "Popen", hangs)
     monkeypatch.setattr(dev, "stop_tree", stopped.append)
     code = dev.run_command(["uv", "run", "pytest"], tmp_path)
     assert code != 0
-    (proc,) = fake_popen.instances
-    assert stopped == [proc]
+    assert stopped == fake_popen.procs
     assert "stopped" in capsys.readouterr().err
+
+
+def test_ctrl_c_stops_the_whole_process_tree_and_reraises(
+    fake_popen: FakePopen, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_popen.wait_error = KeyboardInterrupt()
+    stopped: list[FakeProc] = []
+    monkeypatch.setattr(dev, "stop_tree", stopped.append)
+    with pytest.raises(KeyboardInterrupt):
+        dev.run_command(["uv", "run", "pytest"], tmp_path)
+    assert stopped == fake_popen.procs
+    assert len(stopped) == 1
+
+
+def test_ctrl_c_skips_the_remaining_checks(
+    fake_popen: FakePopen, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fake_popen.wait_error = KeyboardInterrupt()
+    monkeypatch.setattr(dev, "stop_tree", lambda proc: None)
+    root = make_repo(tmp_path, PY_PARTS)
+    with pytest.raises(KeyboardInterrupt):
+        dev.main(["test"], root=root)
+    assert len(fake_popen.procs) == 1
 
 
 @pytest.mark.skipif(dev.sys.platform != "win32", reason="Windows process tree")
 def test_stop_tree_kills_children_and_waits_on_windows(
-    fake_popen: type[FakeProc], monkeypatch: pytest.MonkeyPatch
+    fake_popen: FakePopen, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls: list[list[str]] = []
 
@@ -308,7 +329,7 @@ def test_stop_tree_kills_children_and_waits_on_windows(
         return dev.subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(dev.subprocess, "run", fake_run)
-    proc = FakeProc(["uv"])
+    proc = fake_popen(["uv"])
     dev.stop_tree(proc)  # pyright: ignore[reportArgumentType] -- FakeProc stands in for Popen
     assert calls == [["taskkill", "/F", "/T", "/PID", "4242"]]
     assert proc.waits == 1
@@ -316,13 +337,13 @@ def test_stop_tree_kills_children_and_waits_on_windows(
 
 @pytest.mark.skipif(dev.sys.platform != "win32", reason="Windows process tree")
 def test_stop_tree_falls_back_to_kill_when_taskkill_cannot_start(
-    fake_popen: type[FakeProc], monkeypatch: pytest.MonkeyPatch
+    fake_popen: FakePopen, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def broken(*args: object, **kwargs: object) -> None:
         raise OSError("taskkill missing")
 
     monkeypatch.setattr(dev.subprocess, "run", broken)
-    proc = FakeProc(["uv"])
+    proc = fake_popen(["uv"])
     dev.stop_tree(proc)  # pyright: ignore[reportArgumentType] -- FakeProc stands in for Popen
     assert proc.killed
     assert proc.waits == 1

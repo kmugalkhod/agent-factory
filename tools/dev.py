@@ -54,6 +54,10 @@ def run_command(cmd: list[str], cwd: Path) -> int:
             f"error: {' '.join(cmd)} took over {TIMEOUT_SECONDS}s and was stopped", file=sys.stderr
         )
         return 124
+    except KeyboardInterrupt:
+        # On POSIX the child is in its own session, so Ctrl-C doesn't reach it.
+        stop_tree(proc)
+        raise
 
 
 def stop_tree(proc: subprocess.Popen[str]) -> None:
