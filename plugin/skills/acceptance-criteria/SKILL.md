@@ -28,15 +28,16 @@ skill covers the rest of the plan.
    - a state: a file exists, a field is set, a row is written
 3. Add criteria for the edges the request implies: empty input, invalid input, errors, limits.
 4. Add one criterion that existing behaviour is unchanged, when the change touches code that
-   already works.
+   already works. Its test passes before the build as well as after; that is expected.
 5. For each criterion, write at least one test case that names it (`AC1`, `AC2`, ...). Give
    each test a name the tester can use as is.
 6. Check the result with the questions below.
 
 ## Checks
 
-- Can the tester write a test that fails today and passes after the change? If not, the
-  criterion isn't measurable yet.
+- For new or changed behaviour: can the tester write a test that fails today and passes after
+  the change? If not, the criterion isn't measurable yet. A criterion that existing behaviour
+  is unchanged (step 4) is the exception: its test passes today and must still pass after.
 - Does each criterion test one thing? Split "A and B" into two.
 - Does every criterion have at least one test case, and does every test case name a criterion?
 - Is any requirement in `intent.md` missing? Add a criterion or ask under Questions.
