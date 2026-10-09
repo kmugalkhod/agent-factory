@@ -10,7 +10,7 @@ A local system that turns a request (new project, feature or spec) into a review
 1. **Follow the design.** Build what `docs/design/design.md` says. If a task seems to need something different, stop and ask. Don't silently deviate. Record any agreed deviation in the milestone summary.
 2. **Take the next task.** Work on the first unchecked task in `docs/task/task.md` whose dependencies are all checked. One task at a time; don't start the next one in the same commit.
 3. **Tests first.** Write the task's tests, run them and see them fail for the right reason. Then write the code. Before calling a task done, run `uv run tools/dev.py test` and `uv run tools/dev.py lint` for the whole repo; both must pass.
-4. **Tick and commit.** Mark the task `[x]` in `docs/task/task.md` in the same commit as the code. Commit message: `<task id>: <title>`, for example `2.4: Event stream`.
+4. **Tick and commit.** Mark the task `[x]` in `docs/task/task.md` in the same commit as the code. When a milestone changes status, update its row and add a log line in `docs/task/index.md`. Commit message: `<task id>: <title>`, for example `2.4: Event stream`.
 5. **Stop at milestone ends.** After the last task of a milestone, don't start the next one. Write a summary covering:
    - what was built
    - what was tested (commands and results)
