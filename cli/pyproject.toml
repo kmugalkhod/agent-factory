@@ -1,0 +1,17 @@
+[project]
+name = "factory-cli"
+version = "0.1.0"
+description = "The `factory` command for the agent factory."
+requires-python = ">=3.12,<3.13"
+dependencies = ["factory-engine"]
+
+[tool.uv.sources]
+factory-engine = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "factory_cli"
+module-root = ""

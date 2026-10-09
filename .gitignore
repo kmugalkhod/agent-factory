@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Node (milestone 6)
+node_modules/
+ui/dist/
+
+# Secrets and local settings
+.env
+.env.*
+*.local.json
+
+# Editors and OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -56,7 +56,7 @@ Manual, done by Kunal. Not commits.
 
 Goal: the files every stage writes and reads exist, the role prompts and factory skills exist, and one real task done by hand with them is good enough to merge.
 
-### [ ] 1.1 Repo skeleton and dev tool
+### [x] 1.1 Repo skeleton and dev tool
 
 - **What:** Create the uv workspace with the `engine` and `cli` packages (empty modules, one trivial test each), shared ruff/pyright/pytest config, and `tools/dev.py` with `setup`, `test` and `lint`, each taking an optional part (`engine`, `cli`, `plugin`, `ui`, `all`). Parts that don't exist yet are skipped with a message.
 - **Touches:** `pyproject.toml` (workspace root), `engine/`, `engine/tests/`, `cli/`, `tools/dev.py`, `tools/tests/`, `.gitignore`, `.python-version`
