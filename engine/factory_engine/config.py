@@ -1,16 +1,17 @@
 """Settings models, defaults, merge (run > repo > global) and load/dump of config files."""
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from factory_engine.errors import ConfigError
 
 LogicalModel = Literal["opus", "sonnet", "haiku"]
 Effort = Literal["low", "normal", "high"]
 CommandName = Literal["test", "build", "lint", "smoke"]
+PositiveCap = Annotated[int, Field(gt=0)]
 
 
 class _Model(BaseModel):
@@ -42,12 +43,12 @@ class Commands(_Model):
 
 
 class Caps(_Model):
-    planner_attempts: int
-    tester_attempts: int
-    builder_attempts: int
-    max_turns: int
-    max_minutes: int
-    stall_minutes: int
+    planner_attempts: PositiveCap
+    tester_attempts: PositiveCap
+    builder_attempts: PositiveCap
+    max_turns: PositiveCap
+    max_minutes: PositiveCap
+    stall_minutes: PositiveCap
 
 
 class CriticalFlow(_Model):
@@ -55,21 +56,29 @@ class CriticalFlow(_Model):
     tests: list[str]
 
 
+# Patch fields that `Settings` doesn't allow to be null are typed without `None` and default
+# to `Field(default=None)`. Pydantic doesn't validate defaults, so an unset field passes,
+# while an explicit null fails at load time with the file and key path. Only `exclude_unset`
+# dumps are used for patches, so the placeholder never reaches a merge.
+def _unset() -> Any:
+    return Field(default=None)
+
+
 class RolePatch(_Model):
-    model: LogicalModel | None = None
-    effort: Effort | None = None
-    write_paths: list[str] | None = None
-    deny_paths: list[str] | None = None
-    shell_read_only: bool | None = None
-    shell_allowlist: list[CommandName] | None = None
+    model: LogicalModel = _unset()
+    effort: Effort = _unset()
+    write_paths: list[str] = _unset()
+    deny_paths: list[str] = _unset()
+    shell_read_only: bool = _unset()
+    shell_allowlist: list[CommandName] = _unset()
     skills: list[str] | None = None
 
 
 class RolesPatch(_Model):
-    planner: RolePatch | None = None
-    tester: RolePatch | None = None
-    builder: RolePatch | None = None
-    reviewer: RolePatch | None = None
+    planner: RolePatch = _unset()
+    tester: RolePatch = _unset()
+    builder: RolePatch = _unset()
+    reviewer: RolePatch = _unset()
 
 
 class CommandsPatch(_Model):
@@ -80,12 +89,12 @@ class CommandsPatch(_Model):
 
 
 class CapsPatch(_Model):
-    planner_attempts: int | None = None
-    tester_attempts: int | None = None
-    builder_attempts: int | None = None
-    max_turns: int | None = None
-    max_minutes: int | None = None
-    stall_minutes: int | None = None
+    planner_attempts: PositiveCap = _unset()
+    tester_attempts: PositiveCap = _unset()
+    builder_attempts: PositiveCap = _unset()
+    max_turns: PositiveCap = _unset()
+    max_minutes: PositiveCap = _unset()
+    stall_minutes: PositiveCap = _unset()
 
 
 class Bootstrap(_Model):
@@ -105,18 +114,18 @@ class Settings(_Model):
 
 
 class SettingsPatch(_Model):
-    roles: RolesPatch | None = None
-    commands: CommandsPatch | None = None
-    caps: CapsPatch | None = None
-    provider: str | None = None
+    roles: RolesPatch = _unset()
+    commands: CommandsPatch = _unset()
+    caps: CapsPatch = _unset()
+    provider: str = _unset()
     allowed_providers: list[str] | None = None
-    isolation: Literal["worktree", "sandbox"] | None = None
-    sandbox_required: bool | None = None
-    critical_flows: list[CriticalFlow] | None = None
+    isolation: Literal["worktree", "sandbox"] = _unset()
+    sandbox_required: bool = _unset()
+    critical_flows: list[CriticalFlow] = _unset()
 
 
 class GlobalPatch(SettingsPatch):
-    bootstrap: Bootstrap | None = None
+    bootstrap: Bootstrap = _unset()
 
 
 def default_settings(platform: str) -> Settings:
@@ -185,6 +194,13 @@ def _deep_merge(base: dict[str, Any], top: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _settings_dict(settings: Settings) -> dict[str, Any]:
+    """Full dump, except `bootstrap` keeps only the keys that were set (it is a patch)."""
+    out = settings.model_dump()
+    out["bootstrap"] = settings.bootstrap.model_dump(exclude_unset=True)
+    return out
+
+
 def merge_settings(
     global_settings: Settings,
     repo: SettingsPatch | None = None,
@@ -193,8 +209,7 @@ def merge_settings(
     bootstrap: bool = False,
 ) -> Settings:
     """Merge run > repo > global. With `bootstrap`, the builder patch sits above global."""
-    merged = global_settings.model_dump()
-    merged["bootstrap"] = global_settings.bootstrap.model_dump(exclude_unset=True)
+    merged = _settings_dict(global_settings)
     if bootstrap:
         patch = global_settings.bootstrap.builder.model_dump(exclude_unset=True)
         merged = _deep_merge(merged, {"roles": {"builder": patch}})
@@ -239,6 +254,8 @@ def _read_yaml(path: Path) -> object:
         text = path.read_text(encoding="utf-8")
     except OSError as err:
         raise ConfigError(f"{path}: cannot read file ({err}). Check the path exists.") from err
+    except UnicodeDecodeError as err:
+        raise ConfigError(f"{path}: not valid UTF-8 ({err}). Save the file as UTF-8.") from err
     try:
         return yaml.safe_load(text)
     except yaml.YAMLError as err:
@@ -256,9 +273,7 @@ def load_global_settings(path: Path | None, platform: str) -> Settings:
     if path is None:
         return base
     patch = _validate(GlobalPatch, _read_yaml(path), str(path))
-    merged = base.model_dump()
-    merged["bootstrap"] = base.bootstrap.model_dump(exclude_unset=True)
-    merged = _deep_merge(merged, patch.model_dump(exclude_unset=True))
+    merged = _deep_merge(_settings_dict(base), patch.model_dump(exclude_unset=True))
     try:
         return Settings.model_validate(merged)
     except ValidationError as err:
