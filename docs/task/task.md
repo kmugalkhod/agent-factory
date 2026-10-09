@@ -95,7 +95,7 @@ Goal: the files every stage writes and reads exist, the role prompts and factory
 - **Tests:** `tools/tests/test_prompts.py` checks that each prompt mentions its output file, `handoff`, and its allowed paths.
 - **Depends on:** 1.2
 
-### [ ] 1.4 Factory-wide skills
+### [x] 1.4 Factory-wide skills
 
 - **What:** Write the factory skills the agents use: `write-plan`, `write-handoff`, `review-rubric` and `acceptance-criteria`. Each skill points at its template and gives a short procedure with examples.
 - **Touches:** `plugin/skills/<name>/SKILL.md`, `tools/tests/`
