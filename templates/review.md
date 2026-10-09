@@ -18,7 +18,7 @@ risk, a weakened test). Minor: should be fixed, but doesn't block. Nit: style or
 
 - [Important] `<path>:<line>`: <problem>. Fix: <what to change>
 - [Minor] `<path>:<line>`: <problem>. Fix: <what to change>
-- [Nit] `<path>:<line>`: <problem>
+- [Nit] `<path>:<line>`: <problem>. Fix: <what to change>
 
 ## Verdict
 

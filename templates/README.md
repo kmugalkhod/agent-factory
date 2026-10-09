@@ -13,8 +13,11 @@ parse them, so the headings below are a contract.
 - A filled document keeps every required heading, even when its section is "None". Delete an
   optional section entirely, heading included, when it doesn't apply.
 - Text in `<angle brackets>` is guidance or a placeholder; replace it.
-- Each document fits on one page: at most 60 lines. No code fences, since gates read headings
-  line by line.
+- Each template, and each document an agent or the engine writes from one, fits on one page: at
+  most 60 lines. No code fences, since gates read headings line by line.
+- Supplied content is the exception. The body of `intent.md`'s `Request` section is the request
+  or spec exactly as you gave it: never shortened, reworded or reformatted, whatever its length,
+  fences or headings. Gates treat it as opaque text (see intent.md below).
 
 ## intent.md
 
@@ -22,6 +25,10 @@ Written by you (or the intake step) before the planner. A spec goes in unchanged
 
 - `Request`
 - `Answers`
+
+The `Request` body may contain any Markdown, including its own `## ` lines. Gates look only at
+the first `## Request` line and the last `## Answers` line; everything between them is the
+request. Answers are appended after `## Answers`, so it stays the last heading.
 
 ## plan.md
 
@@ -39,7 +46,14 @@ acceptance criteria.
 
 ## handoff.md
 
-Written by every role at the end of its stage.
+Written at the end of its stage by the planner, the tester and the builder, each to its own
+file in the run folder: `handoff-planner.md`, `handoff-tester.md`, `handoff-builder.md`. The
+reviewer writes `review.md` only.
+
+- Before starting, each role reads the handoffs of every earlier role. For example, the builder
+  reads `handoff-planner.md` and `handoff-tester.md`.
+- `handoff-builder.md` holds the latest builder attempt. Before the next attempt overwrites it,
+  the engine copies it to `attempts/handoff-builder-<n>.md` in the run folder.
 
 - `Files touched`
 - `Decisions`
@@ -56,7 +70,7 @@ Written by the reviewer. The reviewer gate fails on any `[Important]` finding.
 
 Line formats the gate parses:
 
-- Finding: ``- [<Important | Minor | Nit>] `<path>:<line>`: <problem>. Fix: <change>``
+- Finding: ``- [<Important | Minor | Nit>] `<path>:<line>`: <problem>. Fix: <what to change>``
 - Verdict: exactly one line, `Verdict: approve` or `Verdict: request changes`
 
 ## report.md

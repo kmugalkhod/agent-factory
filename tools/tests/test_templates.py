@@ -93,16 +93,39 @@ def test_handoff_sections_match_the_acceptance_criteria() -> None:
     ]
 
 
-def test_review_has_findings_and_verdict_sections() -> None:
-    sections = [heading for heading, _ in contract()["review.md"]]
-    assert "Findings" in sections
-    assert sections[-1] == "Verdict"
+def test_review_sections_match_the_acceptance_criteria() -> None:
+    assert contract()["review.md"] == [
+        ("Acceptance criteria", False),
+        ("Findings", False),
+        ("Verdict", False),
+    ]
+
+
+def finding_format() -> str:
+    """The finding line format from README.md, with the severity left as a placeholder."""
+    prefix = "- Finding: ``"
+    (line,) = [x for x in README.read_text(encoding="utf-8").splitlines() if x.startswith(prefix)]
+    return line.removeprefix(prefix).removesuffix("``")
+
+
+def test_readme_finding_format_names_every_severity_and_a_fix() -> None:
+    fmt = finding_format()
+    assert fmt.startswith("- [<Important | Minor | Nit>] ")
+    assert ". Fix: " in fmt
 
 
 @pytest.mark.parametrize("severity", ["Important", "Minor", "Nit"])
-def test_review_template_names_each_severity(severity: str) -> None:
-    findings = "\n".join(lines("review.md"))
-    assert f"[{severity}]" in findings
+def test_review_example_finding_matches_the_readme_format(severity: str) -> None:
+    expected = finding_format().replace("<Important | Minor | Nit>", severity)
+    assert expected in lines("review.md")
+
+
+def test_review_has_no_example_finding_outside_the_readme_format() -> None:
+    examples = [line for line in lines("review.md") if line.startswith("- [")]
+    fmt = finding_format()
+    for line in examples:
+        severity = line[3 : line.index("]")]
+        assert line == fmt.replace("<Important | Minor | Nit>", severity)
 
 
 def test_review_template_has_a_single_verdict_line() -> None:

@@ -24,7 +24,7 @@ Source of truth: [docs/design/design.md](../design/design.md). This file breaks 
 | Providers | Milestone 2: `subscription` only, plus the profile layer and credential isolation. Full `litellm` (budget, cost) in milestone 4 |
 | `sandbox` isolation | Detect and refuse with a clear message. Sandbox mode is after version 1 |
 | Human decisions | Four. Split approval and planner questions happen inside the planner step |
-| Handoff files | Every role may write its own handoff file in the run's folder. The reviewer writes `review.md` only |
+| Handoff files | Every role may write its own handoff file in the run's folder, `handoff-<role>.md`, all from one template. The reviewer writes `review.md` only. Each role reads the handoffs of all earlier roles first. `handoff-builder.md` holds the latest attempt; the engine archives earlier ones to `attempts/handoff-builder-<n>.md` (agreed Oct 10, 2026) |
 | Run docs before milestone 3 | Live in the factory data folder, outside the repo |
 | Factory-wide skills | Written in `plugin/skills/` in milestone 1; the engine loads them into each agent's config folder from milestone 2. The rest of the plugin waits for milestone 5 |
 | Triggers | GitHub issues with label `factory`, by polling. Jira later |
@@ -424,13 +424,13 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - builder resume with the output
   - review failures resume the builder within the same cap of 3
 
-  When a cap is reached, mark the run Needs you and stop. Save the last completed step after every step.
+  Before each builder retry, copy `handoff-builder.md` to `attempts/handoff-builder-<n>.md` in the run folder. When a cap is reached, mark the run Needs you and stop. Save the last completed step after every step.
 - **Touches:** `engine/factory_engine/pipeline.py`, `engine/tests/test_pipeline.py`
 - **Acceptance criteria:** Scripted fake-runner scenarios produce the expected state and event sequence:
   - happy path
   - bad plan then a good one
   - passing tests then failing ones
-  - builder failing three times → needs_you
+  - builder failing three times → needs_you, with `attempts/handoff-builder-1.md` and `-2.md` kept and `handoff-builder.md` holding attempt 3
   - review with an Important finding → builder → pass
 - **Tests:** Scenario tests with the fake runner and fixture repos.
 - **Depends on:** 2.5, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19
