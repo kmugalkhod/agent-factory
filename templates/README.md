@@ -7,8 +7,9 @@ parse them, so the headings below are a contract.
 
 - This file is the single list of headings. `tools/tests/test_templates.py` checks that each
   template has exactly these `## ` headings, in this order.
-- Changing a heading means changing this list, the template, and the gate that parses it (from
-  milestone 2), in the same commit.
+- Changing a heading means changing this list, the template, the copies bundled with the
+  factory skills in `plugin/skills/`, and the gate that parses it (from milestone 2), in the
+  same commit. `tools/tests/test_skills.py` checks that each bundled copy equals its template.
 - Each template starts with one `# ` title line. Only `## ` headings are part of the contract.
 - A filled document keeps every required heading, even when its section is "None". Delete an
   optional section entirely, heading included, when it doesn't apply.
