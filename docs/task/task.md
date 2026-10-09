@@ -37,12 +37,18 @@ Source of truth: [docs/design/design.md](../design/design.md). This file breaks 
 
 Manual, done by Kunal. Not commits.
 
-- [ ] S.1 Install Windows Terminal, Git and Python 3.12; confirm Claude Code is installed and logged in on the Max plan
-- [ ] S.2 Install `uv` and the GitHub CLI (`gh`), then run `gh auth login`. (`gh` is not installed on this machine as of Oct 9, 2026; task 2.14 needs it)
-- [ ] S.3 Run `claude setup-token` once and store the token as the user environment variable `CLAUDE_CODE_OAUTH_TOKEN`; note its expiry date in the global settings (task 2.6)
-- [ ] S.4 Create a private GitHub repo for the factory itself and push this repo to it
+- [x] S.1 Install Windows Terminal, Git and Python 3.12; confirm Claude Code is installed and logged in on the Max plan
+  - Max plan tier: 5x.
+- [x] S.2 Install `uv` and the GitHub CLI (`gh`), then run `gh auth login`. (`gh` is not installed on this machine as of Oct 9, 2026; task 2.14 needs it)
+  - `gh` 2.102.0 installed on Oct 9, 2026.
+- [x] S.3 Run `claude setup-token` once and store the token as the user environment variable `CLAUDE_CODE_OAUTH_TOKEN`; note its expiry date in the global settings (task 2.6)
+  - Token expires 2026-11-10. Renew it before then and record the date in the global settings (task 2.6).
+- [x] S.4 Create a private GitHub repo for the factory itself and push this repo to it
+  - Deviation: `kmugalkhod/agent-factory` is public, by Kunal's choice.
 - [ ] S.5 Create the GitHub repo for the new pilot project (empty, with a README)
+  - Deferred: the pilot project isn't chosen yet. It is first needed for the milestone 2 exit (bootstrap run).
 - [ ] S.6 Optional: protect `main` on the pilot repo, allowing yourself to bypass
+  - Skipped by Kunal's choice.
 
 ---
 
