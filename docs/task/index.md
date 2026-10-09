@@ -6,7 +6,7 @@ Status values: `Not started`, `In progress`, `Awaiting exit sign-off`, `Done`.
 
 | # | Milestone | Status | Tasks | Exit check |
 | --- | --- | --- | --- | --- |
-| — | Setup before development | Not started | S.1–S.6 (manual) | All setup items ticked |
+| — | Setup before development | Not started | S.1–S.6 (manual) | All required setup items ticked |
 | 1 | Prompts and templates by hand | Not started | 1.1–1.5, 1.X | The manual result is good enough to merge |
 | 2 | Engine and CLI, one repo | Not started | 2.1–2.29, 2.X | Bootstrap plus 3 feature runs completed end to end from the CLI |
 | 3 | Run docs, history and split handling | Not started | To be expanded | A split task finishes as a parent with merged parts, docs in `docs/runs/` |
