@@ -10,7 +10,9 @@ a failure doesn't stop the remaining commands, but the exit code is non-zero.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Callable, Sequence
@@ -34,20 +36,47 @@ def run_command(cmd: list[str], cwd: Path) -> int:
         return 127
     print(f"> {' '.join(cmd)}", flush=True)
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [exe, *cmd[1:]],
             cwd=cwd,
-            check=False,
-            timeout=TIMEOUT_SECONDS,
             encoding="utf-8",
             errors="replace",
+            start_new_session=sys.platform != "win32",
         )
+    except OSError as exc:
+        print(f"error: {cmd[0]} could not start: {exc}; check its install", file=sys.stderr)
+        return 126
+    try:
+        return proc.wait(timeout=TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
+        stop_tree(proc)
         print(
             f"error: {' '.join(cmd)} took over {TIMEOUT_SECONDS}s and was stopped", file=sys.stderr
         )
         return 124
-    return result.returncode
+
+
+def stop_tree(proc: subprocess.Popen[str]) -> None:
+    """Kill a command and every process it started, then wait for it to exit.
+
+    `uv run` starts the real tool as a child, so killing only `proc` would leave it running.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                check=False,
+                capture_output=True,
+                timeout=60,
+                encoding="utf-8",
+                errors="replace",
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: could not stop the process tree of pid {proc.pid}: {exc}", file=sys.stderr)
+    proc.kill()  # no-op if the tree kill worked; covers a taskkill that failed quietly
+    proc.wait()
 
 
 def part_exists(root: Path, part: str) -> bool:
