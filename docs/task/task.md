@@ -39,7 +39,7 @@ Manual, done by Kunal. Not commits.
 
 - [x] S.1 Install Windows Terminal, Git and Python 3.12; confirm Claude Code is installed and logged in on the Max plan
   - Max plan tier: 5x.
-- [x] S.2 Install `uv` and the GitHub CLI (`gh`), then run `gh auth login`. (`gh` is not installed on this machine as of Oct 9, 2026; task 2.14 needs it)
+- [x] S.2 Install `uv` and the GitHub CLI (`gh`), then run `gh auth login`. (Task 2.14 needs `gh`.)
   - `gh` 2.102.0 installed on Oct 9, 2026.
 - [x] S.3 Run `claude setup-token` once and store the token as the user environment variable `CLAUDE_CODE_OAUTH_TOKEN`; note its expiry date in the global settings (task 2.6)
   - Token expires 2026-11-10. Renew it before then and record the date in the global settings (task 2.6).
