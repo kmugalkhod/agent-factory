@@ -25,7 +25,7 @@ Source of truth: [docs/design/design.md](../design/design.md). This file breaks 
 | `sandbox` isolation | Detect and refuse with a clear message. Sandbox mode is after version 1 |
 | Human decisions | Four. Split approval and planner questions happen inside the planner step |
 | Handoff files | Every role may write its own handoff file in the run's folder, `handoff-<role>.md`, all from one template. The reviewer writes `review.md` only. Each role reads the handoffs of all earlier roles first. `handoff-builder.md` holds the latest attempt; the engine archives earlier ones to `attempts/handoff-builder-<n>.md` (agreed Oct 10, 2026) |
-| Commits | Agents never run `git`. The engine commits once after each passing stage gate, with a message like `factory(run-42): builder attempt 2`. The shell allowlists stay exactly as in the design's role table. Deviation from the design's "agents commit on that branch", approved by Kunal (Oct 10, 2026) |
+| Commits | Agents never run `git`. The engine commits once after each passing stage gate, with a message like `factory(run-42): builder attempt 2`. A stage that changed nothing in the worktree (the planner, the reviewer) gets an empty commit, so every passing stage has exactly one. The shell allowlists stay exactly as in the design's role table. Deviation from the design's "agents commit on that branch", approved by Kunal (Oct 10, 2026) |
 | Bootstrap write paths | The bootstrap builder writes the whole worktree except `plan.md`, through a bootstrap override in the global defaults, not hard-coded. Details settled at the start of 2.1 |
 | Run docs before milestone 3 | Live in the factory data folder, outside the repo |
 | Factory-wide skills | Written in `plugin/skills/` in milestone 1; the engine loads them into each agent's config folder from milestone 2. The rest of the plugin waits for milestone 5 |
@@ -342,7 +342,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 
 - **What:** Add git and GitHub operations through `subprocess`:
   - Create branch `factory/run-<id>-<slug>` from the latest `main` in a new worktree under the data folder.
-  - Commit the stage's changes in the worktree, with the message `factory(run-<id>): <role> attempt <n>`.
+  - Commit the stage's changes in the worktree, with the message `factory(run-<id>): <role> attempt <n>`. When the stage changed nothing (the planner, the reviewer), make an empty commit (`--allow-empty`).
   - Fetch and rebase onto `main`.
   - Push with `--force-with-lease`, to the run branch only.
   - Open a PR with `gh`, with the plan, test output and findings in the body. Merge with `gh`.
@@ -353,6 +353,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Against a temporary bare "remote", the branch, rebase, push and lease refusal behave as the design describes.
   - Pushing any branch other than the run branch raises.
   - A stage commit has the message `factory(run-<id>): <role> attempt <n>` and is made on the run branch only.
+  - A stage that changed nothing in the worktree still gets exactly one commit (empty), and the commit step doesn't fail.
   - `gh` calls are checked with a fake `gh` executable on `PATH`.
   - No call uses `shell=True`.
 - **Tests:** Integration tests with temporary git repos and a fake `gh`.
