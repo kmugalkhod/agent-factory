@@ -1,0 +1,43 @@
+[project]
+name = "agent-factory"
+version = "0.1.0"
+description = "Workspace root for the agent factory: engine, CLI and dev tools."
+requires-python = ">=3.12,<3.13"
+dependencies = ["factory-engine", "factory-cli"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "ruff==0.16.10", "pyright==1.1.414"]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["engine", "cli"]
+
+[tool.uv.sources]
+factory-engine = { workspace = true }
+factory-cli = { workspace = true }
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib", "-m", "not live"]
+pythonpath = ["tools"]
+markers = ["live: calls a real model; needs CLAUDE_CODE_OAUTH_TOKEN. Run with `uv run pytest -m live`."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["ui"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PTH"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["factory_engine", "factory_cli", "dev"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+extraPaths = ["tools"]
+exclude = ["**/node_modules", "**/__pycache__", "**/.*", "ui"]

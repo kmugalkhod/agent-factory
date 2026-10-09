@@ -99,6 +99,7 @@ What each part runs underneath:
 - Use pydantic models for anything read from or written to disk (`factory.yaml`, `run.json`, events). Validate data on the way in, not deep inside the code.
 - Use `pathlib.Path` everywhere. Never build paths with strings. Before comparing paths, resolve them (`.resolve()`) and normalize case. Windows paths, drive letters, UNC paths and junctions are normal inputs.
 - Run commands with `subprocess.run([...], check=..., timeout=...)` and a list of arguments. Never use `shell=True`. Always pass `encoding="utf-8"` and `errors="replace"`.
+  - Exception: when a command starts children that must stop with it on timeout or Ctrl-C (for example `uv run pytest`), use `subprocess.Popen` plus a process-tree kill, as `tools/dev.py` does with `stop_tree`. `subprocess.run` kills only the direct child. List args, no shell, a timeout and the encoding rules still apply.
 - Open text files with `encoding="utf-8"`. Write state files atomically: write a temp file, then `os.replace`.
 - No global mutable state. Pass settings, clock and runner in as arguments so tests can replace them.
 - Errors: raise specific exception classes from `factory_engine.errors`. Messages say what failed and what to do next.
