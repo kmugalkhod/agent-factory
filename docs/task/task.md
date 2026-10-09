@@ -80,7 +80,7 @@ Goal: the files every stage writes and reads exist, the role prompts and factory
 - **Tests:** `tools/tests/test_templates.py` checks that each template contains exactly the required headings listed in `templates/README.md`.
 - **Depends on:** 1.1
 
-### [ ] 1.3 Default role prompts
+### [x] 1.3 Default role prompts
 
 - **What:** Write the default prompts for planner, tester, builder and reviewer, plus a bootstrap addendum for the planner and builder. Each prompt states the role's output file, allowed write paths, shell limits and the handoff rule, matching the role table in the design.
 - **Touches:** `prompts/planner.md`, `prompts/tester.md`, `prompts/builder.md`, `prompts/reviewer.md`, `prompts/bootstrap.md`, `tools/tests/`
