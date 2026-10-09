@@ -443,3 +443,92 @@ def test_load_global_settings(tmp_path: Path) -> None:  # AC10
     with pytest.raises(ConfigError) as exc:
         load_global_settings(bad, "win32")
     assert str(bad) in str(exc.value)
+
+
+# ------------------------------------------------- review findings (attempt 1)
+
+NULL_FOR_REQUIRED = [
+    ("sandbox_required: null\n", "sandbox_required"),
+    ("provider: null\n", "provider"),
+    ("roles:\n  builder:\n    model: null\n", "roles.builder.model"),
+    ("caps:\n  max_turns: null\n", "caps.max_turns"),
+]
+
+
+@pytest.mark.parametrize("text,key", NULL_FOR_REQUIRED)
+def test_null_for_required_field_names_file(  # Minor 1
+    tmp_path: Path, text: str, key: str
+) -> None:
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    assert str(path) in str(exc.value)
+    assert key in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "data,key",
+    [
+        ({"sandbox_required": None}, "sandbox_required"),
+        ({"roles": {"builder": {"model": None}}}, "roles.builder.model"),
+    ],
+)
+def test_null_for_required_field_names_run_source(  # Minor 1
+    data: dict[str, Any], key: str
+) -> None:
+    with pytest.raises(ConfigError) as exc:
+        parse_overrides(data, "run overrides")
+    assert "run overrides" in str(exc.value)
+    assert key in str(exc.value)
+
+
+def test_non_utf8_file_names_file(tmp_path: Path) -> None:  # Minor 2
+    path = tmp_path / "factory.yaml"
+    path.write_bytes(b"provider: \xff\xfe\x80\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    assert str(path) in str(exc.value)
+
+
+def test_non_utf8_global_file_names_file(tmp_path: Path) -> None:  # Minor 2
+    path = tmp_path / "global.yaml"
+    path.write_bytes(b"provider: \xff\xfe\x80\n")
+    with pytest.raises(ConfigError) as exc:
+        load_global_settings(path, "win32")
+    assert str(path) in str(exc.value)
+
+
+CAP_FIELDS = [
+    "planner_attempts",
+    "tester_attempts",
+    "builder_attempts",
+    "max_turns",
+    "max_minutes",
+    "stall_minutes",
+]
+
+
+@pytest.mark.parametrize("value", [0, -1])
+@pytest.mark.parametrize("field", CAP_FIELDS)
+def test_caps_reject_non_positive_in_file(  # Minor 3
+    tmp_path: Path, field: str, value: int
+) -> None:
+    path = _write(tmp_path, f"caps:\n  {field}: {value}\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    assert str(path) in str(exc.value)
+    assert f"caps.{field}" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", [0, -5])
+def test_caps_reject_non_positive_in_run_overrides(value: int) -> None:  # Minor 3
+    with pytest.raises(ConfigError) as exc:
+        parse_overrides({"caps": {"builder_attempts": value}}, "run overrides")
+    assert "run overrides" in str(exc.value)
+    assert "caps.builder_attempts" in str(exc.value)
+
+
+def test_caps_accept_one() -> None:  # Minor 3
+    patch = parse_overrides({"caps": {"builder_attempts": 1}}, "run overrides")
+    out = merge_settings(default_settings("win32"), patch)
+    assert out.caps.builder_attempts == 1
