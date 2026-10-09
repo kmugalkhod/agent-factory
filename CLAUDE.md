@@ -10,15 +10,24 @@ A local system that turns a request (new project, feature or spec) into a review
 1. **Follow the design.** Build what `docs/design/design.md` says. If a task seems to need something different, stop and ask. Don't silently deviate. Record any agreed deviation in the milestone summary.
 2. **Take the next task.** Work on the first unchecked task in `docs/task/task.md` whose dependencies are all checked. One task at a time; don't start the next one in the same commit.
 3. **Tests first.** Write the task's tests, run them and see them fail for the right reason. Then write the code. Before calling a task done, run `uv run tools/dev.py test` and `uv run tools/dev.py lint` for the whole repo; both must pass.
-4. **Tick and commit.** Mark the task `[x]` in `docs/task/task.md` in the same commit as the code. When a milestone changes status, update its row and add a log line in `docs/task/index.md`. Commit message: `<task id>: <title>`, for example `2.4: Event stream`.
-5. **Stop at milestone ends.** After the last task of a milestone, don't start the next one. Write a summary covering:
+4. **Branch, commit and open a pull request per task.**
+   - Start each task from an up-to-date `main` on a new branch named `task/<id>-<slug>`, for example `task/2.4-event-stream`.
+   - Mark the task `[x]` in `docs/task/task.md` in the same commit as the code. When a milestone changes status, update its row and add a log line in `docs/task/index.md`.
+   - Commit message: `<task id>: <title>`, for example `2.4: Event stream`.
+   - Push the branch and open a pull request into `main`. The description gives what changed, the acceptance criteria and how each was tested.
+   - Never push to or merge into `main` directly. Kunal merges.
+5. **Review fixes.** Every pull request gets an automated code review. Kunal passes the review comments on.
+   - For each comment, decide whether it is valid. Fix valid ones on the same branch in a new commit, and say why for any you don't fix.
+   - Rerun the tests and lint, then push. Don't open a new pull request.
+   - Start the next task only after the current pull request is merged, from the updated `main`.
+6. **Stop at milestone ends.** After the last task of a milestone, don't start the next one. Write a summary covering:
    - what was built
    - what was tested (commands and results)
    - anything that deviated from the design and why
    - what's left for the manual exit checklist
 
    Exit tasks (`1.X`, `2.X`, …) are signed off by Kunal, never by an agent.
-6. **Expanding later milestones.** Milestones 3–7 are listed as features only. At the start of one, propose its tasks in the same format as milestones 1–2 and wait for approval before building.
+7. **Expanding later milestones.** Milestones 3–7 are listed as features only. At the start of one, propose its tasks in the same format as milestones 1–2 and wait for approval before building.
 
 ## Tech stack
 
@@ -118,7 +127,7 @@ What each part runs underneath:
 
 **Git**
 
-- Work on `main` in small commits, one per task, unless told otherwise.
+- One branch and one pull request per task (see working rules 4 and 5). Never commit directly to `main`.
 - Never commit secrets, tokens or `.env*` files.
 
 ## Things to watch for
