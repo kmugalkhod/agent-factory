@@ -150,3 +150,15 @@ def test_prompt_is_short(name: str) -> None:
 def test_no_other_prompts_exist() -> None:
     names = sorted(p.stem for p in PROMPTS.glob("*.md"))
     assert names == sorted([*ROLES, "bootstrap"])
+
+
+def bootstrap_builder_section() -> str:
+    text = prompt("bootstrap")
+    return text[text.index("## Builder") :]
+
+
+@pytest.mark.parametrize("missing", ["`handoff-tester.md`", "the tests the tester wrote"])
+def test_bootstrap_builder_skips_reads_of_tester_output(missing: str) -> None:
+    """Run 0 has no tester stage; the addendum must exempt the base prompt's reads."""
+    assert missing in bootstrap_builder_section()
+    assert missing.lower() in prompt("builder").lower()  # the read being exempted exists

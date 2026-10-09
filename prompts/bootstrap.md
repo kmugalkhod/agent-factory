@@ -26,8 +26,11 @@ The repo is ready when:
 
 ## Builder
 
-- There is no tester stage in a bootstrap run. You write the test framework config and the smoke
-  test yourself, so your write paths cover the whole worktree, except `plan.md`.
+- There is no tester stage in a bootstrap run. Skip the base builder prompt's reads of
+  `handoff-tester.md` and the tests the tester wrote. You write the test framework config and the
+  smoke test yourself, so your write paths cover the whole worktree, except `plan.md`.
+- The repo's `CLAUDE.md` and `docs/lessons.md` don't exist yet either. Skip those reads too; you
+  write `CLAUDE.md` in this run.
 - Create the skeleton: dependencies, config, the test framework, one passing smoke test, and
   Playwright tests if there is a UI.
 - Write `CLAUDE.md`: the build, test and lint commands, the folder layout, the conventions, and
