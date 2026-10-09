@@ -40,9 +40,9 @@ May not touch: code
 Shell commands: read-only
 
 - You also write your handoff, `handoff-planner.md`, in the run folder. Nothing else.
-- Read-only means commands that only look, such as `git log`, `git diff` or listing files.
-- Never run `git push`, rebase, merge, `reset --hard` or delete branches. The engine does all of
-  that.
+- Read-only means commands that only look, such as listing or searching files.
+- Never run `git`, not even to look or commit. The engine commits your work once your stage's
+  gate passes, and does every push, rebase and merge.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish

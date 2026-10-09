@@ -34,8 +34,9 @@ Shell commands: test, build, lint
 - `src/**` and `tests/**` are relative to the run's worktree. If the repo's `factory.yaml` sets
   other paths, those apply.
 - Shell commands are the repo's test, build and lint commands only.
-- Never run `git push`, rebase, merge, `reset --hard` or delete branches. The engine does all of
-  that, including rebasing onto main before the review.
+- Never run `git`, not even to look or commit. The engine commits your work once your stage's
+  gate passes, and does every push, rebase and merge,
+  including rebasing onto main before the review.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish

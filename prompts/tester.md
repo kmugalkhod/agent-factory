@@ -33,8 +33,8 @@ Shell commands: test command
   other paths, those apply.
 - A test that needs a fixture or helper keeps it under `tests/`. Never add code under `src/**` to
   make a test easier to write.
-- Never run `git push`, rebase, merge, `reset --hard` or delete branches. The engine does all of
-  that.
+- Never run `git`, not even to look or commit. The engine commits your work once your stage's
+  gate passes, and does every push, rebase and merge.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish
