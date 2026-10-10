@@ -1,12 +1,20 @@
 """Tests for factory_engine.agent_config (task 2.7): each agent's CLAUDE_CONFIG_DIR."""
 
 import json
+import shutil
+import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pytest
 
-from factory_engine.agent_config import agent_config_dir, path_rule, write_agent_config
+from factory_engine import agent_config
+from factory_engine.agent_config import (
+    AgentSettings,
+    agent_config_dir,
+    path_rule,
+    write_agent_config,
+)
 from factory_engine.config import Settings, default_settings
 from factory_engine.errors import AgentConfigError, DataFolderError
 from factory_engine.run import Role
@@ -36,6 +44,7 @@ def _write(
     role: Role,
     settings: Settings | None = None,
     other_repos: tuple[Path, ...] = (),
+    skills_source: Path = SKILLS,
 ) -> Path:
     config_dir = tmp_path / "agents" / "app" / "3-status-json" / role
     write_agent_config(
@@ -43,7 +52,7 @@ def _write(
         role=role,
         settings=settings or _settings(),
         run_folder=tmp_path / "runs" / "app" / "3-status-json",
-        skills_source=SKILLS,
+        skills_source=skills_source,
         other_repos=other_repos,
     )
     return config_dir
@@ -99,6 +108,7 @@ def test_deny_rules_cover_secrets_for_reads_and_edits(tmp_path: Path, role: Role
         assert f"Edit({target})" in deny
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="rules are written for drive-letter paths")
 def test_deny_rules_cover_other_repos(tmp_path: Path) -> None:  # AC1
     others = (tmp_path / "repos" / "api", tmp_path / "worktrees" / "app-2-other")
     deny = _permissions(_write(tmp_path, "builder", other_repos=others))["deny"]
@@ -187,6 +197,13 @@ def test_an_unknown_skill_is_refused(tmp_path: Path) -> None:
     assert "no-such" in str(exc.value)
 
 
+def test_a_missing_skills_folder_is_refused(tmp_path: Path) -> None:
+    missing = tmp_path / "no-skills"
+    with pytest.raises(AgentConfigError) as exc:
+        _write(tmp_path, "planner", skills_source=missing)
+    assert str(missing) in str(exc.value)
+
+
 # ----------------------------------------------------- nothing personal
 
 
@@ -218,6 +235,12 @@ def test_settings_json_holds_only_permissions(tmp_path: Path) -> None:
     assert set(data) == {"permissions"}
 
 
+def test_settings_json_matches_its_model(tmp_path: Path) -> None:
+    text = (_write(tmp_path, "builder") / "settings.json").read_text(encoding="utf-8")
+    model = AgentSettings.model_validate_json(text)
+    assert json.loads(model.model_dump_json(by_alias=True)) == json.loads(text)
+
+
 # ---------------------------------------------------------------- rewrite
 
 
@@ -232,3 +255,32 @@ def test_rewriting_keeps_sessions_and_resyncs_skills(tmp_path: Path) -> None:
     assert session.read_text(encoding="utf-8") == "{}"  # kept for resume
     assert _skills(config_dir) == ["write-plan"]
     assert "permissions" in json.loads((config_dir / "settings.json").read_text(encoding="utf-8"))
+
+
+def test_a_failed_skill_copy_keeps_the_old_skills(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = _write(tmp_path, "planner")
+    before = sorted(
+        (p.relative_to(config_dir).as_posix(), p.read_bytes())
+        for p in (config_dir / "skills").rglob("*")
+        if p.is_file()
+    )
+    copies: list[Path] = []
+
+    def failing_copy(src: Path, dst: Path) -> Path:
+        copies.append(src)
+        if len(copies) == 2:
+            raise OSError("disk full")
+        return shutil.copytree(src, dst)
+
+    monkeypatch.setattr(agent_config.shutil, "copytree", failing_copy)
+    with pytest.raises(AgentConfigError, match="disk full"):
+        _write(tmp_path, "planner")
+    after = sorted(
+        (p.relative_to(config_dir).as_posix(), p.read_bytes())
+        for p in (config_dir / "skills").rglob("*")
+        if p.is_file()
+    )
+    assert after == before
+    assert sorted(p.name for p in config_dir.iterdir()) == ["settings.json", "skills"]

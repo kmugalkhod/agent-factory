@@ -15,12 +15,14 @@ How the rules keep an agent in its worktree:
   denied outright. Write paths are enforced by the runner and the path hook, not here.
 """
 
-import json
 import os
 import shutil
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path, PurePath, PureWindowsPath
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from factory_engine.config import RoleSettings, Settings
 from factory_engine.errors import AgentConfigError
@@ -33,6 +35,25 @@ SKILLS_DIR = "skills"
 
 SECRET_PATTERNS = ("~/.ssh/**", "~/.aws/**", "~/.claude/**", "//**/.env*")
 SHELL_TOOLS = ("Bash", "PowerShell")
+
+
+class _Model(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+
+class Permissions(_Model):
+    """The `permissions` block of an agent's `settings.json`, in Claude Code's field names."""
+
+    default_mode: Literal["dontAsk"] = Field(alias="defaultMode")
+    additional_directories: list[str] = Field(alias="additionalDirectories")
+    allow: list[str]
+    deny: list[str]
+
+
+class AgentSettings(_Model):
+    """An agent's whole `settings.json`: permission rules and nothing else."""
+
+    permissions: Permissions
 
 
 def agent_config_dir(data: Path, repo: str, run_id: int, slug: str, role: Role) -> Path:
@@ -69,17 +90,25 @@ def write_agent_config(
     anything else already in the folder, such as saved sessions for resume, is kept.
     """
     role_settings: RoleSettings = getattr(settings.roles, role)
-    skills = _wanted_skills(role_settings, skills_source)
-    permissions = {
-        "defaultMode": "dontAsk",
-        "additionalDirectories": [str(run_folder.resolve())],
-        "allow": _allow_rules(role_settings, settings),
-        "deny": _deny_rules(role_settings, other_repos),
-    }
+    agent_settings = AgentSettings(
+        permissions=Permissions(
+            defaultMode="dontAsk",
+            additionalDirectories=[str(run_folder.resolve())],
+            allow=_allow_rules(role_settings, settings),
+            deny=_deny_rules(role_settings, other_repos),
+        )
+    )
+    try:
+        skills = _wanted_skills(role_settings, skills_source)
+    except OSError as err:
+        raise AgentConfigError(
+            f"{skills_source}: can't read the factory skills folder ({err}). "
+            "Check that the folder exists and is readable."
+        ) from err
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
-        _sync_skills(config_dir / SKILLS_DIR, skills, skills_source)
-        return _write_json(config_dir / SETTINGS_FILE, {"permissions": permissions})
+        _sync_skills(config_dir, skills, skills_source)
+        return _write_settings(config_dir / SETTINGS_FILE, agent_settings)
     except OSError as err:
         raise AgentConfigError(f"{config_dir}: can't write the agent config ({err}).") from err
 
@@ -114,14 +143,27 @@ def _wanted_skills(role: RoleSettings, source: Path) -> list[str]:
     return sorted(set(role.skills))
 
 
-def _sync_skills(target: Path, wanted: list[str], source: Path) -> None:
-    target.mkdir(exist_ok=True)
-    for existing in target.iterdir():
-        if existing.name not in wanted:
-            _remove(existing)
-    for name in wanted:
-        _remove(target / name)
-        shutil.copytree(source / name, target / name)
+def _sync_skills(config_dir: Path, wanted: list[str], source: Path) -> None:
+    """Copy the wanted skills into a staging folder, then swap it in for the old `skills/`.
+
+    A failed copy leaves the old skills untouched.
+    """
+    target = config_dir / SKILLS_DIR
+    staging = Path(tempfile.mkdtemp(prefix=f"{SKILLS_DIR}.", suffix=".tmp", dir=config_dir))
+    try:
+        for name in wanted:
+            shutil.copytree(source / name, staging / name)
+        old = None
+        if target.exists() or target.is_symlink():
+            old = Path(tempfile.mkdtemp(prefix=f"{SKILLS_DIR}.", suffix=".old", dir=config_dir))
+            old.rmdir()
+            target.replace(old)
+        staging.replace(target)
+    except BaseException:
+        _remove(staging)
+        raise
+    if old is not None:
+        _remove(old)
 
 
 def _remove(path: Path) -> None:
@@ -131,13 +173,12 @@ def _remove(path: Path) -> None:
         path.unlink()
 
 
-def _write_json(path: Path, data: object) -> Path:
+def _write_settings(path: Path, data: AgentSettings) -> Path:
     fd, temp_name = tempfile.mkstemp(prefix=f"{path.name}.", suffix=".tmp", dir=path.parent)
     temp = Path(temp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(data, handle, indent=2)
-            handle.write("\n")
+            handle.write(data.model_dump_json(by_alias=True, indent=2) + "\n")
         temp.replace(path)
     except BaseException:
         temp.unlink(missing_ok=True)
