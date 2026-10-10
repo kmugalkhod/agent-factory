@@ -151,6 +151,7 @@ def _search(policy: PathPolicy, root: Path, glob: str | None) -> PathDecision:
             return _block(f"can't list {folder} to check the search ({err}); narrow `path`.")
         for entry in entries:
             path = Path(entry.path)
+            # DirEntry.is_junction is new in Python 3.12, the version this package needs.
             if entry.is_symlink() or entry.is_junction():
                 try:
                     target = path.resolve()

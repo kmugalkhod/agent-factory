@@ -415,6 +415,7 @@ def _file_link(link: Path, target: Path) -> None:
 def test_a_file_link_out_is_judged_by_the_glob(
     roots: dict[str, Path], glob: str | None, allowed: bool
 ) -> None:
+    (roots["out"] / "notes.txt").write_text("x", encoding="utf-8")
     _file_link(roots["wt"] / "src" / "notes.txt", roots["out"] / "notes.txt")
     tool_input: dict[str, object] = {"pattern": "x"}
     if glob is not None:
