@@ -15,3 +15,7 @@ class DataFolderError(FactoryError):
 
 class RunFileError(FactoryError):
     """A run's `run.json` is missing, unreadable, invalid or couldn't be written."""
+
+
+class RegistryError(FactoryError):
+    """The SQLite registry can't be opened, migrated, read or written."""

@@ -172,7 +172,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.1
 - **Deviation:** each run's folder is `<data>/runs/<repo>/<id>-<slug>/`, not `<data>/runs/<id>-<slug>/`. Run IDs count up per repo from 0 (the bootstrap run), so two repos can share an ID and slug; the repo subfolder keeps their folders apart. The data folder override is `AGENT_FACTORY_DATA`. Agreed with Kunal (Oct 10, 2026).
 
-### [ ] 2.3 Registry in SQLite
+### [x] 2.3 Registry in SQLite
 
 - **What:** Add a SQLite registry for repos, runs (an index over `run.json`) and agent sessions, with schema versioning via `PRAGMA user_version`, WAL mode, and functions to rebuild the index from the run folders.
 - **Touches:** `engine/factory_engine/registry.py`, `engine/tests/test_registry.py`
