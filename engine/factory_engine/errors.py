@@ -31,3 +31,8 @@ class IllegalTransitionError(FactoryError):
 
 class ProviderError(FactoryError):
     """A provider profile is unknown, not allowed, or its credentials aren't usable."""
+
+
+class AgentConfigError(FactoryError):
+    """An agent's config folder can't be built: an unknown skill, a path no rule can express,
+    or a file that can't be written."""
