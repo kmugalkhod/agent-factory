@@ -19,6 +19,7 @@ to anything but the null device, `VAR=x` prefixes, and wrappers that run another
 still checked, so its block names the real problem.
 """
 
+import glob
 import os
 import re
 import sys
@@ -135,8 +136,11 @@ READS_CONTENT = frozenset(
 # Searches: the first positional argument is the pattern, and no path means the current folder.
 SEARCHES = frozenset({"grep", "rg", "select-string", "sls"})
 PATTERN_FLAGS = frozenset({"-e", "--regexp", "-f", "--file", "-pattern"})
-NULL_TARGETS = frozenset({"/dev/null", "nul", "nul:", "$null"})
+# In PowerShell these names are cmdlet aliases (`sort` is Sort-Object), whose parameters are
+# whole words, not combinable short flags.
+CMDLET_ALIASES = frozenset({"sort"})
 SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
+WILDCARDS = "*?["
 
 _EXPANSION = (
     "variable and command expansion ($X, $(...), backticks, %X%, @splat) isn't allowed; "
@@ -164,7 +168,7 @@ class ShellPolicy:
     role: Role
     worktree: Path
     run_folder: Path
-    allowlist: tuple[tuple[str, ...], ...]
+    allowlist: tuple[str, ...]  # configured commands, parsed with each call's own shell rules
     read_only: bool
     windows: bool
 
@@ -179,11 +183,11 @@ class ShellPolicy:
         windows: bool = sys.platform == "win32",
     ) -> "ShellPolicy":
         role_settings = getattr(settings.roles, role)
-        commands: list[tuple[str, ...]] = []
+        commands: list[str] = []
         for name in role_settings.shell_allowlist:
             command: str | None = getattr(settings.commands, name)
             if command:  # a command that isn't configured allows nothing
-                commands.append(tuple(_lex(command, "bash")[0][0]))
+                commands.append(command)
         return cls(
             role=role,
             worktree=worktree.resolve(),
@@ -232,14 +236,45 @@ def _block(reason: str) -> CommandDecision:
 # ------------------------------------------------------------------ parts
 
 
-def _check(policy: ShellPolicy, command: str, shell: Shell, cwds: set[Path]) -> None:
-    for words, piped in _lex(command, shell):
-        _check_part(policy, words, piped, shell, cwds)
+@dataclass
+class _Part:
+    """One simple command: its words with quotes removed, which of them the shell expands as
+    wildcards, whether a pipe feeds it, and whether it runs in its own process (`|`, `&`)."""
+
+    words: list[str]
+    wild: list[bool]
+    piped: bool
+    detached: bool = False
 
 
-def _check_part(
-    policy: ShellPolicy, words: list[str], piped: bool, shell: Shell, cwds: set[Path]
-) -> None:
+def _check(policy: ShellPolicy, command: str, shell: Shell, cwds: set[Path]) -> set[Path]:
+    """Check every part in order. Returns the folders the shell could end up in.
+
+    `cwds` holds every folder the shell could be in: a `cd` that may fail keeps the old one, a
+    part in its own process can't move the shell, and a Bash subshell `( )` restores the folder
+    on exit (a PowerShell group doesn't, so both are kept)."""
+    saved: list[set[Path]] = []
+    current = set(cwds)
+    for item in _lex(command, shell, policy.windows):
+        if item == "(":
+            saved.append(set(current))
+        elif item == ")":
+            if not saved:
+                raise _Blocked("the parentheses don't match.")
+            before = saved.pop()
+            current = before if shell == "bash" else before | current
+        elif isinstance(item, _Part):
+            before = set(current)
+            current = _check_part(policy, item, shell, current)
+            if item.piped or item.detached:
+                current |= before
+    if saved:
+        raise _Blocked("the parentheses don't match.")
+    return current
+
+
+def _check_part(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]) -> set[Path]:
+    words = part.words
     if re.match(r"[A-Za-z_]\w*=", words[0]):
         raise _Blocked(f"setting variables ({words[0]}) isn't allowed; run the command plainly.")
     name = _name(words[0])
@@ -254,34 +289,66 @@ def _check_part(
     if name in SHELLS or name in WRAPPERS:
         _check_wrapper(policy, name, words, shell, cwds)
     if name in CD:
-        _cd(policy, words, args, shell, cwds)
-        return
+        return _cd(policy, part, shell, cwds)
     if name in DELETE:
         _check_delete(policy, words, args, shell, cwds)
-    if _allowlisted(policy, words):
-        return
+    if _allowlisted(policy, words, shell):
+        return cwds
     if policy.read_only and name in READ_ONLY:
-        _check_read_only(policy, name, words, args, piped, shell, cwds)
-        return
+        trusted = _trusted_read_only(policy, words[0], shell)
+        if trusted is None:
+            raise _Blocked(
+                f"`{words[0]}` runs a program from a path; run `{name}` by its plain name."
+            )
+        _check_read_only(policy, trusted, part, shell, cwds)
+        return cwds
     raise _Blocked(f"`{words[0]}` isn't allowed for the {policy.role}. {_may_run(policy)}")
 
 
 def _may_run(policy: ShellPolicy) -> str:
-    runs = [f"`{' '.join(c)}`" for c in policy.allowlist]
+    runs = [f"`{c}`" for c in policy.allowlist]
     if policy.read_only:
         runs.append("read-only commands (ls, cat, head, grep, find, ...)")
     return f"It may run only: {', '.join(runs)}."
 
 
-def _allowlisted(policy: ShellPolicy, words: list[str]) -> bool:
-    for allowed in policy.allowlist:
+def _allowlisted(policy: ShellPolicy, words: list[str], shell: Shell) -> bool:
+    """Whether the part starts with a configured command, read with this call's shell rules.
+    The program must be named exactly as configured: `./uv` is not `uv`."""
+    for configured in policy.allowlist:
+        try:
+            parts = [p for p in _lex(configured, shell, policy.windows) if isinstance(p, _Part)]
+        except _Blocked:
+            continue  # a configured command this shell can't read allows nothing here
+        if len(parts) != 1:
+            continue
+        allowed = parts[0].words
         if (
             len(words) >= len(allowed)
-            and _name(words[0]) == _name(allowed[0])
-            and words[1 : len(allowed)] == list(allowed[1:])
+            and _program(policy, words[0], shell) == _program(policy, allowed[0], shell)
+            and words[1 : len(allowed)] == allowed[1:]
         ):
             return True
     return False
+
+
+def _program(policy: ShellPolicy, word: str, shell: Shell) -> str:
+    """A program word as the shell would look it up: case-insensitive on Windows and in
+    PowerShell, with `.exe` optional on Windows."""
+    if policy.windows or shell == "powershell":
+        word = word.casefold()
+    if policy.windows and word.endswith(".exe"):
+        word = word[: -len(".exe")]
+    return word
+
+
+def _trusted_read_only(policy: ShellPolicy, word: str, shell: Shell) -> str | None:
+    """The read-only command a word runs, or None when it names a program by path (`./cat`,
+    `.\\cat.ps1`), which could be anything in the repo."""
+    if "/" in word or "\\" in word:
+        return None
+    program = _program(policy, word, shell)
+    return program if program in READ_ONLY else None
 
 
 def _check_wrapper(
@@ -306,25 +373,27 @@ def _check_wrapper(
 # --------------------------------------------------------- cd and deletes
 
 
-def _cd(
-    policy: ShellPolicy, words: list[str], args: list[str], shell: Shell, cwds: set[Path]
-) -> None:
-    targets = [a for a in args if not a.startswith("-")]
+def _cd(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]) -> set[Path]:
+    words = part.words
+    targets = [(a, w) for a, w in zip(words[1:], part.wild[1:], strict=True) if a[:1] != "-"]
     if not targets:
         raise _Blocked(
             f"`{' '.join(words)}` goes to the home folder; cd only to folders inside the "
             f"worktree ({policy.worktree})."
         )
     moved: set[Path] = set()
+    raw, wild = targets[0]
     for cwd in cwds:  # every folder the shell could be in at this point
-        path = _resolve(policy, targets[0], cwd, shell)
-        if path is None or _relative(policy, path, policy.worktree) is None:
-            raise _Blocked(
-                f"`{' '.join(words)}` leaves the worktree ({policy.worktree}); cd only to "
-                "folders inside it."
-            )
-        moved.add(path)
-    cwds |= moved  # a subshell's cd may not stick, so keep the old folders too
+        for _, path in _targets(policy, raw, wild, cwd, shell):
+            if path is None or _relative(policy, path, policy.worktree) is None:
+                raise _Blocked(
+                    f"`{' '.join(words)}` leaves the worktree ({policy.worktree}); cd only to "
+                    "folders inside it."
+                )
+            moved.add(path)
+            if not path.is_dir():
+                moved.add(cwd)  # the cd fails and the shell stays where it was
+    return moved
 
 
 def _check_delete(
@@ -332,79 +401,119 @@ def _check_delete(
 ) -> None:
     for target in (a for a in args if not a.startswith("-")):
         for cwd in cwds:
-            path = _resolve(policy, target, cwd, shell)
-            rel = None if path is None else _relative(policy, path, policy.worktree)
-            if not rel:  # outside, the worktree itself, or a parent of it
-                raise _Blocked(
-                    f"`{' '.join(words)}` deletes the worktree, a parent folder or something "
-                    "outside the worktree."
-                )
+            for _, path in _targets(policy, target, True, cwd, shell):
+                rel = None if path is None else _relative(policy, path, policy.worktree)
+                if not rel:  # outside, the worktree itself, or a parent of it
+                    raise _Blocked(
+                        f"`{' '.join(words)}` deletes the worktree, a parent folder or "
+                        "something outside the worktree."
+                    )
 
 
 # --------------------------------------------------------------- read-only
 
 
 def _check_read_only(
-    policy: ShellPolicy,
-    name: str,
-    words: list[str],
-    args: list[str],
-    piped: bool,
-    shell: Shell,
-    cwds: set[Path],
+    policy: ShellPolicy, name: str, part: _Part, shell: Shell, cwds: set[Path]
 ) -> None:
-    for arg in args:
-        flag = arg.casefold()
-        if any(flag == f or flag.startswith(f + "=") for f in READ_ONLY[name]):
+    words = part.words
+    args = list(zip(words[1:], part.wild[1:], strict=True))
+    clusters = not (shell == "powershell" and name in CMDLET_ALIASES)
+    for arg, _ in args:
+        if _forbidden(name, arg, clusters):
             raise _Blocked(
                 f"`{words[0]} {arg}` can change files or run commands; the {policy.role} may run "
                 "read-only commands only."
             )
-    paths = [a for a in args if not a.startswith("-")]
-    if name in SEARCHES and paths and not any(a.casefold() in PATTERN_FLAGS for a in args):
-        paths = paths[1:]  # the first one is the pattern
+    positional = [(a, w) for a, w in args if not a.startswith("-")]
+    if name in SEARCHES and positional and not any(a.casefold() in PATTERN_FLAGS for a, _ in args):
+        positional = positional[1:]  # the first one is the pattern
+    in_options = [
+        (value, any(c in value for c in WILDCARDS))
+        for arg, _ in args
+        if arg.startswith("-")
+        for value in _option_values(arg)
+    ]
     for cwd in cwds:
-        targets = [_resolve(policy, p, cwd, shell) for p in paths]
-        if name in SEARCHES and not paths and not piped:
-            targets = [cwd]  # searches the current folder
-        for raw, path in zip(paths or ["."], targets, strict=False):
-            if path is None or (
-                _relative(policy, path, policy.worktree) is None
-                and _relative(policy, path, policy.run_folder) is None
-            ):
+        checks: list[tuple[str, Path | None]] = []
+        if name in SEARCHES and not positional and not part.piped:
+            checks.append((".", cwd))  # searches the current folder
+        for raw, wild in positional + in_options:
+            checks += _targets(policy, raw, wild, cwd, shell)
+        for raw, path in checks:
+            if path is None or _working_relative(policy, path) is None:
                 raise _Blocked(
                     f"`{words[0]}` reads {raw}, outside the worktree and the run folder."
                 )
             if name in READS_CONTENT:
-                secret = _secret_under(path, policy.windows)
-                if secret is not None:
-                    raise _Blocked(
-                        f"`{words[0]}` would read {secret}, a secrets file (.env*). Narrow the "
-                        "paths so it skips the file."
-                    )
+                _check_reads(policy, words[0], path)
 
 
-def _secret_under(path: Path, windows: bool) -> Path | None:
-    """The first `.env*` file at or under `path`; links aren't followed."""
-    if _is_secret(path.name, windows):
-        return path
+def _forbidden(name: str, arg: str, clusters: bool) -> bool:
+    """Whether an argument is one of the command's forbidden flags, including attached values
+    (`--output=x`, `-ox`) and, with `clusters`, short flags combined in one word (`-uo x`)."""
+    for flag in READ_ONLY[name]:
+        if arg.casefold() == flag or arg.casefold().startswith(flag + "="):
+            return True
+        if clusters and len(flag) == 2 and re.match(r"-[^-]", arg) and flag[1] in arg[1:]:
+            return True
+    return False
+
+
+def _option_values(arg: str) -> list[str]:
+    """Everything in an option word that could name a file: `--from-file=x`, `-Path:x`, and
+    the attached value of a short option (`-fx`)."""
+    body = arg.lstrip("-")
+    values = [body.split(sep, 1)[1] for sep in "=:" if sep in body]
+    if not arg.startswith("--") and len(body) > 1:
+        values.append(body[1:])
+    return [v for v in values if v]
+
+
+def _check_reads(policy: ShellPolicy, command: str, path: Path) -> None:
+    """Block a content read that can reach a `.env*` file, or follow a link out of the working
+    folders. Links are followed, as `grep -R` and friends do."""
+    if _is_secret(path.name, policy.windows):
+        raise _Blocked(f"`{command}` would read {path}, a secrets file (.env*).")
     if not path.is_dir():
-        return None
-    folders = [path]
+        return
+    folders, seen = [path], set[str]()
     while folders:
         folder = folders.pop()
+        key = _key(str(folder), policy.windows)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
             entries = list(os.scandir(folder))
         except OSError as err:
             raise _Blocked(f"can't list {folder} to check for secrets ({err}).") from err
         for entry in entries:
+            found = Path(entry.path)
+            if _is_secret(entry.name, policy.windows):
+                raise _Blocked(
+                    f"`{command}` would read {found}, a secrets file (.env*). Narrow the paths "
+                    "so it skips the file."
+                )
+            # DirEntry.is_junction is new in Python 3.12, the version this package needs.
             if entry.is_symlink() or entry.is_junction():
-                continue
-            if entry.is_dir(follow_symlinks=False):
-                folders.append(Path(entry.path))
-            elif _is_secret(entry.name, windows):
-                return Path(entry.path)
-    return None
+                try:
+                    target = found.resolve()
+                except (OSError, ValueError, RuntimeError) as err:
+                    raise _Blocked(f"`{command}` meets {found}, a broken link ({err}).") from err
+                if _working_relative(policy, target) is None:
+                    raise _Blocked(
+                        f"`{command}` could follow {found}, a link outside the worktree and the "
+                        "run folder. Narrow the paths to skip it."
+                    )
+                if target.is_dir():
+                    folders.append(target)
+                elif _is_secret(target.name, policy.windows):
+                    raise _Blocked(
+                        f"`{command}` would read {found}, a link to a secrets file (.env*)."
+                    )
+            elif entry.is_dir(follow_symlinks=False):
+                folders.append(found)
 
 
 def _is_secret(name: str, windows: bool) -> bool:
@@ -414,15 +523,37 @@ def _is_secret(name: str, windows: bool) -> bool:
 # ----------------------------------------------------------------- paths
 
 
-def _resolve(policy: ShellPolicy, raw: str, cwd: Path, shell: Shell) -> Path | None:
-    """Where a path argument really leads, or None when it can't be judged."""
-    text = raw
-    if text.startswith("~") or text.replace("\\", "/").startswith("//"):
+def _targets(
+    policy: ShellPolicy, raw: str, wild: bool, cwd: Path, shell: Shell
+) -> list[tuple[str, Path | None]]:
+    """The real paths an argument names: every match of a wildcard the shell (or a PowerShell
+    cmdlet) expands, else the literal path. None for a path that can't be judged."""
+    text = _translate(policy, raw, shell)
+    if text is None:
+        return [(raw, None)]
+    if wild and any(c in text for c in WILDCARDS):
+        try:
+            # Path.glob refuses absolute patterns and `..`, which are exactly the ones to check.
+            matches = glob.glob(text, root_dir=cwd, recursive=True, include_hidden=True)  # noqa: PTH207
+        except (OSError, ValueError):
+            return [(raw, None)]
+        if matches:
+            return [(m, _to_path(m, cwd)) for m in matches]
+    return [(raw, _to_path(text, cwd))]
+
+
+def _translate(policy: ShellPolicy, raw: str, shell: Shell) -> str | None:
+    """A path argument as a native path, or None when it can't be judged."""
+    if raw.startswith("~") or raw.replace("\\", "/").startswith("//"):
         return None  # home folder, network or device path
     if policy.windows and shell == "bash":
-        drive = re.match(r"/([A-Za-z])(/|$)", text)
+        drive = re.match(r"/([A-Za-z])(/|$)", raw)
         if drive:  # Git Bash writes C:\x as /c/x
-            text = f"{drive.group(1)}:/{text[drive.end() :]}"
+            return f"{drive.group(1)}:/{raw[drive.end() :]}"
+    return raw
+
+
+def _to_path(text: str, cwd: Path) -> Path | None:
     path = Path(text)
     if not path.is_absolute() and (path.drive or path.root):
         return None  # drive-relative (`C:x`) or rooted without a drive (`\x`, `/x` on Windows)
@@ -430,6 +561,11 @@ def _resolve(policy: ShellPolicy, raw: str, cwd: Path, shell: Shell) -> Path | N
         return (path if path.is_absolute() else cwd / path).resolve()
     except (OSError, ValueError, RuntimeError):
         return None
+
+
+def _working_relative(policy: ShellPolicy, path: Path) -> str | None:
+    rel = _relative(policy, path, policy.worktree)
+    return rel if rel is not None else _relative(policy, path, policy.run_folder)
 
 
 def _relative(policy: ShellPolicy, path: Path, root: Path) -> str | None:
@@ -449,7 +585,8 @@ def _key(text: str, windows: bool) -> str:
 
 
 def _name(word: str) -> str:
-    """A command word as a bare, lower-case program name: `C:\\Git\\bin\\Git.EXE` is `git`."""
+    """A command word as a bare, lower-case program name: `C:\\Git\\bin\\Git.EXE` is `git`.
+    Used to deny; granting compares the word itself (see `_program`)."""
     base = re.split(r"[\\/]", word)[-1].casefold()
     for suffix in SUFFIXES:
         if base.endswith(suffix):
@@ -460,24 +597,27 @@ def _name(word: str) -> str:
 # ----------------------------------------------------------------- lexer
 
 
-def _lex(command: str, shell: Shell) -> list[tuple[list[str], bool]]:
-    """Split a command into parts of words, quotes removed. Each part says whether a pipe
-    feeds it. Raises `_Blocked` for anything the check can't judge."""
+def _lex(command: str, shell: Shell, windows: bool) -> list[_Part | str]:
+    """Split a command into parts, with `(` and `)` marking groups. Raises `_Blocked` for
+    anything the check can't judge."""
     if re.search(r"%[A-Za-z_][\w()]*%", command):
         raise _Blocked(_EXPANSION)
-    lexer = _Lexer(command, shell)
+    lexer = _Lexer(command, shell, windows)
     lexer.run()
-    return lexer.parts
+    return lexer.items
 
 
 class _Lexer:
-    def __init__(self, command: str, shell: Shell) -> None:
+    def __init__(self, command: str, shell: Shell, windows: bool) -> None:
         self.text = command
         self.shell = shell
-        self.parts: list[tuple[list[str], bool]] = []
+        self.windows = windows
+        self.items: list[_Part | str] = []
         self.words: list[str] = []
+        self.wild: list[bool] = []
         self.buf: list[str] = []
         self.started = False  # a word has begun, even an empty quoted one
+        self.globbed = False  # the word has a wildcard the shell expands
         self.redirect = False  # the next word is a redirect target
         self.piped = False  # the part being read is fed by a pipe
         self.i = 0
@@ -505,8 +645,12 @@ class _Lexer:
             elif c in " \t\r":
                 self._end_word()
                 self.i += 1
-            elif c in "\n;()":
+            elif c in "\n;":
                 self._end_part(piped=False)
+                self.i += 1
+            elif c in "()":
+                self._end_part(piped=False)
+                self.items.append(c)
                 self.i += 1
             elif c in "&|":
                 self._operator(c)
@@ -518,6 +662,8 @@ class _Lexer:
                 while self.i < n and text[self.i] != "\n":
                     self.i += 1
             else:
+                if c in WILDCARDS:
+                    self.globbed = True
                 self.buf.append(c)
                 self.started = True
                 self.i += 1
@@ -586,6 +732,8 @@ class _Lexer:
     def _operator(self, c: str) -> None:
         double = self.text[self.i : self.i + 2] in ("&&", "||")
         self._end_part(piped=c == "|" and not double)
+        if not double and self.items and isinstance(self.items[-1], _Part):
+            self.items[-1].detached = True  # `a | b` and `a &` run a in its own process
         self.i += 2 if double else 1
 
     def _redirect(self, c: str) -> None:
@@ -609,25 +757,37 @@ class _Lexer:
         self.redirect = True
         self.i = j
 
+    def _is_null(self, word: str) -> bool:
+        """The null device for this shell and platform. `nul` is a plain file name outside
+        Windows, and Bash on Windows (Git Bash) writes the device as `/dev/null`."""
+        if self.shell == "bash":
+            return word == "/dev/null"
+        if word.casefold() == "$null":
+            return True
+        return word.casefold() in ("nul", "nul:") if self.windows else word == "/dev/null"
+
     def _end_word(self) -> None:
         if not self.started:
             return
         word = "".join(self.buf)
-        self.buf, self.started = [], False
+        # PowerShell cmdlets expand wildcards in paths themselves, even quoted ones.
+        wild = self.globbed or (self.shell == "powershell" and any(c in word for c in WILDCARDS))
+        self.buf, self.started, self.globbed = [], False, False
         if self.redirect:
             self.redirect = False
-            if word.casefold() not in NULL_TARGETS:
+            if not self._is_null(word):
                 raise _Blocked(
                     f"the redirect to {word} writes a file; redirect only to the null device."
                 )
         else:
             self.words.append(word)
+            self.wild.append(wild)
 
     def _end_part(self, *, piped: bool) -> None:
         self._end_word()
         if self.redirect:
             raise _Blocked("a redirect has no target.")
         if self.words:
-            self.parts.append((self.words, self.piped))
-        self.words = []
+            self.items.append(_Part(self.words, self.wild, self.piped))
+        self.words, self.wild = [], []
         self.piped = piped

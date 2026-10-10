@@ -168,6 +168,46 @@ CASES = [
     ("planner", "sh", "grep -r TOKEN .", False, "secret"),
     ("planner", "sh", "grep -r TOKEN", False, "secret"),
     ("planner", "sh", "git log", False, "git"),
+    # ---- review round 1: wildcards the shell expands (issue 1)
+    ("planner", "sh", "cat config/.en[v].local", False, "secret"),
+    ("planner", "sh", "cat config/.env*", False, "secret"),
+    ("planner", "sh", "cat config/*", False, "secret"),
+    ("planner", "sh", "cat ../outside_folder/*", False, "outside"),
+    ("planner", "sh", "cat ../*/x", False, "outside"),
+    ("planner", "sh", "cat src/*.py", True, ""),
+    ("planner", "sh", "cat 'config/.en[v].local'", True, ""),
+    ("planner", "ps", "Get-Content 'config/.en[v].local'", False, "secret"),
+    ("builder", "sh", "cd ../*", False, "worktree"),
+    # ---- attached and combined short flags (issue 2)
+    ("planner", "sh", "sort -ooutput.txt src/app.py", False, "read-only"),
+    ("planner", "sh", "sort -uo out.txt src/app.py", False, "read-only"),
+    ("planner", "sh", "sort --output=out.txt src/app.py", False, "read-only"),
+    ("planner", "sh", "tree -oout.txt src", False, "read-only"),
+    ("planner", "sh", "sort -n src/app.py", True, ""),
+    ("planner", "ps", "sort -Property Name", True, ""),
+    # ---- programs named by path (issue 4)
+    ("planner", "sh", "./cat src/app.py", False, "plain name"),
+    ("planner", "sh", "src/cat src/app.py", False, "plain name"),
+    ("planner", "ps", "& .\\cat.ps1 src/app.py", False, "plain name"),
+    ("planner", "ps", "cat.ps1 src/app.py", False, "plain name"),
+    ("builder", "sh", "./uv run pytest", False, "isn't allowed"),
+    ("builder", "ps", ".\\uv.exe run pytest", False, "isn't allowed"),
+    # ---- paths inside options (issue 5)
+    ("planner", "sh", "diff --from-file=../outside_folder/x src/app.py", False, "outside"),
+    ("planner", "sh", "diff --from-file=config/.env.local src/app.py", False, "secret"),
+    ("planner", "sh", "grep -f../outside_folder/x def src", False, "outside"),
+    ("planner", "ps", "Get-Content -Path:../outside_folder/x", False, "outside"),
+    ("planner", "sh", "head -n5 src/app.py", True, ""),
+    ("planner", "sh", "grep -rn --include=*.py def src", True, ""),
+    # ---- cd: returning to the worktree, subshells and pipes (issue 8)
+    ("builder", "sh", "cd src && cd ..", True, ""),
+    ("builder", "sh", "cd src; cd ..", True, ""),
+    ("builder", "sh", "cd src && cd .. && uv run pytest", True, ""),
+    ("builder", "sh", "cd missing; cd ..", False, "worktree"),
+    ("builder", "sh", "(cd src && cd ..) && cd ..", False, "worktree"),
+    ("builder", "ps", "(cd src); cd ..", False, "worktree"),
+    ("planner", "sh", "cd src | ls; cd ..", False, "worktree"),
+    ("builder", "sh", "uv run pytest)", False, "parentheses"),
     # ---- the reviewer: no shell at all
     ("reviewer", "sh", "ls", False, "no shell"),
     ("reviewer", "sh", "uv run pytest", False, "no shell"),
@@ -185,6 +225,8 @@ WINDOWS_CASES = [
     ("builder", "sh", "cd SRC && uv run pytest", True, ""),
     ("planner", "ps", "Get-Content ..\\outside_folder\\x", False, "outside"),
     ("planner", "ps", "type \\\\server\\share\\x", False, "outside"),
+    ("builder", "ps", "uv run pytest > nul", True, ""),
+    ("planner", "ps", "cat.exe src/app.py", True, ""),
 ]
 
 
@@ -256,3 +298,106 @@ def test_a_tool_that_is_not_a_shell_is_blocked(roots: dict[str, Path]) -> None:
         "builder", _settings(), worktree=roots["wt"], run_folder=roots["run"]
     )
     _assert(check_shell_command(policy, "Read", {"file_path": "x"}), False, "shell")
+
+
+# ------------------------------------------------- null devices (issue 3)
+
+
+@pytest.mark.parametrize(
+    ("shell", "target", "windows", "allowed"),
+    [
+        ("sh", "/dev/null", False, True),
+        ("sh", "/dev/null", True, True),
+        ("sh", "nul", False, False),
+        ("sh", "nul", True, False),  # Git Bash: `nul` isn't the device there
+        ("sh", "/DEV/NULL", False, False),
+        ("ps", "$null", False, True),
+        ("ps", "$NULL", True, True),
+        ("ps", "nul", True, True),
+        ("ps", "NUL", True, True),
+        ("ps", "nul", False, False),
+        ("ps", "/dev/null", False, True),
+        ("ps", "/dev/null", True, False),
+    ],
+)
+def test_the_null_device_depends_on_shell_and_platform(
+    roots: dict[str, Path], shell: str, target: str, windows: bool, allowed: bool
+) -> None:
+    policy = ShellPolicy.build(
+        "planner", _settings(), worktree=roots["wt"], run_folder=roots["run"], windows=windows
+    )
+    decision = check_shell_command(policy, TOOLS[shell], {"command": f"pwd > {target}"})
+    _assert(decision, allowed, "redirect")
+
+
+# ---------------------------------- links a content read follows (issue 6)
+
+
+def _junction(link: Path, target: Path) -> None:
+    import _winapi  # Windows only; the stdlib's own junction call
+
+    _winapi.CreateJunction(str(target), str(link))
+
+
+@WINDOWS
+@pytest.mark.parametrize("command", ["grep -R TOKEN src", "cat src/link/x", "grep -r x"])
+def test_a_read_through_a_link_out_of_the_worktree_is_blocked(
+    roots: dict[str, Path], command: str
+) -> None:
+    (roots["wt"] / "config" / ".env.local").unlink()
+    _junction(roots["wt"] / "src" / "link", roots["out"])
+    _assert(_check(roots, "planner", "sh", command), False, "outside")
+
+
+@WINDOWS
+def test_a_read_through_a_link_to_a_secrets_folder_is_blocked(roots: dict[str, Path]) -> None:
+    _junction(roots["wt"] / "src" / "cfg", roots["wt"] / "config")
+    _assert(_check(roots, "planner", "sh", "grep -R TOKEN src"), False, "secret")
+
+
+@WINDOWS
+def test_a_read_through_a_link_inside_the_worktree_is_allowed(roots: dict[str, Path]) -> None:
+    (roots["wt"] / "lib").mkdir()
+    _junction(roots["wt"] / "src" / "lib", roots["wt"] / "lib")
+    _assert(_check(roots, "planner", "sh", "grep -R def src"), True, "")
+
+
+def test_a_symlink_to_a_secrets_file_is_blocked(roots: dict[str, Path]) -> None:
+    try:
+        (roots["wt"] / "src" / "notes.txt").symlink_to(roots["wt"] / "config" / ".env.local")
+    except OSError as err:
+        pytest.skip(f"can't create symlinks here: {err}")
+    _assert(_check(roots, "planner", "sh", "grep -R TOKEN src"), False, "secret")
+
+
+# --------------------------- configured commands per shell (issue 7)
+
+
+def _policy_with_test(roots: dict[str, Path], test: str) -> ShellPolicy:
+    base = _settings()
+    settings = base.model_copy(update={"commands": base.commands.model_copy(update={"test": test})})
+    return ShellPolicy.build("builder", settings, worktree=roots["wt"], run_folder=roots["run"])
+
+
+@pytest.mark.parametrize(
+    ("tool", "command", "allowed"),
+    [
+        ("PowerShell", "python scripts\\test.py", True),
+        ("PowerShell", "python scripts\\test.py -q", True),
+        ("PowerShell", "python scriptstest.py", False),
+        ("Bash", "python scripts\\test.py", True),
+        ("Bash", "python scriptstest.py", True),  # what Bash itself runs for both
+        ("Bash", "python 'scripts\\test.py'", False),
+    ],
+)
+def test_configured_commands_are_read_with_the_calls_shell(
+    roots: dict[str, Path], tool: str, command: str, allowed: bool
+) -> None:
+    policy = _policy_with_test(roots, "python scripts\\test.py")
+    decision = check_shell_command(policy, tool, {"command": command})
+    _assert(decision, allowed, "isn't allowed")
+
+
+def test_a_configured_command_a_shell_cant_read_allows_nothing(roots: dict[str, Path]) -> None:
+    policy = _policy_with_test(roots, "pytest $ARGS")
+    _assert(check_shell_command(policy, "Bash", {"command": "pytest"}), False, "")
