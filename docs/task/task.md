@@ -269,7 +269,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.1
 - **Note:** protected files are a fixed list for every repo and role, the bootstrap builder included: `.git` (a file in a linked worktree) and `.git/**`, `.claude/**`, `.github/**`, `factory.yaml`, `CLAUDE.md`, `.env*` anywhere. Every role may read the worktree and the run folder (not `.env*`); a Grep is checked against every file it can open, so it can't read `.env*` or follow a link out. In the run folder a role writes only its own run docs: the run-doc names in its `write_paths` (`plan.md`, `review.md`) and its `handoff-<role>.md` (not the reviewer); its other `write_paths` apply to the worktree only. The engine passes in the files the tester created; every role but the tester is locked out of them. Agreed with Kunal (Oct 10, 2026).
 
-### [ ] 2.9 Safety hook: shell commands
+### [x] 2.9 Safety hook: shell commands
 
 - **What:** Add a PreToolUse check for Bash and PowerShell. It splits compound commands (`&&`, `||`, `;`, `|`, subshells) and checks each part against the role's allowlist. It also blocks:
   - every `git` command, for every role (agents never run git; the engine commits)
@@ -284,6 +284,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - The planner is allowed only read-only commands.
 - **Tests:** Table-driven unit tests.
 - **Depends on:** 2.1
+- **Note:** "read-only commands" is a fixed list in `safety/commands.py` (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `stat`, `diff`, `sort`, `pwd`, `which` and their PowerShell forms), minus flags that write or run something (`find -exec`/`-delete`, `rg --pre`, `sort -o`). Their paths must stay inside the worktree and the run folder, and a content read may not reach `.env*`, through wildcards, option values (`--from-file=x`, `-fx`) or links included. Programs given by path (`./cat`) never count as read-only or allowlisted. A search (`grep`, `rg`, `Select-String`) checks every argument as a path and its current folder too unless input is piped in, so it is blocked whenever a `.env*` file is in reach. The tester and builder run only their allowlist, plus `cd` inside the worktree. `gh` is blocked with `git`. Anything the check can't judge is blocked: expansion (`$`, backticks, `%X%`, `@splat`), braces, input redirects, output redirects except to the null device, `VAR=x` prefixes, and wrappers (`cmd /c`, `powershell -c`, `bash -c`, `env`, `xargs`, `iex`, ...), whose inner command is checked for the reason. Built on `main` before 2.8 merged, at Kunal's request (Oct 10, 2026).
 
 ### [ ] 2.10 Secret scan
 
