@@ -222,6 +222,18 @@ CASES = [
     ("planner", "ps", "Select-String -Pattern TOKEN config/.env.local", False, "secret"),
     ("planner", "ps", "sls -Pat TOKEN config/.env.local", False, "secret"),
     ("planner", "sh", "grep -e def src", True, ""),
+    # ---- review round 3: long options match exactly; unsure means check the folder too
+    ("planner", "sh", "rg --hidden --no-ignore --files-with-matches TOKEN", False, "secret"),
+    ("planner", "sh", "grep -rl --files-without-match TOKEN", False, "secret"),
+    ("planner", "sh", "rg --regex=TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "rg -e TOKEN", False, "secret"),
+    ("planner", "sh", "grep -ie TOKEN", False, "secret"),
+    ("planner", "sh", "grep -ie TOKEN src", True, ""),
+    ("planner", "ps", "Select-String -pa TOKEN", False, "secret"),
+    ("planner", "sh", "rg -e TOKEN -e def src", True, ""),
+    ("planner", "sh", "rg -f src/app.py", False, "secret"),
+    ("planner", "sh", "rg --files-with-matches def src", True, ""),
+    ("planner", "sh", "grep -e def -e main src", True, ""),
     # ---- options that run a program (issue 3)
     ("planner", "sh", "sort --compress-program=./payload -S 1K src/app.py", False, "read-only"),
     ("planner", "sh", "sort --compress-program ./payload src/app.py", False, "read-only"),

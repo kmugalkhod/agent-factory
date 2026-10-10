@@ -465,8 +465,16 @@ def _check_read_only(
                 "read-only commands only."
             )
     positional = [(a, w) for a, w in args if not a.startswith("-")]
-    if name in SEARCHES and positional and not _pattern_in_option(words[1:], shell):
-        positional = positional[1:]  # the first one is the pattern
+    searches_here = False
+    if name in SEARCHES:
+        given, values = _pattern_option(words[1:], shell)
+        if given == "no" and positional:
+            positional = positional[1:]  # the first one is the pattern
+        # With no path the search reads the current folder. Values of separate pattern options
+        # (`-e x`) aren't paths; when it's unclear whether an option gave the pattern, one
+        # positional argument may be it. Every positional argument is still checked as a path.
+        paths = len(positional) - values - (1 if given == "maybe" else 0)
+        searches_here = not part.piped and paths <= 0
     in_options = [
         (value, any(c in value for c in WILDCARDS))
         for arg, _ in args
@@ -475,8 +483,8 @@ def _check_read_only(
     ]
     for cwd in cwds:
         checks: list[tuple[str, Path | None]] = []
-        if name in SEARCHES and not positional and not part.piped:
-            checks += _targets(policy, ".", False, cwd, shell)  # searches the current folder
+        if searches_here:
+            checks += _targets(policy, ".", False, cwd, shell)
         for raw, wild in positional + in_options:
             checks += _targets(policy, raw, wild, cwd, shell)
         for raw, path in checks:
@@ -488,19 +496,32 @@ def _check_read_only(
                 _check_reads(policy, words[0], path)
 
 
-def _pattern_in_option(args: list[str], shell: Shell) -> bool:
-    """Whether an option may give the search pattern (`-e x`, `-ex`, `-ie x`, `--regexp=x`,
-    `-f file`, `-Pattern x`), so that no positional argument is the pattern. When unsure it
-    says yes, and then every positional argument is checked as a path."""
+def _pattern_option(args: list[str], shell: Shell) -> tuple[Literal["yes", "maybe", "no"], int]:
+    """Whether an option gives the search pattern, so that no positional argument is it.
+
+    "yes" for `-e x`, `-ex`, `-f file`, `--regexp[=x]` or an abbreviation of it, `--file[=x]`
+    and `-Pattern` down to `-Pat`. "maybe" for a short flag that may hide one in a group
+    (`-ie x`) and an ambiguous PowerShell prefix (`-p`, `-pa`). Long options are matched
+    exactly: `--files-with-matches` is not `--file`. Also returns how many of the following
+    arguments are values of such options given separately (`-e x`), so not paths."""
+    given: Literal["yes", "maybe", "no"] = "no"
+    values = 0
     for arg in args:
         lowered = arg.casefold()
-        if lowered.startswith(("--regexp", "--file")):
-            return True
-        if shell == "powershell" and lowered.startswith("-p"):  # -Pattern or a prefix of it
-            return True
-        if re.match(r"-[^-]", arg) and ("e" in arg[1:] or "f" in arg[1:]):
-            return True
-    return False
+        option = lowered.split("=", 1)[0]
+        if option == "--file" or (len(option) > 4 and "--regexp".startswith(option)):
+            given, values = "yes", values + ("=" not in arg)
+        elif shell == "powershell" and lowered.startswith("-p"):
+            name = option.split(":", 1)[0]
+            if len(name) >= 4 and "-pattern".startswith(name):
+                given, values = "yes", values + (":" not in arg)
+            elif "-pattern".startswith(name) and given == "no":
+                given = "maybe"  # -p and -pa could be -Path too
+        elif arg.startswith(("-e", "-f")) and not arg.startswith("--"):
+            given, values = "yes", values + (len(arg) == 2)
+        elif re.match(r"-[^-]", arg) and ("e" in arg[2:] or "f" in arg[2:]) and given == "no":
+            given = "maybe"
+    return given, values
 
 
 def _forbidden(name: str, arg: str, clusters: bool) -> bool:
