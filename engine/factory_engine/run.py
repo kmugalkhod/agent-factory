@@ -4,6 +4,7 @@
 crash. It is written atomically, so a crash mid-write leaves the previous version intact.
 """
 
+import contextlib
 import os
 import re
 import tempfile
@@ -13,7 +14,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
-from factory_engine.errors import RunFileError
+from factory_engine.errors import DataFolderError, RunFileError
 from factory_engine.paths import repo_runs_dir, run_dir
 
 Role = Literal["planner", "tester", "builder", "reviewer"]
@@ -108,7 +109,8 @@ def save_run(run: Run, folder: Path) -> None:
         temp.replace(target)  # atomic on the same volume (os.replace)
     except OSError as err:
         if temp is not None:
-            temp.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):  # a failed cleanup must not hide `err`
+                temp.unlink(missing_ok=True)
         raise RunFileError(
             f"{target}: couldn't write ({err}). The previous version is unchanged; retry the save."
         ) from err
@@ -139,16 +141,33 @@ def allocate_run(data: Path, repo: str, slug: str) -> tuple[int, Path]:
     """
     claims = repo_runs_dir(data, repo) / CLAIMS
     run_dir(data, repo, 0, slug)  # validate repo and slug before touching the disk
-    claims.mkdir(parents=True, exist_ok=True)
-    run_id = 1 + max(
-        (int(p.name) for p in claims.iterdir() if CLAIMED_ID.fullmatch(p.name)), default=-1
-    )
+    try:
+        claims.mkdir(parents=True, exist_ok=True)
+        run_id = 1 + max(
+            (int(p.name) for p in claims.iterdir() if CLAIMED_ID.fullmatch(p.name)), default=-1
+        )
+    except OSError as err:
+        raise DataFolderError(
+            f"{claims}: can't create or read the run ID claims ({err}). "
+            "Check the data folder exists as a writable folder."
+        ) from err
     while True:
+        claim = claims / str(run_id)
         try:
-            (claims / str(run_id)).touch(exist_ok=False)
+            claim.touch(exist_ok=False)
             break
         except FileExistsError:
             run_id += 1
+        except OSError as err:
+            raise DataFolderError(
+                f"{claim}: can't claim run ID {run_id} ({err}). Check {claims} is writable."
+            ) from err
     folder = run_dir(data, repo, run_id, slug)
-    folder.mkdir()
+    try:
+        folder.mkdir()
+    except OSError as err:
+        raise DataFolderError(
+            f"{folder}: can't create the run folder ({err}). Run ID {run_id} stays claimed; "
+            "clear that path and start the run again."
+        ) from err
     return run_id, folder

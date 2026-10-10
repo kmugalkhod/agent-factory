@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from factory_engine import run as run_module
-from factory_engine.errors import RunFileError
+from factory_engine.errors import DataFolderError, RunFileError
 from factory_engine.paths import run_dir
 from factory_engine.run import Metrics, Run, allocate_run, load_run, new_run, save_run
 
@@ -168,6 +168,51 @@ def test_concurrent_allocation_gives_unique_ids(tmp_path: Path) -> None:  # AC4
     for thread in threads:
         thread.join()
     assert sorted(ids) == list(range(20))
+
+
+def test_cleanup_failure_doesnt_hide_the_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR #12 review: an error deleting the temp file must not replace the RunFileError."""
+
+    def crash(*args: object, **kwargs: object) -> None:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(run_module.os, "replace", crash)
+    monkeypatch.setattr(Path, "unlink", crash)
+    with pytest.raises(RunFileError) as exc:
+        save_run(_run(), tmp_path)
+    assert str(tmp_path / "run.json") in str(exc.value)
+
+
+def test_allocate_when_data_folder_is_a_file_names_the_path(tmp_path: Path) -> None:
+    """PR #12 review: disk failures in allocate_run raise DataFolderError, not OSError."""
+    data = tmp_path / "data"
+    data.write_text("not a folder", encoding="utf-8")
+    with pytest.raises(DataFolderError) as exc:
+        allocate_run(data, "app", "x")
+    assert str(data) in str(exc.value)
+
+
+def test_failed_id_claim_names_the_claim_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def deny(self: Path, *args: object, **kwargs: object) -> None:
+        raise PermissionError("access denied")
+
+    monkeypatch.setattr(Path, "touch", deny)
+    with pytest.raises(DataFolderError) as exc:
+        allocate_run(tmp_path, "app", "x")
+    assert str(tmp_path / "runs" / "app" / ".ids") in str(exc.value)
+
+
+def test_blocked_run_folder_names_the_folder(tmp_path: Path) -> None:
+    blocker = run_dir(tmp_path, "app", 0, "x")
+    blocker.parent.mkdir(parents=True)
+    blocker.write_text("a file where the run folder goes", encoding="utf-8")
+    with pytest.raises(DataFolderError) as exc:
+        allocate_run(tmp_path, "app", "x")
+    assert str(blocker) in str(exc.value)
 
 
 def test_save_writes_through_a_temp_file_and_replace(

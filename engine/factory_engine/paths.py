@@ -10,6 +10,8 @@ DATA_ENV = "AGENT_FACTORY_DATA"
 """Environment variable that overrides the data folder."""
 
 REPO_NAME = re.compile(r"[A-Za-z0-9._-]{1,100}")
+# Windows device names open a device, not a folder, with or without an extension (`CON.txt`).
+WINDOWS_DEVICE = re.compile(r"(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?", re.IGNORECASE)
 SLUG = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 MAX_SLUG = 40
 
@@ -30,10 +32,14 @@ def data_dir(env: Mapping[str, str]) -> Path:
 
 def repo_runs_dir(data: Path, repo: str) -> Path:
     """`<data>/runs/<repo>/`: every run of one repo. Run IDs count up per repo."""
-    if not REPO_NAME.fullmatch(repo) or repo in (".", ".."):
+    if not REPO_NAME.fullmatch(repo) or repo.endswith("."):
         raise DataFolderError(
-            f"repo name {repo!r} can't be used as a folder name. "
-            "Use 1 to 100 letters, digits, '.', '_' or '-'."
+            f"repo name {repo!r} can't be used as a folder name. Use 1 to 100 letters, digits, "
+            "'.', '_' or '-', not ending in '.' (Windows drops a trailing period)."
+        )
+    if WINDOWS_DEVICE.fullmatch(repo):
+        raise DataFolderError(
+            f"repo name {repo!r} is a reserved Windows device name. Rename the repo entry."
         )
     return data / "runs" / repo
 
