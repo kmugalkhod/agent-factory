@@ -19,3 +19,7 @@ class RunFileError(FactoryError):
 
 class RegistryError(FactoryError):
     """The SQLite registry can't be opened, migrated, read or written."""
+
+
+class EventLogError(FactoryError):
+    """A run's `events.jsonl` can't be read or written, or holds an invalid event."""

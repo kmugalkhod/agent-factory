@@ -184,7 +184,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Unit tests on a temporary database, including rebuild and migration from version 0.
 - **Depends on:** 2.2
 
-### [ ] 2.4 Event stream
+### [x] 2.4 Event stream
 
 - **What:** Add an append-only `events.jsonl` per run with typed events:
   - `state_changed`, `stage_started`, `stage_finished`
