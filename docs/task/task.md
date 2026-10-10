@@ -267,7 +267,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   Every block has a non-empty reason.
 - **Tests:** Table-driven unit tests, plus junction cases on a temporary folder.
 - **Depends on:** 2.1
-- **Note:** protected files are a fixed list for every repo and role, the bootstrap builder included: `.git/**`, `.claude/**`, `.github/**`, `factory.yaml`, `CLAUDE.md`, `.env*` anywhere. Every role may read the worktree and the run folder (not `.env*`). In the run folder a role writes only its own run docs: the run-doc names in its `write_paths` (`plan.md`, `review.md`) and its `handoff-<role>.md` (not the reviewer); its other `write_paths` apply to the worktree only. The engine passes in the files the tester created; every role but the tester is locked out of them. Agreed with Kunal (Oct 10, 2026).
+- **Note:** protected files are a fixed list for every repo and role, the bootstrap builder included: `.git` (a file in a linked worktree) and `.git/**`, `.claude/**`, `.github/**`, `factory.yaml`, `CLAUDE.md`, `.env*` anywhere. Every role may read the worktree and the run folder (not `.env*`); a Grep is checked against every file it can open, so it can't read `.env*` or follow a link out. In the run folder a role writes only its own run docs: the run-doc names in its `write_paths` (`plan.md`, `review.md`) and its `handoff-<role>.md` (not the reviewer); its other `write_paths` apply to the worktree only. The engine passes in the files the tester created; every role but the tester is locked out of them. Agreed with Kunal (Oct 10, 2026).
 
 ### [ ] 2.9 Safety hook: shell commands
 

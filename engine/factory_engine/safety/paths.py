@@ -12,6 +12,7 @@ are judged by where they really lead. Windows also rewrites some names on the wa
 Every block carries a reason the agent can act on.
 """
 
+import os
 import re
 import sys
 from collections.abc import Iterable, Mapping
@@ -19,10 +20,20 @@ from dataclasses import dataclass
 from pathlib import Path, PurePath
 
 from factory_engine.config import RoleSettings
+from factory_engine.errors import SafetyError
 from factory_engine.run import Role
 
 # Agents never write these, whatever the role's write paths say.
-PROTECTED = (".git/**", ".claude/**", ".github/**", "factory.yaml", "CLAUDE.md", "**/.env*")
+# `.git` alone is a file in a linked worktree.
+PROTECTED = (
+    ".git",
+    ".git/**",
+    ".claude/**",
+    ".github/**",
+    "factory.yaml",
+    "CLAUDE.md",
+    "**/.env*",
+)
 SECRETS = ("**/.env*",)
 RUN_DOCS = frozenset({"plan.md", "review.md"})
 NO_HANDOFF: frozenset[Role] = frozenset({"reviewer"})
@@ -38,6 +49,8 @@ FILE_TOOLS: dict[str, tuple[str, bool, str | None]] = {
     "Grep": ("path", False, "glob"),
 }
 OPTIONAL_PATH = frozenset({"Glob", "Grep"})  # these search the worktree when no path is given
+SEARCHES_CONTENT = frozenset({"Grep"})  # reads every file it searches, so each one is checked
+UNSURE_GLOB = re.compile(r"[{}\[\]]|^!")  # braces, classes and negation: assume it matches
 
 
 @dataclass(frozen=True)
@@ -81,16 +94,15 @@ class PathPolicy:
         docs = {p for p in settings.write_paths if p in RUN_DOCS}
         if role not in NO_HANDOFF:
             docs.add(f"handoff-{role}.md")
+        root = worktree.resolve()
         return cls(
             role=role,
-            worktree=worktree.resolve(),
+            worktree=root,
             run_folder=run_folder.resolve(),
             write_paths=tuple(p for p in settings.write_paths if p not in RUN_DOCS),
             deny_paths=tuple(settings.deny_paths),
             run_docs=frozenset(_key(d, windows) for d in docs),
-            locked=frozenset(
-                _key(p.replace("\\", "/").removeprefix("./"), windows) for p in locked
-            ),
+            locked=frozenset(_key(_locked_entry(root, p, windows), windows) for p in locked),
             windows=windows,
         )
 
@@ -108,19 +120,78 @@ def check_file_tool(
             return bad
     raw = tool_input.get(path_key)
     if raw is None and tool_name in OPTIONAL_PATH:
-        return ALLOW  # searches the working folder, the worktree
-    if not isinstance(raw, str) or not raw.strip():
+        raw, located = ".", policy.worktree  # searches the working folder, the worktree
+    elif not isinstance(raw, str) or not raw.strip():
         return _block(f"{tool_name} needs a file path in `{path_key}`.")
-    located = _locate(raw, policy)
-    if isinstance(located, PathDecision):
-        return located
-    return _write(policy, raw, located) if writes else _read(policy, raw, located)
+    else:
+        located = _locate(raw, policy)
+        if isinstance(located, PathDecision):
+            return located
+    if writes:
+        return _write(policy, raw, located)
+    decision = _read(policy, raw, located)
+    if decision.allowed and tool_name in SEARCHES_CONTENT:
+        glob = tool_input.get(pattern_key) if pattern_key else None
+        return _search(policy, located, glob if isinstance(glob, str) else None)
+    return decision
+
+
+def _search(policy: PathPolicy, root: Path, glob: str | None) -> PathDecision:
+    """Check every file a content search under `root` can open: no secrets files, and no
+    link that leads out of the working folders. A glob the check can't judge counts as
+    matching everything."""
+    if not root.is_dir():
+        return ALLOW  # one file, already checked as a read
+    folders = [root]
+    while folders:
+        folder = folders.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError as err:
+            return _block(f"can't list {folder} to check the search ({err}); narrow `path`.")
+        for entry in entries:
+            path = Path(entry.path)
+            if entry.is_symlink() or entry.is_junction():
+                try:
+                    target = path.resolve()
+                except (OSError, ValueError, RuntimeError) as err:
+                    return _block(
+                        f"the search meets {path}, a link that can't be resolved ({err})."
+                    )
+                if _working_relative(policy, target) is None:
+                    return _block(
+                        f"the search would follow {path}, a link outside the worktree. "
+                        "Narrow `path` to skip it."
+                    )
+                continue  # its target is searched where it really lives
+            if entry.is_dir(follow_symlinks=False):
+                folders.append(path)
+            elif _matches(entry.name, SECRETS, policy.windows) and _glob_may_match(
+                glob, path.relative_to(root).as_posix(), entry.name, policy.windows
+            ):
+                return _block(
+                    f"the search would read {path}, a secrets file (.env*). Narrow it with "
+                    "`glob` or `path` so it skips the file."
+                )
+    return ALLOW
+
+
+def _glob_may_match(glob: str | None, rel: str, name: str, windows: bool) -> bool:
+    """Whether a search glob can select a file. Like ripgrep, a glob without `/` matches the
+    file name, one with `/` the path under the search folder."""
+    if glob is None or UNSURE_GLOB.search(glob):
+        return True
+    target = rel if "/" in glob.replace("\\", "/") else name
+    return _matches(target, (glob.replace("\\", "/").removeprefix("./"),), windows)
+
+
+def _working_relative(policy: PathPolicy, path: Path) -> str | None:
+    rel = _relative(path, policy.worktree, policy.windows)
+    return rel if rel is not None else _relative(path, policy.run_folder, policy.windows)
 
 
 def _read(policy: PathPolicy, raw: str, path: Path) -> PathDecision:
-    rel = _relative(path, policy.worktree, policy.windows)
-    if rel is None:
-        rel = _relative(path, policy.run_folder, policy.windows)
+    rel = _working_relative(policy, path)
     if rel is None:
         return _outside(policy, raw)
     if _matches(rel, SECRETS, policy.windows):
@@ -184,8 +255,22 @@ def _locate(raw: str, policy: PathPolicy) -> Path | PathDecision:
             return _block(f"{raw} has a name with a trailing dot or space; Windows drops them.")
     try:
         return (path if path.is_absolute() else policy.worktree / path).resolve()
-    except (OSError, ValueError) as err:
+    except (OSError, ValueError, RuntimeError) as err:  # RuntimeError: a symlink loop
         return _block(f"{raw} can't be resolved ({err}).")
+
+
+def _locked_entry(worktree: Path, entry: str, windows: bool) -> str:
+    """A locked file as its real path under the (resolved) worktree, so aliases match."""
+    try:
+        rel = _relative((worktree / entry).resolve(), worktree, windows)
+    except (OSError, ValueError, RuntimeError) as err:
+        raise SafetyError(f"locked file {entry} can't be resolved ({err}).") from err
+    if not rel:
+        raise SafetyError(
+            f"locked file {entry} is not a file inside the worktree ({worktree}); pass the "
+            "tester's files as paths relative to the worktree."
+        )
+    return rel
 
 
 def _bad_pattern(pattern: object) -> PathDecision | None:

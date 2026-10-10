@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from factory_engine.config import RoleSettings, default_settings
+from factory_engine.errors import SafetyError
 from factory_engine.run import Role
 from factory_engine.safety.paths import PathDecision, PathPolicy, check_file_tool
 
@@ -141,6 +142,7 @@ CASES = [
     # ---- protected files, even for the bootstrap builder
     ("boot", "Write", {"file_path": "pyproject.toml"}, True, ""),
     ("boot", "NotebookEdit", {"notebook_path": "notebooks/a.ipynb"}, True, ""),
+    ("boot", "Write", {"file_path": ".git"}, False, "protected"),
     ("boot", "Write", {"file_path": ".git/config"}, False, "protected"),
     ("boot", "Write", {"file_path": ".git/hooks/pre-commit"}, False, "protected"),
     ("boot", "Write", {"file_path": ".claude/settings.json"}, False, "protected"),
@@ -300,3 +302,127 @@ def test_a_short_name_for_the_worktree_is_allowed(roots: dict[str, Path]) -> Non
 def test_a_short_name_outside_is_blocked(roots: dict[str, Path]) -> None:
     short = _short(roots["out"])
     _assert(_check(roots, "builder", "Read", {"file_path": short + "\\x.txt"}), False, "outside")
+
+
+# ------------------------------------------------- searches reach every file
+
+
+def _secret(roots: dict[str, Path], rel: str = ".env") -> None:
+    path = roots["wt"] / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("TOKEN=secret", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {"pattern": ".", "glob": "**/.env*", "output_mode": "content"},
+        {"pattern": ".", "glob": "**/.env*", "path": "{wt}"},
+        {"pattern": ".", "glob": ".env*", "path": "."},
+        {"pattern": "TOKEN"},
+        {"pattern": "TOKEN", "path": "config"},
+        {"pattern": "TOKEN", "glob": "*.{{env,py}}"},
+        {"pattern": "TOKEN", "glob": "!*.py"},
+    ],
+)
+def test_a_search_that_can_read_a_secrets_file_is_blocked(
+    roots: dict[str, Path], tool_input: dict[str, object]
+) -> None:
+    _secret(roots, "config/.env.local")
+    _assert(_check(roots, "builder", "Grep", tool_input), False, "secret")
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {"pattern": "TOKEN", "glob": "*.py"},
+        {"pattern": "TOKEN", "path": "src"},
+        {"pattern": "TOKEN", "glob": "src/**"},
+    ],
+)
+def test_a_search_that_skips_the_secrets_file_is_allowed(
+    roots: dict[str, Path], tool_input: dict[str, object]
+) -> None:
+    _secret(roots, "config/.env.local")
+    _assert(_check(roots, "builder", "Grep", tool_input), True, "")
+
+
+@WINDOWS
+def test_a_search_through_a_junction_out_of_the_worktree_is_blocked(
+    roots: dict[str, Path],
+) -> None:
+    _junction(roots["wt"] / "src" / "link", roots["out"])
+    _assert(_check(roots, "builder", "Grep", {"pattern": "x"}), False, "outside")
+
+
+# --------------------------------------------------------- .git as a file
+
+
+def test_a_linked_worktree_git_file_is_protected(roots: dict[str, Path]) -> None:
+    (roots["wt"] / ".git").rmdir()
+    (roots["wt"] / ".git").write_text("gitdir: C:/repos/app/.git/worktrees/x", encoding="utf-8")
+    for tool in ("Write", "Edit"):
+        decision = _check(roots, "builder", tool, {"file_path": ".git"}, bootstrap=True)
+        _assert(decision, False, "protected")
+
+
+# ---------------------------------------------------- lock entries resolve
+
+
+def _boot_policy(roots: dict[str, Path], locked: tuple[str, ...]) -> PathPolicy:
+    return PathPolicy.build(
+        "builder",
+        _role_settings("builder", bootstrap=True),
+        worktree=roots["wt"],
+        run_folder=roots["run"],
+        locked=locked,
+    )
+
+
+@pytest.mark.parametrize(
+    "entry", ["tests/../tests/test_lock.py", "./tests/test_lock.py", "tests//test_lock.py"]
+)
+def test_a_lock_entry_locks_the_real_file(roots: dict[str, Path], entry: str) -> None:
+    policy = _boot_policy(roots, (entry,))
+    decision = check_file_tool(policy, "Edit", {"file_path": "tests/test_lock.py"})
+    _assert(decision, False, "locked")
+
+
+@WINDOWS
+def test_a_lock_entry_through_a_junction_locks_the_real_file(roots: dict[str, Path]) -> None:
+    _junction(roots["wt"] / "alias", roots["wt"] / "tests")
+    policy = _boot_policy(roots, ("alias/test_lock.py",))
+    decision = check_file_tool(policy, "Edit", {"file_path": "tests/test_lock.py"})
+    _assert(decision, False, "locked")
+
+
+@pytest.mark.parametrize("entry", ["../outside_folder/x.py", "."])
+def test_a_lock_entry_outside_the_worktree_is_refused(roots: dict[str, Path], entry: str) -> None:
+    with pytest.raises(SafetyError) as exc:
+        _boot_policy(roots, (entry,))
+    assert entry in str(exc.value)
+
+
+# ------------------------------------------------------------ link loops
+
+
+def test_a_path_that_cannot_resolve_is_blocked(
+    roots: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = _policy(roots, "builder")
+
+    def loop(self: Path, strict: bool = False) -> Path:
+        raise RuntimeError(f"Symlink loop from {self}")
+
+    monkeypatch.setattr(Path, "resolve", loop)
+    _assert(check_file_tool(policy, "Read", {"file_path": "src/a"}), False, "resolve")
+
+
+def test_a_symlink_loop_is_blocked(roots: dict[str, Path]) -> None:
+    a, b = roots["wt"] / "src" / "a", roots["wt"] / "src" / "b"
+    try:
+        a.symlink_to(b)
+        b.symlink_to(a)
+    except OSError as err:
+        pytest.skip(f"can't create symlinks here: {err}")
+    _assert(_check(roots, "builder", "Read", {"file_path": "src/a"}), False, "")
