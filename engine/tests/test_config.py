@@ -1,6 +1,7 @@
 """Tests for factory_engine.config (task 2.1). Each test names the criterion it covers."""
 
 import types
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal, Union, get_args, get_origin
 
@@ -203,10 +204,13 @@ def test_bootstrap_sits_between_global_and_repo(
 # --------------------------------------------------------------------- AC4
 
 
+GLOBAL_ONLY = ("bootstrap", "token_expires")
+
+
 def _leaf_paths(model: type[BaseModel], prefix: tuple[str, ...] = ()) -> list[tuple]:
     leaves: list[tuple[tuple[str, ...], Any]] = []
     for name, field in model.model_fields.items():
-        if not prefix and name == "bootstrap":
+        if not prefix and name in GLOBAL_ONLY:  # set only in the global settings file
             continue
         ann = field.annotation
         if isinstance(ann, type) and issubclass(ann, BaseModel):
@@ -269,7 +273,7 @@ def test_leaf_enumeration_is_not_trivial() -> None:  # AC4
     assert "caps.max_turns" in paths
     assert "commands.test" in paths
     assert "critical_flows" in paths
-    assert not any(p.startswith("bootstrap") for p in paths)
+    assert not any(p.startswith(GLOBAL_ONLY) for p in paths)
     assert len(paths) >= 30
 
 
@@ -538,6 +542,22 @@ def test_load_global_settings(tmp_path: Path) -> None:  # AC10
     with pytest.raises(ConfigError) as exc:
         load_global_settings(bad, "win32")
     assert str(bad) in str(exc.value)
+
+
+def test_token_expires_defaults_to_unset() -> None:  # task 2.6
+    assert default_settings("win32").token_expires is None
+
+
+def test_global_file_records_the_token_expiry_date(tmp_path: Path) -> None:  # task 2.6
+    path = _write(tmp_path, "token_expires: 2026-11-10\n", "global.yaml")
+    assert load_global_settings(path, "win32").token_expires == date(2026, 11, 10)
+
+
+def test_repo_file_cant_set_the_token_expiry_date(tmp_path: Path) -> None:  # task 2.6
+    path = _write(tmp_path, "token_expires: 2026-11-10\n")
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    assert "token_expires" in str(exc.value)
 
 
 # ------------------------------------------------- review findings (attempt 1)

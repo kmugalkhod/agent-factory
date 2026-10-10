@@ -27,3 +27,7 @@ class EventLogError(FactoryError):
 
 class IllegalTransitionError(FactoryError):
     """A run was asked to move between two states the state machine doesn't connect."""
+
+
+class ProviderError(FactoryError):
+    """A provider profile is unknown, not allowed, or its credentials aren't usable."""

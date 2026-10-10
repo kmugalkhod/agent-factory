@@ -1,5 +1,6 @@
 """Settings models, defaults, merge (run > repo > global) and load/dump of config files."""
 
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -111,6 +112,8 @@ class Settings(_Model):
     sandbox_required: bool
     critical_flows: list[CriticalFlow]
     bootstrap: Bootstrap
+    # When the subscription token from `claude setup-token` expires; global settings only.
+    token_expires: date | None
 
 
 class SettingsPatch(_Model):
@@ -126,6 +129,7 @@ class SettingsPatch(_Model):
 
 class GlobalPatch(SettingsPatch):
     bootstrap: Bootstrap = _unset()
+    token_expires: date | None = None
 
 
 def default_settings(platform: str) -> Settings:
@@ -162,6 +166,7 @@ def default_settings(platform: str) -> Settings:
             "sandbox_required": False,
             "critical_flows": [],
             "bootstrap": {"builder": {"write_paths": ["**"], "deny_paths": ["plan.md"]}},
+            "token_expires": None,
         }
     )
 

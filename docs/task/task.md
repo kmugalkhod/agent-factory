@@ -214,7 +214,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.4
 - **Note:** the order was `building → reviewing → updating`; it now follows the design's git flow (step 3, rebase before review) and task 2.22. A rebase needed at merge time happens inside the merge action, so `merged` is reached only from `awaiting_merge`. Agreed with Kunal (Oct 10, 2026).
 
-### [ ] 2.6 Provider profiles and credential isolation
+### [x] 2.6 Provider profiles and credential isolation
 
 - **What:** Add the provider profile layer (logical model → real model name) and the `subscription` profile. Build each agent's environment from a clean base:
   - Remove all `ANTHROPIC_*`, proxy and Claude credential variables.
@@ -228,6 +228,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Preflight fails with a specific message for a missing token, a near-expiry token and a disallowed provider.
 - **Tests:** Unit tests with a fake parent environment.
 - **Depends on:** 2.1
+- **Note:** the token's expiry date is a new global-only setting, `token_expires` in `config.py` (like `bootstrap`, not settable in `factory.yaml` or run overrides). Preflight fails when it isn't recorded.
 
 ### [ ] 2.7 Per-agent config folder
 
