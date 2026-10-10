@@ -8,7 +8,7 @@ repo's path or readiness.
 One `sessions` row per run and role that has a session ID, an attempt count or a token total.
 """
 
-import re
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -22,7 +22,6 @@ from factory_engine.paths import repo_runs_dir, run_dir
 from factory_engine.run import CLAIMS, RUN_FILE, Metrics, Role, Run, load_run
 
 REGISTRY_FILE = "registry.db"
-RUN_FOLDER = re.compile(r"(\d+)-(.+)")
 
 # MIGRATIONS[n] takes the schema from version n to n + 1.
 MIGRATIONS = [
@@ -146,6 +145,22 @@ class Registry:
                 raise RegistryError(f"{self.path}: can't {action} ({err}).") from err
             raise
 
+    @contextmanager
+    def _snapshot(self) -> Iterator[None]:
+        """One read transaction, so several queries see the same committed version."""
+        if self._conn.in_transaction:
+            yield
+            return
+        try:
+            self._conn.execute("BEGIN")
+        except sqlite3.Error as err:
+            raise RegistryError(f"{self.path}: can't read the registry ({err}).") from err
+        try:
+            yield
+        finally:
+            if self._conn.in_transaction:
+                self._conn.execute("COMMIT")
+
     def _read(self, sql: str, params: tuple[object, ...] = ()) -> list[sqlite3.Row]:
         try:
             cursor = self._conn.execute(sql, params)
@@ -155,20 +170,16 @@ class Registry:
             raise RegistryError(f"{self.path}: can't read the registry ({err}).") from err
 
     def _migrate(self) -> None:
-        try:
-            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
-        except sqlite3.Error as err:
-            raise RegistryError(
-                f"{self.path}: not a readable registry ({err}). Move it aside; "
-                "rebuild_index recreates the run index, repos must be added again."
-            ) from err
-        if version > SCHEMA_VERSION:
-            raise RegistryError(
-                f"{self.path}: schema version {version} is newer than this factory supports "
-                f"({SCHEMA_VERSION}). Upgrade the factory before using this registry."
-            )
-        for step in range(version, SCHEMA_VERSION):
-            with self._write(f"migrate the schema to version {step + 1}") as conn:
+        """Read the version and apply migrations under one write lock, so two first opens
+        can't both migrate."""
+        with self._write("check and migrate the schema") as conn:
+            version = _schema_version(conn)
+            if version > SCHEMA_VERSION:
+                raise RegistryError(
+                    f"{self.path}: schema version {version} is newer than this factory "
+                    f"supports ({SCHEMA_VERSION}). Upgrade the factory before using it."
+                )
+            for step in range(version, SCHEMA_VERSION):
                 for statement in MIGRATIONS[step].split(";"):
                     if statement.strip():
                         conn.execute(statement)
@@ -179,9 +190,11 @@ class Registry:
     def add_repo(self, name: str, path: Path, *, now: datetime) -> Repo:
         repo_runs_dir(Path(), name)  # the name becomes a folder name; refuse unsafe ones
         repo = Repo(name=name, path=path.resolve(), ready=False, added_at=now)
-        if self.get_repo(name) is not None:
-            raise RegistryError(f"repo {name!r} is already registered. Use update_repo instead.")
         with self._write(f"add repo {name!r}") as conn:
+            if _repo_in(conn, name) is not None:
+                raise RegistryError(
+                    f"repo {name!r} is already registered. Use update_repo instead."
+                )
             conn.execute(
                 "INSERT INTO repos (name, path, ready, added_at) VALUES (?, ?, ?, ?)",
                 (repo.name, str(repo.path), int(repo.ready), repo.added_at.isoformat()),
@@ -189,8 +202,10 @@ class Registry:
         return repo
 
     def get_repo(self, name: str) -> Repo | None:
-        rows = self._read("SELECT * FROM repos WHERE name = ?", (name,))
-        return _repo(rows[0]) if rows else None
+        try:
+            return _repo_in(self._conn, name)
+        except sqlite3.Error as err:
+            raise RegistryError(f"{self.path}: can't read the registry ({err}).") from err
 
     def list_repos(self) -> list[Repo]:
         return [_repo(row) for row in self._read("SELECT * FROM repos ORDER BY name")]
@@ -198,16 +213,16 @@ class Registry:
     def update_repo(
         self, name: str, *, path: Path | None = None, ready: bool | None = None
     ) -> Repo:
-        current = self.get_repo(name)
-        if current is None:
-            raise RegistryError(f"repo {name!r} is not registered. Add it with add_repo first.")
-        updated = current.model_copy(
-            update={
-                "path": path.resolve() if path is not None else current.path,
-                "ready": ready if ready is not None else current.ready,
-            }
-        )
         with self._write(f"update repo {name!r}") as conn:
+            current = _repo_in(conn, name)  # read under the lock, so no update is lost
+            if current is None:
+                raise RegistryError(f"repo {name!r} is not registered. Add it with add_repo first.")
+            updated = current.model_copy(
+                update={
+                    "path": path.resolve() if path is not None else current.path,
+                    "ready": ready if ready is not None else current.ready,
+                }
+            )
             conn.execute(
                 "UPDATE repos SET path = ?, ready = ? WHERE name = ?",
                 (str(updated.path), int(updated.ready), name),
@@ -222,17 +237,21 @@ class Registry:
             _insert_run(conn, run)
 
     def get_run(self, repo: str, run_id: int) -> Run | None:
-        rows = self._read(
-            f"SELECT {RUN_COLUMNS} FROM runs WHERE repo = ? AND id = ?", (repo, run_id)
-        )
-        return self._run(rows[0]) if rows else None
+        with self._snapshot():  # the run row and its sessions from one committed version
+            rows = self._read(
+                f"SELECT {RUN_COLUMNS} FROM runs WHERE repo = ? AND id = ?", (repo, run_id)
+            )
+            return self._run(rows[0]) if rows else None
 
     def list_runs(self, repo: str | None = None) -> list[Run]:
-        if repo is None:
-            rows = self._read(f"SELECT {RUN_COLUMNS} FROM runs ORDER BY repo, id")
-        else:
-            rows = self._read(f"SELECT {RUN_COLUMNS} FROM runs WHERE repo = ? ORDER BY id", (repo,))
-        return [self._run(row) for row in rows]
+        with self._snapshot():
+            if repo is None:
+                rows = self._read(f"SELECT {RUN_COLUMNS} FROM runs ORDER BY repo, id")
+            else:
+                rows = self._read(
+                    f"SELECT {RUN_COLUMNS} FROM runs WHERE repo = ? ORDER BY id", (repo,)
+                )
+            return [self._run(row) for row in rows]
 
     def list_sessions(self, repo: str | None = None, run_id: int | None = None) -> list[Session]:
         where, params = [], []
@@ -251,11 +270,13 @@ class Registry:
     def rebuild_index(self, data: Path) -> int:
         """Recreate `runs` and `sessions` from every `run.json` under `<data>/runs/`.
 
-        All or nothing: any bad file raises and leaves the index as it was. Folders without a
-        `run.json` (allocated, never saved) are skipped. Returns the number of runs indexed.
+        All or nothing: any bad or misplaced file raises and leaves the index as it was.
+        Folders without a `run.json` (allocated, never saved) are skipped. Files are read under
+        the write lock, so a concurrent `upsert_run` can't be overwritten by an older copy.
+        Returns the number of runs indexed.
         """
-        runs = [_load_checked(data, folder) for folder in _run_folders(data)]
         with self._write("rebuild the run index") as conn:
+            runs = [_load_checked(data, folder) for folder in _run_folders(data)]
             conn.execute("DELETE FROM sessions")
             conn.execute("DELETE FROM runs")
             for run in runs:
@@ -284,6 +305,17 @@ class Registry:
             ),
             last_completed_step=row["last_completed_step"],
         )
+
+
+def _schema_version(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def _repo_in(conn: sqlite3.Connection, name: str) -> Repo | None:
+    cursor = conn.execute("SELECT * FROM repos WHERE name = ?", (name,))
+    cursor.row_factory = sqlite3.Row
+    row = cursor.fetchone()
+    return _repo(row) if row is not None else None
 
 
 def _repo(row: sqlite3.Row) -> Repo:
@@ -334,19 +366,21 @@ def _run_folders(data: Path) -> list[Path]:
         for repo in runs.iterdir()
         if repo.is_dir()
         for folder in repo.iterdir()
-        if folder.is_dir()
-        and folder.name != CLAIMS
-        and RUN_FOLDER.fullmatch(folder.name)
-        and (folder / RUN_FILE).is_file()
-    )
+        if folder.is_dir() and folder.name != CLAIMS and (folder / RUN_FILE).is_file()
+    )  # names are checked by _load_checked, so a renamed folder is reported, not skipped
 
 
 def _load_checked(data: Path, folder: Path) -> Run:
     """Load a run and check it belongs in this folder: same repo, ID and slug."""
     run = load_run(folder)
-    if run_dir(data, run.repo, run.id, run.slug) != folder:
+    if not _same_folder(run_dir(data, run.repo, run.id, run.slug), folder):
         raise RegistryError(
             f"{folder}: run.json says {run.repo}/{run.id}-{run.slug}, which belongs in a "
             "different folder. Fix the file or move the folder, then rebuild again."
         )
     return run
+
+
+def _same_folder(a: Path, b: Path) -> bool:
+    """Compare resolved paths with the platform's case rules (CLAUDE.md: Windows paths)."""
+    return os.path.normcase(a.resolve()) == os.path.normcase(b.resolve())

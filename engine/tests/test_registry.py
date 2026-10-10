@@ -1,13 +1,16 @@
 """Tests for factory_engine.registry (task 2.3): repos, the run index and agent sessions."""
 
 import sqlite3
-from collections.abc import Iterator
+import sys
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from factory_engine import registry as registry_module
 from factory_engine.errors import DataFolderError, RegistryError
+from factory_engine.paths import run_dir
 from factory_engine.registry import (
     SCHEMA_VERSION,
     Registry,
@@ -300,3 +303,144 @@ def test_two_connections_read_while_one_writes(tmp_path: Path) -> None:  # AC4
         assert old_reader.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
     old_reader.execute("COMMIT")
     old_reader.close()
+
+
+# ------------------------------------------- PR #13 review: races and folders
+# Each race test hooks the point where the race window was and lets a second connection act
+# there. Fixed code either holds the write lock (the other connection is blocked) or reads from
+# one snapshot (the other commit is invisible).
+
+
+@pytest.mark.parametrize(
+    "read",
+    [lambda r: r.get_run("app", 3), lambda r: r.list_runs()[0]],
+    ids=["get_run", "list_runs"],
+)
+def test_a_run_and_its_sessions_come_from_one_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: Callable[[Registry], Run | None]
+) -> None:  # issue 1
+    path = tmp_path / "registry.db"
+    old = _busy_run("app", 3, "status-json")
+    newer = old.model_copy(
+        update={"state": "reviewing", "session_ids": {"reviewer": "s-rev"}, "attempts": {}}
+    )
+    with open_registry(path) as reader, open_registry(path) as writer:
+        reader.upsert_run(old)
+        real = Registry.list_sessions
+        raced: list[bool] = []
+
+        def racing(self: Registry, repo: str | None = None, run_id: int | None = None) -> list:
+            if self is reader and not raced:
+                raced.append(True)
+                writer.upsert_run(newer)  # commits between the run query and the sessions query
+            return real(self, repo, run_id)
+
+        monkeypatch.setattr(Registry, "list_sessions", racing)
+        got = read(reader)
+        monkeypatch.undo()
+        assert raced
+        assert got == old
+        assert reader.get_run("app", 3) == newer
+
+
+def test_update_repo_reads_under_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # issue 2
+    path = tmp_path / "registry.db"
+    with open_registry(path) as reg:
+        reg.add_repo("app", tmp_path / "app", now=NOW)
+    with open_registry(path, timeout=0.2) as a, open_registry(path, timeout=0.2) as b:
+        real = registry_module._repo_in
+        outcome: list[str] = []
+
+        def racing(conn: sqlite3.Connection, name: str) -> object:
+            if not outcome:
+                outcome.append("started")
+                try:
+                    b.update_repo("app", path=tmp_path / "moved")
+                    outcome.append("other update landed")
+                except RegistryError:
+                    outcome.append("other update blocked")
+            return real(conn, name)
+
+        monkeypatch.setattr(registry_module, "_repo_in", racing)
+        a.update_repo("app", ready=True)
+        monkeypatch.undo()
+        final = a.get_repo("app")
+    assert outcome == ["started", "other update blocked"]
+    assert final is not None and final.ready is True
+
+
+def test_first_open_holds_the_lock_while_migrating(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # issue 3
+    path = tmp_path / "registry.db"
+    real = registry_module._schema_version
+    outcome: list[str] = []
+
+    def racing(conn: sqlite3.Connection) -> int:
+        if not outcome:
+            outcome.append("started")
+            try:
+                Registry(path, timeout=0.2).close()
+                outcome.append("other open migrated first")
+            except RegistryError:
+                outcome.append("other open blocked")
+        return real(conn)
+
+    monkeypatch.setattr(registry_module, "_schema_version", racing)
+    with open_registry(path) as reg:
+        assert reg.list_repos() == []
+    assert outcome == ["started", "other open blocked"]
+
+
+def test_rebuild_refuses_a_run_json_in_a_renamed_folder(tmp_path: Path) -> None:  # issue 4
+    data = tmp_path / "data"
+    data.mkdir()
+    with open_registry(registry_path(data)) as reg:
+        _seed_runs(data, reg)
+        before = _dump(registry_path(data))
+        renamed = run_dir(data, "app", 0, "bootstrap").rename(data / "runs" / "app" / "bootstrap")
+        with pytest.raises(RegistryError) as exc:
+            reg.rebuild_index(data)
+        assert str(renamed) in str(exc.value)
+    assert _dump(registry_path(data)) == before
+
+
+def test_rebuild_loads_files_under_the_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # issue 5
+    data = tmp_path / "data"
+    data.mkdir()
+    path = registry_path(data)
+    run_id, folder = allocate_run(data, "app", "task")
+    run = _run("app", run_id, "task")
+    save_run(run, folder)
+    newer = run.model_copy(update={"state": "reviewing"})
+    with open_registry(path, timeout=0.2) as rebuilder, open_registry(path, timeout=0.2) as other:
+        real = registry_module._load_checked
+        outcome: list[str] = []
+
+        def racing(data_: Path, run_folder: Path) -> Run:
+            if not outcome:
+                outcome.append("started")
+                try:
+                    other.upsert_run(newer)
+                    outcome.append("other upsert landed")
+                except RegistryError:
+                    outcome.append("other upsert blocked")
+            return real(data_, run_folder)
+
+        monkeypatch.setattr(registry_module, "_load_checked", racing)
+        rebuilder.rebuild_index(data)
+    assert outcome == ["started", "other upsert blocked"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows paths are case-insensitive")
+def test_rebuild_compares_folders_resolved_and_case_normalized(tmp_path: Path) -> None:  # 6
+    data = tmp_path / "data"
+    data.mkdir()
+    _, folder = allocate_run(data, "app", "task")  # the folder on disk is runs/app/0-task
+    save_run(_run("App", 0, "task"), folder)  # same folder on Windows, other case
+    with open_registry(registry_path(data)) as reg:
+        assert reg.rebuild_index(data) == 1
