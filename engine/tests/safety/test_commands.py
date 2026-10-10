@@ -208,6 +208,34 @@ CASES = [
     ("builder", "ps", "(cd src); cd ..", False, "worktree"),
     ("planner", "sh", "cd src | ls; cd ..", False, "worktree"),
     ("builder", "sh", "uv run pytest)", False, "parentheses"),
+    # ---- review round 2: a quoted '$null' is a file (issue 1)
+    ("planner", "ps", "pwd > $null", True, ""),
+    ("planner", "ps", "pwd > '$null'", False, "redirect"),
+    ("planner", "ps", "pwd > '$NULL'", False, "redirect"),
+    # ---- options that give the search pattern (issue 2)
+    ("planner", "sh", "grep --regexp=TOKEN config/.env.local src/app.py", False, "secret"),
+    ("planner", "sh", "grep --regexp TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "grep -eTOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "grep -e TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "grep -ie TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "rg --file=src/app.py config/.env.local", False, "secret"),
+    ("planner", "ps", "Select-String -Pattern TOKEN config/.env.local", False, "secret"),
+    ("planner", "ps", "sls -Pat TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "grep -e def src", True, ""),
+    # ---- options that run a program (issue 3)
+    ("planner", "sh", "sort --compress-program=./payload -S 1K src/app.py", False, "read-only"),
+    ("planner", "sh", "sort --compress-program ./payload src/app.py", False, "read-only"),
+    ("planner", "sh", "sort --compress-prog=./payload src/app.py", False, "read-only"),
+    ("planner", "sh", "sort --outp=x src/app.py", False, "read-only"),
+    ("planner", "sh", "rg --hostname-bin=./payload def src", False, "read-only"),
+    ("planner", "sh", "sort --check src/app.py", True, ""),
+    # ---- && and || decide where the next command runs (issue 5)
+    ("planner", "sh", "cd src || cd .; cat ../../outside_folder/x", False, "outside"),
+    ("planner", "sh", "cd src || cd ..; ls", True, ""),
+    ("builder", "sh", "cd missing && cd ..", True, ""),
+    ("builder", "sh", "cd missing || cd ..", False, "worktree"),
+    # a part that should never run is still checked, in case a cd fails unexpectedly
+    ("builder", "sh", "cd src && cd .. || cd ..", False, "worktree"),
     # ---- the reviewer: no shell at all
     ("reviewer", "sh", "ls", False, "no shell"),
     ("reviewer", "sh", "uv run pytest", False, "no shell"),
@@ -401,3 +429,37 @@ def test_configured_commands_are_read_with_the_calls_shell(
 def test_a_configured_command_a_shell_cant_read_allows_nothing(roots: dict[str, Path]) -> None:
     policy = _policy_with_test(roots, "pytest $ARGS")
     _assert(check_shell_command(policy, "Bash", {"command": "pytest"}), False, "")
+
+
+# ----------------------------- the folder as typed and as real (issue 4)
+
+
+@WINDOWS
+@pytest.mark.parametrize(
+    ("command", "allowed"),
+    [
+        ("cd link; cd ..; cat ../outside_folder/x", False),
+        ("cd link && cd .. && cat ../outside_folder/x", False),
+        ("cd link; cd ..; ls", True),
+        ("cd link; cat ../../x", False),
+        ("cd link; cat ../app.py", True),
+    ],
+)
+def test_cd_through_a_link_checks_the_folder_as_typed_and_as_real(
+    roots: dict[str, Path], command: str, allowed: bool
+) -> None:
+    """`link` points to `deep/inner`. After `cd link`, Bash's `cd ..` goes back up the link to
+    the worktree, while programs resolve `..` from `deep/inner`; both must stay inside."""
+    inner = roots["wt"] / "deep" / "inner"
+    inner.mkdir(parents=True)
+    (roots["wt"] / "deep" / "app.py").write_text("", encoding="utf-8")
+    _junction(roots["wt"] / "link", inner)
+    _assert(_check(roots, "planner", "sh", command), allowed, "outside")
+
+
+def test_or_runs_from_where_the_first_command_failed(roots: dict[str, Path]) -> None:
+    """`cd src || cd deeper` stays in src when src exists, so a read two levels up leaves the
+    worktree even though it wouldn't from src/deeper."""
+    (roots["wt"] / "src" / "deeper").mkdir()
+    command = "cd src || cd deeper; cat ../../outside_folder/x"
+    _assert(_check(roots, "planner", "sh", command), False, "outside")

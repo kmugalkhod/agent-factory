@@ -98,7 +98,7 @@ READ_ONLY: dict[str, frozenset[str]] = {
         "tail": (),
         "wc": (),
         "grep": (),
-        "rg": ("--pre", "--pre-glob", "-z", "--search-zip"),
+        "rg": ("--pre", "--pre-glob", "-z", "--search-zip", "--hostname-bin"),
         "find": ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0")
         + ("-fprintf", "-fls"),
         "tree": ("-o",),
@@ -106,7 +106,7 @@ READ_ONLY: dict[str, frozenset[str]] = {
         "file": (),
         "du": (),
         "diff": (),
-        "sort": ("-o", "--output"),
+        "sort": ("-o", "--output", "--compress-program"),
         "which": (),
         "where": (),
         "get-childitem": (),
@@ -135,12 +135,12 @@ READS_CONTENT = frozenset(
 )
 # Searches: the first positional argument is the pattern, and no path means the current folder.
 SEARCHES = frozenset({"grep", "rg", "select-string", "sls"})
-PATTERN_FLAGS = frozenset({"-e", "--regexp", "-f", "--file", "-pattern"})
 # In PowerShell these names are cmdlet aliases (`sort` is Sort-Object), whose parameters are
 # whole words, not combinable short flags.
 CMDLET_ALIASES = frozenset({"sort"})
 SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
 WILDCARDS = "*?["
+OPERATORS = frozenset({";", "&&", "||", "|", "&"})
 
 _EXPANSION = (
     "variable and command expansion ($X, $(...), backticks, %X%, @splat) isn't allowed; "
@@ -247,33 +247,60 @@ class _Part:
     detached: bool = False
 
 
-def _check(policy: ShellPolicy, command: str, shell: Shell, cwds: set[Path]) -> set[Path]:
-    """Check every part in order. Returns the folders the shell could end up in.
-
-    `cwds` holds every folder the shell could be in: a `cd` that may fail keeps the old one, a
-    part in its own process can't move the shell, and a Bash subshell `( )` restores the folder
-    on exit (a PowerShell group doesn't, so both are kept)."""
-    saved: list[set[Path]] = []
-    current = set(cwds)
-    for item in _lex(command, shell, policy.windows):
-        if item == "(":
-            saved.append(set(current))
-        elif item == ")":
-            if not saved:
-                raise _Blocked("the parentheses don't match.")
-            before = saved.pop()
-            current = before if shell == "bash" else before | current
-        elif isinstance(item, _Part):
-            before = set(current)
-            current = _check_part(policy, item, shell, current)
-            if item.piped or item.detached:
-                current |= before
-    if saved:
+def _check(policy: ShellPolicy, command: str, shell: Shell, cwds: set[Path]) -> None:
+    items = _lex(command, shell, policy.windows)
+    _, _, end = _evaluate(policy, items, 0, shell, set(cwds))
+    if end != len(items):
         raise _Blocked("the parentheses don't match.")
-    return current
 
 
-def _check_part(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]) -> set[Path]:
+def _evaluate(
+    policy: ShellPolicy, items: list[_Part | str], i: int, shell: Shell, start: set[Path]
+) -> tuple[set[Path], set[Path], int]:
+    """Check the commands from `items[i]` up to a closing `)`. Returns the folders the shell
+    can be in when the list succeeds and when it fails, and where the list ended.
+
+    Folders follow the operators: in `a && b`, b runs from where a succeeded; in `a || b`, from
+    where a failed; after `;`, from both. A part in its own process (`|`, `&`) can't move the
+    shell, and neither can a Bash subshell `( )` (a PowerShell group can). A part that may
+    never run is still checked, from every folder known so far."""
+    ok, failed = set(start), set[Path]()
+    op = ";"
+    while i < len(items):
+        item = items[i]
+        if item == ")":
+            return ok, failed, i
+        if isinstance(item, str) and item in OPERATORS:
+            op = item
+            i += 1
+            continue
+        runs = ok if op == "&&" else failed if op == "||" else ok | failed
+        runs = runs or ok | failed
+        if isinstance(item, _Part):
+            after_ok, after_failed = _check_part(policy, item, shell, runs)
+            if item.piped or item.detached:
+                after_ok, after_failed = after_ok | runs, after_failed | runs
+        else:  # "(": a group, up to its ")"
+            inner_ok, inner_failed, i = _evaluate(policy, items, i + 1, shell, runs)
+            if i >= len(items):
+                raise _Blocked("the parentheses don't match.")
+            after_ok = set(runs) if shell == "bash" else inner_ok | runs
+            after_failed = set(runs) if shell == "bash" else inner_failed | runs
+        if op == "&&":
+            ok, failed = after_ok, after_failed | failed
+        elif op == "||":
+            ok, failed = after_ok | ok, after_failed
+        else:
+            ok, failed = after_ok, after_failed
+        op = ";"
+        i += 1
+    return ok, failed, i
+
+
+def _check_part(
+    policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]
+) -> tuple[set[Path], set[Path]]:
+    """Check one part. Returns the folders the shell is in after it succeeds and fails."""
     words = part.words
     if re.match(r"[A-Za-z_]\w*=", words[0]):
         raise _Blocked(f"setting variables ({words[0]}) isn't allowed; run the command plainly.")
@@ -293,7 +320,7 @@ def _check_part(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path])
     if name in DELETE:
         _check_delete(policy, words, args, shell, cwds)
     if _allowlisted(policy, words, shell):
-        return cwds
+        return cwds, cwds
     if policy.read_only and name in READ_ONLY:
         trusted = _trusted_read_only(policy, words[0], shell)
         if trusted is None:
@@ -301,7 +328,7 @@ def _check_part(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path])
                 f"`{words[0]}` runs a program from a path; run `{name}` by its plain name."
             )
         _check_read_only(policy, trusted, part, shell, cwds)
-        return cwds
+        return cwds, cwds
     raise _Blocked(f"`{words[0]}` isn't allowed for the {policy.role}. {_may_run(policy)}")
 
 
@@ -373,7 +400,12 @@ def _check_wrapper(
 # --------------------------------------------------------- cd and deletes
 
 
-def _cd(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]) -> set[Path]:
+def _cd(
+    policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]
+) -> tuple[set[Path], set[Path]]:
+    """Returns the folders after the cd succeeds and after it fails. Shells apply `..` to the
+    folder as typed (`cd link; cd ..` goes back up the link), while `cd -P` and programs use
+    the real folder, so both are kept and both must stay inside the worktree."""
     words = part.words
     targets = [(a, w) for a, w in zip(words[1:], part.wild[1:], strict=True) if a[:1] != "-"]
     if not targets:
@@ -381,19 +413,26 @@ def _cd(policy: ShellPolicy, part: _Part, shell: Shell, cwds: set[Path]) -> set[
             f"`{' '.join(words)}` goes to the home folder; cd only to folders inside the "
             f"worktree ({policy.worktree})."
         )
+    leaves = _Blocked(
+        f"`{' '.join(words)}` leaves the worktree ({policy.worktree}); cd only to folders "
+        "inside it."
+    )
     moved: set[Path] = set()
+    stays: set[Path] = set()
     raw, wild = targets[0]
     for cwd in cwds:  # every folder the shell could be in at this point
-        for _, path in _targets(policy, raw, wild, cwd, shell):
-            if path is None or _relative(policy, path, policy.worktree) is None:
-                raise _Blocked(
-                    f"`{' '.join(words)}` leaves the worktree ({policy.worktree}); cd only to "
-                    "folders inside it."
-                )
-            moved.add(path)
-            if not path.is_dir():
-                moved.add(cwd)  # the cd fails and the shell stays where it was
-    return moved
+        texts = _expand(policy, raw, wild, cwd, shell)
+        if texts is None:
+            raise leaves
+        for text in texts:
+            found = _candidates(text, cwd)
+            if found is None or any(_relative(policy, f, policy.worktree) is None for f in found):
+                raise leaves
+            physical = found[-1]
+            moved |= {Path(os.path.normpath(cwd / text)), physical}
+            if not physical.is_dir():
+                stays.add(cwd)  # the cd fails and the shell stays where it was
+    return moved, stays
 
 
 def _check_delete(
@@ -426,7 +465,7 @@ def _check_read_only(
                 "read-only commands only."
             )
     positional = [(a, w) for a, w in args if not a.startswith("-")]
-    if name in SEARCHES and positional and not any(a.casefold() in PATTERN_FLAGS for a, _ in args):
+    if name in SEARCHES and positional and not _pattern_in_option(words[1:], shell):
         positional = positional[1:]  # the first one is the pattern
     in_options = [
         (value, any(c in value for c in WILDCARDS))
@@ -437,7 +476,7 @@ def _check_read_only(
     for cwd in cwds:
         checks: list[tuple[str, Path | None]] = []
         if name in SEARCHES and not positional and not part.piped:
-            checks.append((".", cwd))  # searches the current folder
+            checks += _targets(policy, ".", False, cwd, shell)  # searches the current folder
         for raw, wild in positional + in_options:
             checks += _targets(policy, raw, wild, cwd, shell)
         for raw, path in checks:
@@ -449,12 +488,30 @@ def _check_read_only(
                 _check_reads(policy, words[0], path)
 
 
+def _pattern_in_option(args: list[str], shell: Shell) -> bool:
+    """Whether an option may give the search pattern (`-e x`, `-ex`, `-ie x`, `--regexp=x`,
+    `-f file`, `-Pattern x`), so that no positional argument is the pattern. When unsure it
+    says yes, and then every positional argument is checked as a path."""
+    for arg in args:
+        lowered = arg.casefold()
+        if lowered.startswith(("--regexp", "--file")):
+            return True
+        if shell == "powershell" and lowered.startswith("-p"):  # -Pattern or a prefix of it
+            return True
+        if re.match(r"-[^-]", arg) and ("e" in arg[1:] or "f" in arg[1:]):
+            return True
+    return False
+
+
 def _forbidden(name: str, arg: str, clusters: bool) -> bool:
     """Whether an argument is one of the command's forbidden flags, including attached values
     (`--output=x`, `-ox`) and, with `clusters`, short flags combined in one word (`-uo x`)."""
+    option = arg.split("=", 1)[0].casefold()
     for flag in READ_ONLY[name]:
-        if arg.casefold() == flag or arg.casefold().startswith(flag + "="):
+        if option == flag:
             return True
+        if flag.startswith("--") and len(option) > 2 and flag.startswith(option):
+            return True  # GNU tools accept any unambiguous prefix: --compress-prog
         if clusters and len(flag) == 2 and re.match(r"-[^-]", arg) and flag[1] in arg[1:]:
             return True
     return False
@@ -526,20 +583,33 @@ def _is_secret(name: str, windows: bool) -> bool:
 def _targets(
     policy: ShellPolicy, raw: str, wild: bool, cwd: Path, shell: Shell
 ) -> list[tuple[str, Path | None]]:
-    """The real paths an argument names: every match of a wildcard the shell (or a PowerShell
-    cmdlet) expands, else the literal path. None for a path that can't be judged."""
+    """The real paths an argument can name: every match of a wildcard the shell (or a
+    PowerShell cmdlet) expands, else the literal path; each from the folder as typed and from
+    its real location. None for a path that can't be judged."""
+    texts = _expand(policy, raw, wild, cwd, shell)
+    if texts is None:
+        return [(raw, None)]
+    out: list[tuple[str, Path | None]] = []
+    for text in texts:
+        found = _candidates(text, cwd)
+        out += [(text, None)] if found is None else [(text, f) for f in found]
+    return out
+
+
+def _expand(policy: ShellPolicy, raw: str, wild: bool, cwd: Path, shell: Shell) -> list[str] | None:
+    """The native paths an argument names: a wildcard's matches, else the argument itself."""
     text = _translate(policy, raw, shell)
     if text is None:
-        return [(raw, None)]
+        return None
     if wild and any(c in text for c in WILDCARDS):
         try:
             # Path.glob refuses absolute patterns and `..`, which are exactly the ones to check.
             matches = glob.glob(text, root_dir=cwd, recursive=True, include_hidden=True)  # noqa: PTH207
         except (OSError, ValueError):
-            return [(raw, None)]
+            return None
         if matches:
-            return [(m, _to_path(m, cwd)) for m in matches]
-    return [(raw, _to_path(text, cwd))]
+            return matches
+    return [text]
 
 
 def _translate(policy: ShellPolicy, raw: str, shell: Shell) -> str | None:
@@ -553,14 +623,19 @@ def _translate(policy: ShellPolicy, raw: str, shell: Shell) -> str | None:
     return raw
 
 
-def _to_path(text: str, cwd: Path) -> Path | None:
+def _candidates(text: str, cwd: Path) -> list[Path] | None:
+    """Where a path leads from `cwd`, a folder as the shell has it (links not resolved): with
+    `..` applied to the folder as typed, and to its real location. Shells and programs differ,
+    so both count; the real one is last. None for a path that can't be judged."""
     path = Path(text)
     if not path.is_absolute() and (path.drive or path.root):
         return None  # drive-relative (`C:x`) or rooted without a drive (`\x`, `/x` on Windows)
     try:
-        return (path if path.is_absolute() else cwd / path).resolve()
+        as_typed = Path(os.path.normpath(cwd / path)).resolve()
+        real = (cwd.resolve() / path).resolve()
     except (OSError, ValueError, RuntimeError):
         return None
+    return [real] if as_typed == real else [as_typed, real]
 
 
 def _working_relative(policy: ShellPolicy, path: Path) -> str | None:
@@ -618,6 +693,7 @@ class _Lexer:
         self.buf: list[str] = []
         self.started = False  # a word has begun, even an empty quoted one
         self.globbed = False  # the word has a wildcard the shell expands
+        self.literal = False  # part of the word was quoted or escaped
         self.redirect = False  # the next word is a redirect target
         self.piped = False  # the part being read is fed by a pipe
         self.i = 0
@@ -647,6 +723,7 @@ class _Lexer:
                 self.i += 1
             elif c in "\n;":
                 self._end_part(piped=False)
+                self.items.append(";")
                 self.i += 1
             elif c in "()":
                 self._end_part(piped=False)
@@ -684,7 +761,7 @@ class _Lexer:
                 break
             self.buf.append(text[j])
             j += 1
-        self.started = True
+        self.started = self.literal = True
         self.i = j + 1
 
     def _double_quoted(self) -> None:
@@ -707,7 +784,7 @@ class _Lexer:
                 continue
             self.buf.append(d)
             j += 1
-        self.started = True
+        self.started = self.literal = True
         self.i = j + 1
 
     def _dollar(self) -> None:
@@ -726,7 +803,7 @@ class _Lexer:
             raise _Blocked("the command ends in a backslash.")
         if nxt != "\n":  # a backslash-newline continues the line
             self.buf.append(nxt)
-            self.started = True
+            self.started = self.literal = True
         self.i += 2
 
     def _operator(self, c: str) -> None:
@@ -734,6 +811,7 @@ class _Lexer:
         self._end_part(piped=c == "|" and not double)
         if not double and self.items and isinstance(self.items[-1], _Part):
             self.items[-1].detached = True  # `a | b` and `a &` run a in its own process
+        self.items.append(self.text[self.i : self.i + 2] if double else c)
         self.i += 2 if double else 1
 
     def _redirect(self, c: str) -> None:
@@ -757,13 +835,14 @@ class _Lexer:
         self.redirect = True
         self.i = j
 
-    def _is_null(self, word: str) -> bool:
+    def _is_null(self, word: str, literal: bool) -> bool:
         """The null device for this shell and platform. `nul` is a plain file name outside
-        Windows, and Bash on Windows (Git Bash) writes the device as `/dev/null`."""
+        Windows, Bash on Windows (Git Bash) writes the device as `/dev/null`, and a quoted
+        `'$null'` is a file name, not the variable."""
         if self.shell == "bash":
             return word == "/dev/null"
         if word.casefold() == "$null":
-            return True
+            return not literal
         return word.casefold() in ("nul", "nul:") if self.windows else word == "/dev/null"
 
     def _end_word(self) -> None:
@@ -772,10 +851,11 @@ class _Lexer:
         word = "".join(self.buf)
         # PowerShell cmdlets expand wildcards in paths themselves, even quoted ones.
         wild = self.globbed or (self.shell == "powershell" and any(c in word for c in WILDCARDS))
-        self.buf, self.started, self.globbed = [], False, False
+        literal = self.literal
+        self.buf, self.started, self.globbed, self.literal = [], False, False, False
         if self.redirect:
             self.redirect = False
-            if not self._is_null(word):
+            if not self._is_null(word, literal):
                 raise _Blocked(
                     f"the redirect to {word} writes a file; redirect only to the null device."
                 )
