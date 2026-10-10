@@ -268,7 +268,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Table-driven unit tests, plus junction cases on a temporary folder.
 - **Depends on:** 2.1
 
-### [ ] 2.9 Safety hook: shell commands
+### [x] 2.9 Safety hook: shell commands
 
 - **What:** Add a PreToolUse check for Bash and PowerShell. It splits compound commands (`&&`, `||`, `;`, `|`, subshells) and checks each part against the role's allowlist. It also blocks:
   - every `git` command, for every role (agents never run git; the engine commits)
@@ -283,6 +283,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - The planner is allowed only read-only commands.
 - **Tests:** Table-driven unit tests.
 - **Depends on:** 2.1
+- **Note:** "read-only commands" is a fixed list in `safety/commands.py` (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `stat`, `diff`, `sort`, `pwd`, `which` and their PowerShell forms), minus flags that write or run something (`find -exec`/`-delete`, `rg --pre`, `sort -o`). Their paths must stay inside the worktree and the run folder, and a content read may not reach `.env*`. The tester and builder run only their allowlist, plus `cd` inside the worktree. `gh` is blocked with `git`. Anything the check can't judge is blocked: expansion (`$`, backticks, `%X%`, `@splat`), braces, input redirects, output redirects except to the null device, `VAR=x` prefixes, and wrappers (`cmd /c`, `powershell -c`, `bash -c`, `env`, `xargs`, `iex`, ...), whose inner command is checked for the reason. Built on `main` before 2.8 merged, at Kunal's request (Oct 10, 2026).
 
 ### [ ] 2.10 Secret scan
 
