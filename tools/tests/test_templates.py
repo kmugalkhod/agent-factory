@@ -140,3 +140,8 @@ def test_plan_acceptance_criteria_are_numbered() -> None:
     body = text[start + 1 : end]
     assert any(line.startswith("1. ") for line in body)
     assert not any(line.startswith("- ") for line in body)
+
+
+def test_readme_says_earlier_reviews_are_archived() -> None:
+    """Run 1 (task 1.5): a second review overwrote the first with no rule for keeping it."""
+    assert "`attempts/review-<n>.md`" in README.read_text(encoding="utf-8")

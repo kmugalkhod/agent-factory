@@ -110,7 +110,7 @@ Each repo carries its own factory configuration, so every repo can have differen
 | Thinking effort | High      | Normal       | Normal                | High        |
 | May write       | `plan.md` | `tests/**`   | `src/**`              | `review.md` |
 | May not touch   | code      | `src/**`     | `tests/**`, `plan.md` | everything  |
-| Shell commands  | read-only | test command | test, build, lint     | none        |
+| Shell commands  | read-only | test, lint   | test, build, lint     | none        |
 
 Roles ask for logical models (`opus`, `sonnet`). Each provider profile maps those to real model names, so switching provider never means editing every repo.
 

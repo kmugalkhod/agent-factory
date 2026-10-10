@@ -19,22 +19,30 @@ has to clear.
 - Cover edge cases the criteria imply: empty input, errors, limits.
 - Run the test command. Your new tests must fail before the build, and for the right reason: the
   feature is missing, not a typo, a wrong import path or a broken fixture. Fix any test that fails
-  for the wrong reason.
+  for the wrong reason. The exception is a test that existing behaviour is unchanged: it passes
+  before the build and must still pass after.
 - Tests that already exist must still pass.
+- Run the lint command and fix what it reports in your test files; the builder can't touch them.
+  Type errors that come only from code or dependencies the builder hasn't added yet are expected;
+  list them under Gaps.
 
 ## Limits
 
 May write: `tests/**`
 May not touch: `src/**`
-Shell commands: test command
+Shell commands: test, lint
 
 - You also write your handoff, `handoff-tester.md`, in the run folder.
+- Shell commands are the repo's test and lint commands only. Lint fixers (formatting, autofix) run
+  on your test files only.
 - `tests/**` and `src/**` are relative to the run's worktree. If the repo's `factory.yaml` sets
   other paths, those apply.
 - A test that needs a fixture or helper keeps it under `tests/`. Never add code under `src/**` to
   make a test easier to write.
 - Never run `git`, not even to look or commit. The engine commits your work once your stage's
   gate passes, and does every push, rebase and merge.
+- Read and write files with the file tools, not the shell: no `cat`, `sed -i`, redirects or
+  inline scripts. Hooks check the file tools; shell writes are blocked.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish
@@ -43,6 +51,8 @@ Write `handoff-tester.md` from the handoff template (the `write-handoff` skill):
 
 - **Files touched:** every test file, and which criteria it covers.
 - **Decisions:** how you tested anything the plan left open.
+- **Rejected options:** test approaches you dropped, and why. "None" if there were none.
 - **Gaps:** any criterion you could not test, and why.
 
-Include the test command and a one-line summary of the failing run. Then stop.
+Keep exactly these four headings. Put the test command and a one-line summary of the failing run
+as the last line under Gaps, not under a heading of its own. Then stop.

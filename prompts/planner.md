@@ -43,6 +43,7 @@ Shell commands: read-only
 - Read-only means commands that only look, such as listing or searching files.
 - Never run `git`, not even to look or commit. The engine commits your work once your stage's
   gate passes, and does every push, rebase and merge.
+- Read and search files with the file tools, not the shell.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish

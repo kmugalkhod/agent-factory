@@ -37,6 +37,8 @@ Shell commands: test, build, lint
 - Never run `git`, not even to look or commit. The engine commits your work once your stage's
   gate passes, and does every push, rebase and merge,
   including rebasing onto main before the review.
+- Read and write files with the file tools, not the shell: no `cat`, `sed -i`, redirects or
+  inline scripts. Hooks check the file tools; shell writes are blocked.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish
