@@ -371,7 +371,7 @@ def test_update_repo_reads_under_the_write_lock(
     assert final is not None and final.ready is True
 
 
-def test_first_open_holds_the_lock_while_migrating(
+def test_migration_holds_the_write_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:  # issue 3
     path = tmp_path / "registry.db"
@@ -379,11 +379,11 @@ def test_first_open_holds_the_lock_while_migrating(
     outcome: list[str] = []
 
     def racing(conn: sqlite3.Connection) -> int:
-        if not outcome:
+        if conn.in_transaction and not outcome:  # the version read under the lock
             outcome.append("started")
             try:
                 Registry(path, timeout=0.2).close()
-                outcome.append("other open migrated first")
+                outcome.append("other open migrated too")
             except RegistryError:
                 outcome.append("other open blocked")
         return real(conn)
@@ -392,6 +392,44 @@ def test_first_open_holds_the_lock_while_migrating(
     with open_registry(path) as reg:
         assert reg.list_repos() == []
     assert outcome == ["started", "other open blocked"]
+
+
+def test_migration_rechecks_the_version_under_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # issue 3, and the follow-up review
+    """Another open migrates between this open's unlocked read and its lock."""
+    path = tmp_path / "registry.db"
+    real = registry_module._schema_version
+    outcome: list[str] = []
+
+    def racing(conn: sqlite3.Connection) -> int:
+        version = real(conn)
+        if not conn.in_transaction and not outcome:  # the first, unlocked read
+            outcome.append("started")
+            Registry(path).close()  # migrates the fresh database to SCHEMA_VERSION
+            outcome.append("other open migrated")
+        return version
+
+    monkeypatch.setattr(registry_module, "_schema_version", racing)
+    with open_registry(path) as reg:  # saw 0 without the lock; must not migrate again
+        assert reg.list_repos() == []
+    assert outcome == ["started", "other open migrated"]
+
+
+def test_opening_a_current_registry_doesnt_wait_for_a_writer(tmp_path: Path) -> None:
+    """PR #13 follow-up: a current schema needs no write lock, so opens work during writes."""
+    path = tmp_path / "registry.db"
+    with open_registry(path) as reg:
+        reg.add_repo("app", tmp_path / "app", now=NOW)
+    writer = sqlite3.connect(path, timeout=0.2, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("UPDATE repos SET ready = 1")
+    try:
+        with open_registry(path, timeout=0.2) as reader:
+            assert [r.ready for r in reader.list_repos()] == [False]  # the committed version
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
 
 
 def test_rebuild_refuses_a_run_json_in_a_renamed_folder(tmp_path: Path) -> None:  # issue 4

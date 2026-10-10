@@ -170,20 +170,31 @@ class Registry:
             raise RegistryError(f"{self.path}: can't read the registry ({err}).") from err
 
     def _migrate(self) -> None:
-        """Read the version and apply migrations under one write lock, so two first opens
-        can't both migrate."""
-        with self._write("check and migrate the schema") as conn:
+        """Bring the schema to SCHEMA_VERSION.
+
+        A current schema needs no write, so the first check takes no lock and opens don't wait
+        for writers. A migration takes the write lock and checks the version again, since
+        another open may have migrated in between.
+        """
+        version = _schema_version(self._conn)
+        self._check_supported(version)
+        if version == SCHEMA_VERSION:
+            return
+        with self._write("migrate the schema") as conn:
             version = _schema_version(conn)
-            if version > SCHEMA_VERSION:
-                raise RegistryError(
-                    f"{self.path}: schema version {version} is newer than this factory "
-                    f"supports ({SCHEMA_VERSION}). Upgrade the factory before using it."
-                )
+            self._check_supported(version)
             for step in range(version, SCHEMA_VERSION):
                 for statement in MIGRATIONS[step].split(";"):
                     if statement.strip():
                         conn.execute(statement)
                 conn.execute(f"PRAGMA user_version = {step + 1}")
+
+    def _check_supported(self, version: int) -> None:
+        if version > SCHEMA_VERSION:
+            raise RegistryError(
+                f"{self.path}: schema version {version} is newer than this factory "
+                f"supports ({SCHEMA_VERSION}). Upgrade the factory before using it."
+            )
 
     # --------------------------------------------------------------- repos
 
