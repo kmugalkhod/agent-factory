@@ -3,7 +3,10 @@ name = "factory-engine"
 version = "0.1.0"
 description = "Deterministic engine for the agent factory: stages, gates, registry, events."
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14,<2.15",
+    "pyyaml>=6.0.3,<7",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.10"]

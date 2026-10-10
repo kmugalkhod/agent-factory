@@ -133,7 +133,7 @@ Goal: the deterministic engine runs bootstrap and feature runs end to end on one
 
 All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tests use a fake agent runner and temporary git repos. Tests that call a real model are marked `@pytest.mark.live` and are skipped by default.
 
-### [ ] 2.1 `factory.yaml` schema and layered settings
+### [x] 2.1 `factory.yaml` schema and layered settings
 
 - **What:** Add pydantic models for the global defaults, the repo's `factory.yaml` and run-level overrides, merged in the order run > repo > global. Fields:
   - models and thinking effort per role
