@@ -230,7 +230,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.1
 - **Note:** the token's expiry date is a new global-only setting, `token_expires` in `config.py` (like `bootstrap`, not settable in `factory.yaml` or run overrides). Preflight fails when it isn't recorded.
 
-### [ ] 2.7 Per-agent config folder
+### [x] 2.7 Per-agent config folder
 
 - **What:** For each run and role, create a `CLAUDE_CONFIG_DIR` holding:
   - a `settings.json` with the role's allow and deny rules
@@ -245,6 +245,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Nothing from `~/.claude` is copied.
 - **Tests:** Unit tests inspect the generated folder for each role.
 - **Depends on:** 1.4, 2.1, 2.6
+- **Note:** deny rules always beat allow rules, and the worktree sits inside the home folder, so no deny rule can say "everything outside the worktree". Instead `settings.json` sets `defaultMode: dontAsk` with the run folder as an extra working folder: Claude Code approves reads and edits only inside its working folders, and dontAsk refuses the rest. Deny rules name `~/.ssh`, `~/.aws`, `~/.claude`, `.env*` and other repos. The config folder is `<data>/agents/<repo>/<id>-<slug>/<role>/`, outside the run folder. Agreed with Kunal (Oct 10, 2026).
 
 ### [ ] 2.8 Safety hook: file paths
 
