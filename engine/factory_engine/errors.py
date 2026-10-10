@@ -7,3 +7,11 @@ class FactoryError(Exception):
 
 class ConfigError(FactoryError):
     """A config file or override is missing, unreadable or invalid."""
+
+
+class DataFolderError(FactoryError):
+    """The factory data folder can't be located, or a repo name or slug is unsafe as a path."""
+
+
+class RunFileError(FactoryError):
+    """A run's `run.json` is missing, unreadable, invalid or couldn't be written."""
