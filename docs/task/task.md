@@ -154,7 +154,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Unit tests for precedence, defaults, validation errors, and a full sample `factory.yaml` round trip.
 - **Depends on:** 1.1 (done by hand in 1.5)
 
-### [ ] 2.2 Data folder and `run.json`
+### [x] 2.2 Data folder and `run.json`
 
 - **What:** Add the factory data folder (`%LOCALAPPDATA%\agent-factory`, overridable by an env var) and the `Run` model saved as `run.json`:
   - id, slug, repo, kind (bootstrap / feature / spec), state, stage, attempts
@@ -170,6 +170,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Run IDs are unique and increase per repo.
 - **Tests:** Round-trip test, simulated interrupted write, ID allocation test.
 - **Depends on:** 2.1
+- **Deviation:** each run's folder is `<data>/runs/<repo>/<id>-<slug>/`, not `<data>/runs/<id>-<slug>/`. Run IDs count up per repo from 0 (the bootstrap run), so two repos can share an ID and slug; the repo subfolder keeps their folders apart. The data folder override is `AGENT_FACTORY_DATA`. Agreed with Kunal (Oct 10, 2026).
 
 ### [ ] 2.3 Registry in SQLite
 
