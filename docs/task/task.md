@@ -106,7 +106,7 @@ Goal: the files every stage writes and reads exist, the role prompts and factory
 - **Tests:** `tools/tests/test_skills.py` validates the frontmatter, the name/folder match and the line limit for every folder in `plugin/skills/`.
 - **Depends on:** 1.2
 
-### [ ] 1.5 Manual run on this repo
+### [x] 1.5 Manual run on this repo
 
 - **What:** Do task 2.1 by hand with the milestone 1 files. Run a separate Claude Code session per role (planner, then tester, builder and reviewer), each given only its role prompt and the previous stage's files. Keep the run docs in a scratch folder outside the repo. Fix the prompts, templates and skills wherever they fell short.
 - **Touches:** `prompts/`, `templates/`, `plugin/skills/` (fixes only); the task 2.1 code is committed under task 2.1

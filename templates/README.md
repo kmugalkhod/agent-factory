@@ -63,7 +63,9 @@ reviewer writes `review.md` only.
 
 ## review.md
 
-Written by the reviewer. The reviewer gate fails on any `[Important]` finding.
+Written by the reviewer. The reviewer gate fails on any `[Important]` finding. `review.md` holds
+the latest review; before the next review overwrites it, the engine copies it to
+`attempts/review-<n>.md` in the run folder.
 
 - `Acceptance criteria`
 - `Findings`

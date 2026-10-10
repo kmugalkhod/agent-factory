@@ -168,3 +168,32 @@ def test_bootstrap_builder_skips_reads_of_tester_output(missing: str) -> None:
     """Run 0 has no tester stage; the addendum must exempt the base prompt's reads."""
     assert missing in bootstrap_builder_section()
     assert missing.lower() in prompt("builder").lower()  # the read being exempted exists
+
+
+@pytest.mark.parametrize("role", ["planner", "tester", "builder"])
+def test_prompt_lists_every_handoff_heading(role: str) -> None:
+    """Run 1 (task 1.5): the tester's handoff dropped Rejected options the prompt didn't name."""
+    text = prompt(role).lower()
+    for heading in ("files touched", "decisions", "rejected options", "gaps"):
+        assert heading in text
+
+
+def test_tester_puts_the_test_command_under_gaps() -> None:
+    """Run 1: the tester invented a `## Test command` heading the gate rejects."""
+    assert "under Gaps" in prompt("tester")
+
+
+@pytest.mark.parametrize("role", ROLES)
+def test_prompt_says_to_use_file_tools_not_the_shell(role: str) -> None:
+    """Run 1: agents tried `cat`, `sed -i` and heredocs; hooks only check the file tools."""
+    assert "file tools, not the shell" in prompt(role)
+
+
+def test_tester_may_lint_its_own_tests() -> None:
+    """Run 1: nobody could fix lint in test files; Kunal gave the tester lint (Oct 10, 2026)."""
+    assert role_table()["Shell commands"]["tester"] == "test, lint"
+
+
+def test_tester_allows_unchanged_behaviour_tests_to_pass_before_the_build() -> None:
+    """A test that existing behaviour is unchanged passes before the build by design."""
+    assert "existing behaviour is unchanged" in prompt("tester")

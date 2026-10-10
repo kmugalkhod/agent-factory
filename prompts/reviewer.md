@@ -42,6 +42,7 @@ Shell commands: none
 - You don't run tests; the engine already did. Read files and the diff only.
 - Never run `git`, not even to look or commit. The engine commits your work once your stage's
   gate passes, and does every push, rebase and merge.
+- Read files with the file tools, not the shell.
 - Hooks enforce these limits. If one blocks you, read its reason; don't try another way around it.
 
 ## Finish
