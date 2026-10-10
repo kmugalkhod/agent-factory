@@ -87,7 +87,7 @@ def _write(tmp_path: Path, text: str, name: str = "factory.yaml") -> Path:
 
 ROLE_TABLE = [
     ("planner", "opus", "high", ["plan.md"], [], True, [], None),
-    ("tester", "sonnet", "normal", ["tests/**"], ["src/**"], False, ["test"], None),
+    ("tester", "sonnet", "normal", ["tests/**"], ["src/**"], False, ["test", "lint"], None),
     (
         "builder",
         "sonnet",
@@ -379,6 +379,46 @@ def test_bad_files_raise_config_error(tmp_path: Path) -> None:  # AC7
     with pytest.raises(ConfigError) as exc:
         load_repo_config(as_list)
     assert str(as_list) in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "key_path"),
+    [
+        ("provider: subscription\nprovider: litellm\n", "provider"),
+        (
+            "roles:\n  builder:\n    model: opus\n  builder:\n    effort: high\n",
+            "roles.builder",
+        ),
+        ("roles:\n  builder:\n    model: opus\n    model: sonnet\n", "roles.builder.model"),
+        (
+            "critical_flows:\n  - name: a\n    tests: []\n    tests: [x]\n",
+            "critical_flows.0.tests",
+        ),
+    ],
+)
+def test_duplicate_key_reports_file_and_path(tmp_path: Path, text: str, key_path: str) -> None:
+    """PR #9 review: a repeated YAML key must not silently replace the earlier settings."""
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    message = str(exc.value)
+    assert str(path) in message
+    assert key_path in message
+    assert "duplicate" in message
+
+
+def test_same_key_under_different_parents_is_allowed(tmp_path: Path) -> None:
+    path = _write(tmp_path, "roles:\n  planner:\n    model: opus\n  builder:\n    model: opus\n")
+    settings = merge_settings(default_settings("win32"), load_repo_config(path))
+    assert settings.roles.builder.model == "opus"
+
+
+def test_duplicate_key_in_global_file_reports_file(tmp_path: Path) -> None:
+    path = _write(tmp_path, "provider: subscription\nprovider: litellm\n", "global.yaml")
+    with pytest.raises(ConfigError) as exc:
+        load_global_settings(path, "win32")
+    assert str(path) in str(exc.value)
+    assert "provider" in str(exc.value)
 
 
 @pytest.mark.parametrize("text", ["", "   \n", "# only a comment\n"])

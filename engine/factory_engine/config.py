@@ -134,7 +134,9 @@ def default_settings(platform: str) -> Settings:
         {
             "roles": {
                 "planner": _role("opus", "high", ["plan.md"], [], True, []),
-                "tester": _role("sonnet", "normal", ["tests/**"], ["src/**"], False, ["test"]),
+                "tester": _role(
+                    "sonnet", "normal", ["tests/**"], ["src/**"], False, ["test", "lint"]
+                ),
                 "builder": _role(
                     "sonnet",
                     "normal",
@@ -257,9 +259,30 @@ def _read_yaml(path: Path) -> object:
     except UnicodeDecodeError as err:
         raise ConfigError(f"{path}: not valid UTF-8 ({err}). Save the file as UTF-8.") from err
     try:
+        _reject_duplicate_keys(yaml.compose(text, Loader=yaml.SafeLoader), path, [])
         return yaml.safe_load(text)
     except yaml.YAMLError as err:
         raise ConfigError(f"{path}: invalid YAML ({err}). Fix the syntax and retry.") from err
+
+
+def _reject_duplicate_keys(node: yaml.Node | None, path: Path, keys: list[str]) -> None:
+    """Fail on a repeated mapping key; YAML loaders otherwise keep the last one silently."""
+    if isinstance(node, yaml.MappingNode):
+        seen: set[str] = set()
+        for key_node, value_node in node.value:
+            key = str(key_node.value)
+            if key in seen:
+                key_path = ".".join([*keys, key])
+                line = key_node.start_mark.line + 1
+                raise ConfigError(
+                    f"{path}: {key_path}: duplicate key (line {line}). "
+                    "Keep one entry and merge them."
+                )
+            seen.add(key)
+            _reject_duplicate_keys(value_node, path, [*keys, key])
+    elif isinstance(node, yaml.SequenceNode):
+        for index, item in enumerate(node.value):
+            _reject_duplicate_keys(item, path, [*keys, str(index)])
 
 
 def load_repo_config(path: Path) -> SettingsPatch:
