@@ -36,3 +36,7 @@ class ProviderError(FactoryError):
 class AgentConfigError(FactoryError):
     """An agent's config folder can't be built: an unknown skill, a path no rule can express,
     or a file that can't be written."""
+
+
+class SafetyError(FactoryError):
+    """A safety check can't be set up, for example a locked file outside the worktree."""
