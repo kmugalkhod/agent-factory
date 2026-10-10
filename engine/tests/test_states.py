@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import get_args
 
 import pytest
+from pydantic import ValidationError
 
 from factory_engine.errors import EventLogError, IllegalTransitionError
 from factory_engine.events import EventLog, StateChanged, read_events
-from factory_engine.run import Run, RunState, new_run
+from factory_engine.run import Run, RunState, load_run, new_run, save_run
 from factory_engine.states import TRANSITIONS, move, transition
 
 NOW = datetime(2026, 10, 10, 9, 30, tzinfo=UTC)
@@ -137,6 +138,18 @@ def test_transition_is_pure() -> None:
     assert run.state == "pending"
     assert run.updated_at == NOW
     assert moved is not run
+
+
+def test_transition_refuses_a_time_without_a_timezone() -> None:
+    """PR #15 review: model_copy skips validation, so a naive `now` must be refused first."""
+    with pytest.raises(ValidationError):
+        transition(_run("pending"), "planning", now=datetime(2026, 10, 10, 9, 30))
+
+
+def test_a_moved_run_saves_and_loads(tmp_path: Path) -> None:
+    moved, _ = transition(_run("pending"), "planning", now=LATER)
+    save_run(moved, tmp_path)
+    assert load_run(tmp_path) == moved
 
 
 def _log(folder: Path, *times: datetime) -> EventLog:

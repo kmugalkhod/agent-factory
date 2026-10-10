@@ -13,6 +13,8 @@ Staying in a state is not a transition: retries and resumed sessions keep the ru
 from datetime import datetime
 from types import MappingProxyType
 
+from pydantic import AwareDatetime, TypeAdapter
+
 from factory_engine.errors import EventLogError, IllegalTransitionError
 from factory_engine.events import EventLog, StateChanged
 from factory_engine.run import Run, RunState
@@ -21,6 +23,7 @@ WORKING: tuple[RunState, ...] = ("planning", "testing", "building", "updating", 
 """States in which an agent or the engine is working on the run."""
 
 _STOP: tuple[RunState, ...] = ("failed", "stopped")
+_AWARE = TypeAdapter(AwareDatetime)
 
 TRANSITIONS: MappingProxyType[RunState, frozenset[RunState]] = MappingProxyType(
     {
@@ -55,7 +58,12 @@ TRANSITIONS: MappingProxyType[RunState, frozenset[RunState]] = MappingProxyType(
 
 
 def transition(run: Run, target: RunState, *, now: datetime) -> tuple[Run, StateChanged]:
-    """The run moved to `target`, and the event that records it. Raises if not allowed."""
+    """The run moved to `target`, and the event that records it. Raises if not allowed.
+
+    `now` must carry a timezone, like every `Run` timestamp: `model_copy` doesn't validate, so
+    it is checked here.
+    """
+    now = _AWARE.validate_python(now)
     allowed = TRANSITIONS[run.state]
     if target not in allowed:
         options = ", ".join(sorted(allowed)) or "none, the run is closed"
