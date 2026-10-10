@@ -10,7 +10,7 @@ import pytest
 from factory_engine.config import RoleSettings, default_settings
 from factory_engine.errors import SafetyError
 from factory_engine.run import Role
-from factory_engine.safety.paths import PathDecision, PathPolicy, check_file_tool
+from factory_engine.safety.paths import PathDecision, PathPolicy, _link_decision, check_file_tool
 
 WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="Windows path rules")
 LOCKED = ("tests/test_lock.py",)
@@ -353,6 +353,85 @@ def test_a_search_through_a_junction_out_of_the_worktree_is_blocked(
 ) -> None:
     _junction(roots["wt"] / "src" / "link", roots["out"])
     _assert(_check(roots, "builder", "Grep", {"pattern": "x"}), False, "outside")
+
+
+@WINDOWS
+def test_a_glob_does_not_excuse_a_junction_out_of_the_worktree(roots: dict[str, Path]) -> None:
+    """A glob filters the files inside a linked folder, which the check can't predict."""
+    _junction(roots["wt"] / "src" / "link", roots["out"])
+    decision = _check(roots, "builder", "Grep", {"pattern": "x", "glob": "*.py"})
+    _assert(decision, False, "outside")
+
+
+def test_a_plain_folder_search_is_allowed(roots: dict[str, Path]) -> None:
+    (roots["wt"] / "src" / "pkg").mkdir()
+    (roots["wt"] / "src" / "pkg" / "mod.py").write_text("x = 1", encoding="utf-8")
+    _assert(_check(roots, "builder", "Grep", {"pattern": "x", "path": "src"}), True, "")
+
+
+@pytest.mark.parametrize(
+    ("target", "is_file", "glob", "allowed", "reason"),
+    [
+        ("{out}/notes.txt", True, "*.py", True, ""),
+        ("{out}/notes.txt", True, "src/*.py", True, ""),
+        ("{out}/notes.txt", True, "*.txt", False, "outside"),
+        ("{out}/notes.txt", True, None, False, "outside"),
+        ("{out}/notes.txt", True, "*.{py,txt}", False, "outside"),
+        ("{out}", False, "*.py", False, "outside"),
+        ("{wt}/config/.env", True, "*.py", True, ""),
+        ("{wt}/config/.env", True, "*.txt", False, "secret"),
+        ("{wt}/config/.env", True, None, False, "secret"),
+        ("{wt}/src/app.py", True, None, True, ""),
+        ("{wt}/tests", False, None, True, ""),
+    ],
+)
+def test_each_link_a_search_meets_is_judged_by_its_target_and_the_glob(
+    roots: dict[str, Path],
+    target: str,
+    is_file: bool,
+    glob: str | None,
+    allowed: bool,
+    reason: str,
+) -> None:
+    """The judgement behind the link tests below, which need symlink rights to run."""
+    policy = _policy(roots, "builder")
+    link = roots["wt"] / "src" / "notes.txt"
+    resolved = Path(target.format(**{k: str(v) for k, v in roots.items()})).resolve()
+    blocked = _link_decision(policy, link, "src/notes.txt", resolved, is_file, glob)
+    _assert(blocked or PathDecision(True), allowed, reason)
+
+
+def _file_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as err:
+        pytest.skip(f"can't create symlinks here: {err}")
+
+
+@pytest.mark.parametrize(
+    ("glob", "allowed"),
+    [("*.py", True), ("src/*.py", True), ("*.txt", False), (None, False), ("*.{py,txt}", False)],
+)
+def test_a_file_link_out_is_judged_by_the_glob(
+    roots: dict[str, Path], glob: str | None, allowed: bool
+) -> None:
+    _file_link(roots["wt"] / "src" / "notes.txt", roots["out"] / "notes.txt")
+    tool_input: dict[str, object] = {"pattern": "x"}
+    if glob is not None:
+        tool_input["glob"] = glob
+    _assert(_check(roots, "builder", "Grep", tool_input), allowed, "outside")
+
+
+@pytest.mark.parametrize(("glob", "allowed"), [("*.py", True), ("*.txt", False), (None, False)])
+def test_a_file_link_to_a_secrets_file_is_judged_by_the_glob(
+    roots: dict[str, Path], glob: str | None, allowed: bool
+) -> None:
+    _secret(roots, "config/.env")
+    _file_link(roots["wt"] / "src" / "notes.txt", roots["wt"] / "config" / ".env")
+    tool_input: dict[str, object] = {"pattern": "x", "path": "src"}
+    if glob is not None:
+        tool_input["glob"] = glob
+    _assert(_check(roots, "builder", "Grep", tool_input), allowed, "secret")
 
 
 # --------------------------------------------------------- .git as a file

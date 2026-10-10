@@ -158,12 +158,11 @@ def _search(policy: PathPolicy, root: Path, glob: str | None) -> PathDecision:
                     return _block(
                         f"the search meets {path}, a link that can't be resolved ({err})."
                     )
-                if _working_relative(policy, target) is None:
-                    return _block(
-                        f"the search would follow {path}, a link outside the worktree. "
-                        "Narrow `path` to skip it."
-                    )
-                continue  # its target is searched where it really lives
+                rel = path.relative_to(root).as_posix()
+                blocked = _link_decision(policy, path, rel, target, target.is_file(), glob)
+                if blocked:
+                    return blocked
+                continue  # a linked folder inside is searched where it really lives
             if entry.is_dir(follow_symlinks=False):
                 folders.append(path)
             elif _matches(entry.name, SECRETS, policy.windows) and _glob_may_match(
@@ -174,6 +173,29 @@ def _search(policy: PathPolicy, root: Path, glob: str | None) -> PathDecision:
                     "`glob` or `path` so it skips the file."
                 )
     return ALLOW
+
+
+def _link_decision(
+    policy: PathPolicy, link: Path, rel: str, target: Path, is_file: bool, glob: str | None
+) -> PathDecision | None:
+    """A block for a link the search can open, or None. A linked file the glob skips is never
+    opened; a linked folder can't be judged by the glob, which filters the files inside it."""
+    if is_file and not _glob_may_match(glob, rel, link.name, policy.windows):
+        return None
+    if _working_relative(policy, target) is None:
+        return _block(
+            f"the search would follow {link}, a link outside the worktree. Narrow `path` or "
+            "`glob` to skip it."
+        )
+    if is_file and (
+        _matches(link.name, SECRETS, policy.windows)
+        or _matches(target.name, SECRETS, policy.windows)
+    ):
+        return _block(
+            f"the search would read {link}, a link to a secrets file (.env*). Narrow it with "
+            "`glob` or `path` so it skips the file."
+        )
+    return None
 
 
 def _glob_may_match(glob: str | None, rel: str, name: str, windows: bool) -> bool:
