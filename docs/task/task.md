@@ -118,12 +118,12 @@ Goal: the files every stage writes and reads exist, the role prompts and factory
 - **Tests:** `uv run tools/dev.py test` and `lint` pass after the fixes.
 - **Depends on:** 1.3, 1.4
 
-### [ ] 1.X Milestone 1 exit (manual, signed off by Kunal)
+### [x] 1.X Milestone 1 exit (manual, signed off by Kunal)
 
-- [ ] The manual result of task 2.1 is good enough to merge, and is merged
-- [ ] The run docs from 1.5 are each at most one page and readable without the transcript
-- [ ] Prompt and template fixes from 1.5 are committed
-- [ ] Milestone summary written: what was built, what was tested, deviations from the design
+- [x] The manual result of task 2.1 is good enough to merge, and is merged
+- [x] The run docs from 1.5 are each at most one page and readable without the transcript
+- [x] Prompt and template fixes from 1.5 are committed
+- [x] Milestone summary written: what was built, what was tested, deviations from the design
 
 ---
 
