@@ -148,7 +148,6 @@ CASES = [
     ("planner", "sh", "ls src", True, ""),
     ("planner", "sh", "pwd", True, ""),
     ("planner", "sh", "cat src/app.py | head -5", True, ""),
-    ("planner", "sh", "grep -rn def src", True, ""),
     ("planner", "sh", "find . -name '*.py'", True, ""),
     ("planner", "sh", "cd src && ls", True, ""),
     ("planner", "sh", "cat {run}/plan.md", True, ""),
@@ -198,7 +197,6 @@ CASES = [
     ("planner", "sh", "grep -f../outside_folder/x def src", False, "outside"),
     ("planner", "ps", "Get-Content -Path:../outside_folder/x", False, "outside"),
     ("planner", "sh", "head -n5 src/app.py", True, ""),
-    ("planner", "sh", "grep -rn --include=*.py def src", True, ""),
     # ---- cd: returning to the worktree, subshells and pipes (issue 8)
     ("builder", "sh", "cd src && cd ..", True, ""),
     ("builder", "sh", "cd src; cd ..", True, ""),
@@ -221,19 +219,22 @@ CASES = [
     ("planner", "sh", "rg --file=src/app.py config/.env.local", False, "secret"),
     ("planner", "ps", "Select-String -Pattern TOKEN config/.env.local", False, "secret"),
     ("planner", "ps", "sls -Pat TOKEN config/.env.local", False, "secret"),
-    ("planner", "sh", "grep -e def src", True, ""),
     # ---- review round 3: long options match exactly; unsure means check the folder too
     ("planner", "sh", "rg --hidden --no-ignore --files-with-matches TOKEN", False, "secret"),
     ("planner", "sh", "grep -rl --files-without-match TOKEN", False, "secret"),
     ("planner", "sh", "rg --regex=TOKEN config/.env.local", False, "secret"),
     ("planner", "sh", "rg -e TOKEN", False, "secret"),
     ("planner", "sh", "grep -ie TOKEN", False, "secret"),
-    ("planner", "sh", "grep -ie TOKEN src", True, ""),
     ("planner", "ps", "Select-String -pa TOKEN", False, "secret"),
-    ("planner", "sh", "rg -e TOKEN -e def src", True, ""),
     ("planner", "sh", "rg -f src/app.py", False, "secret"),
-    ("planner", "sh", "rg --files-with-matches def src", True, ""),
-    ("planner", "sh", "grep -e def -e main src", True, ""),
+    # ---- review round 4: named PowerShell paths and options with separate values
+    ("planner", "ps", "Select-String -Path config/.env.local TOKEN", False, "secret"),
+    ("planner", "ps", "Select-String -LiteralPath config/.env.local TOKEN", False, "secret"),
+    ("planner", "ps", "sls -Path config/.env.local -Pattern TOKEN", False, "secret"),
+    ("planner", "sh", "grep -A 3 TOKEN config/.env.local", False, "secret"),
+    ("planner", "sh", "grep -r -A 3 config", False, "secret"),
+    ("planner", "sh", "grep -rn def src", False, "secret"),  # the folder holds config/.env.local
+    ("planner", "ps", "Get-Content src/app.py | Select-String TOKEN", True, ""),
     # ---- options that run a program (issue 3)
     ("planner", "sh", "sort --compress-program=./payload -S 1K src/app.py", False, "read-only"),
     ("planner", "sh", "sort --compress-program ./payload src/app.py", False, "read-only"),
@@ -397,6 +398,7 @@ def test_a_read_through_a_link_to_a_secrets_folder_is_blocked(roots: dict[str, P
 
 @WINDOWS
 def test_a_read_through_a_link_inside_the_worktree_is_allowed(roots: dict[str, Path]) -> None:
+    (roots["wt"] / "config" / ".env.local").unlink()
     (roots["wt"] / "lib").mkdir()
     _junction(roots["wt"] / "src" / "lib", roots["wt"] / "lib")
     _assert(_check(roots, "planner", "sh", "grep -R def src"), True, "")
@@ -475,3 +477,28 @@ def test_or_runs_from_where_the_first_command_failed(roots: dict[str, Path]) -> 
     (roots["wt"] / "src" / "deeper").mkdir()
     command = "cd src || cd deeper; cat ../../outside_folder/x"
     _assert(_check(roots, "planner", "sh", command), False, "outside")
+
+
+# --------------------------- searches in a worktree without secrets
+
+
+@pytest.mark.parametrize(
+    ("shell", "command"),
+    [
+        ("sh", "grep -rn def src"),
+        ("sh", "grep -rn --include=*.py def src"),
+        ("sh", "grep -e def src"),
+        ("sh", "grep -ie TOKEN src"),
+        ("sh", "grep -r -A 3 def"),
+        ("sh", "rg -e TOKEN -e def src"),
+        ("sh", "rg --files-with-matches def src"),
+        ("sh", "grep -e def -e main src"),
+        ("ps", "Select-String -Path src/app.py def"),
+        ("ps", "Select-String def src/app.py"),
+    ],
+)
+def test_searches_are_allowed_when_no_secret_is_in_reach(
+    roots: dict[str, Path], shell: str, command: str
+) -> None:
+    (roots["wt"] / "config" / ".env.local").unlink()
+    _assert(_check(roots, "planner", shell, command), True, "")
