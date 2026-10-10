@@ -23,3 +23,7 @@ class RegistryError(FactoryError):
 
 class EventLogError(FactoryError):
     """A run's `events.jsonl` can't be read or written, or holds an invalid event."""
+
+
+class IllegalTransitionError(FactoryError):
+    """A run was asked to move between two states the state machine doesn't connect."""
