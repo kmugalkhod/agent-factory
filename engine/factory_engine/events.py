@@ -128,17 +128,19 @@ class EventLog:
     def __init__(
         self, folder: Path, *, repo: str, run_id: int, clock: Callable[[], datetime]
     ) -> None:
+        self._folder = folder
         self.path = folder / EVENTS_FILE
         self._repo = repo
         self._run_id = run_id
         self._clock = clock
         self._lock = threading.Lock()
-        self._cut_unfinished_line()
-        events = read_events(folder)
-        self._last_seq = events[-1].seq if events else 0
+        self._last_seq = 0
+        self._recover()
 
     def append(self, body: Body, *, role: Role | None = None) -> Event:
         with self._lock:
+            if self._needs_recovery:
+                self._recover()
             event = Event(
                 seq=self._last_seq + 1,
                 at=self._clock(),
@@ -153,12 +155,24 @@ class EventLog:
                     handle.write(line)
                     handle.flush()
             except OSError as err:
+                # Part or all of the line may be on disk: recover before the next append.
+                self._needs_recovery = True
                 raise EventLogError(
                     f"{self.path}: can't append event {event.seq} ({err}). "
                     "Check the run folder is writable."
                 ) from err
             self._last_seq = event.seq
             return event
+
+    def _recover(self) -> None:
+        """Cut an unfinished last line and take the sequence from the file, which is the
+        truth after a crash or a failed write. Stays marked if it fails, so no append runs
+        on a log in an unknown state."""
+        self._needs_recovery = True
+        self._cut_unfinished_line()
+        events = read_events(self._folder)
+        self._last_seq = events[-1].seq if events else 0
+        self._needs_recovery = False
 
     def _cut_unfinished_line(self) -> None:
         """Drop bytes after the last newline: a line a crash left unfinished."""
@@ -187,10 +201,56 @@ def read_events(folder: Path, after: int = 0) -> list[Event]:
         return []
     except OSError as err:
         raise EventLogError(f"{path}: can't read the event log ({err}).") from err
-    complete = data[: data.rfind(b"\n") + 1]
+    events, _, _ = _parse(path, _complete(data), lines_before=0, last_seq=0)
+    return [event for event in events if event.seq > after]
+
+
+class EventTail:
+    """Follows one run's events for a live view: each `poll` reads only bytes it hasn't seen.
+
+    The first poll reads the file from the start; later polls continue from where the last
+    one stopped, so a poll with nothing new costs one small read. Lines already passed are not
+    checked again; `read_events` checks the whole file.
+    """
+
+    def __init__(self, folder: Path, after: int = 0) -> None:
+        self.path = folder / EVENTS_FILE
+        self._after = after
+        self._offset = 0
+        self._lines = 0
+        self._last_seq = 0
+
+    def poll(self) -> list[Event]:
+        """New complete events since the last poll, with `seq > after`."""
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self._offset)
+                data = handle.read()
+        except FileNotFoundError:
+            return []
+        except OSError as err:
+            raise EventLogError(f"{self.path}: can't read the event log ({err}).") from err
+        complete = _complete(data)
+        events, self._last_seq, self._lines = _parse(
+            self.path, complete, lines_before=self._lines, last_seq=self._last_seq
+        )
+        self._offset += len(complete)
+        return [event for event in events if event.seq > self._after]
+
+
+def _complete(data: bytes) -> bytes:
+    """The bytes up to and including the last newline: whole lines only."""
+    return data[: data.rfind(b"\n") + 1]
+
+
+def _parse(
+    path: Path, complete: bytes, *, lines_before: int, last_seq: int
+) -> tuple[list[Event], int, int]:
+    """Parse whole lines; returns the events, the last seq and the total line count."""
     events: list[Event] = []
-    last_seq = 0
-    for number, raw in enumerate(complete.splitlines(), start=1):
+    number = lines_before
+    for raw in complete.splitlines():
+        number += 1
         try:
             event = Event.model_validate_json(raw)
         except ValidationError as err:
@@ -203,9 +263,8 @@ def read_events(folder: Path, after: int = 0) -> list[Event]:
                 "sequence numbers must strictly increase."
             )
         last_seq = event.seq
-        if event.seq > after:
-            events.append(event)
-    return events
+        events.append(event)
+    return events, last_seq, number
 
 
 def _problems(err: ValidationError) -> str:

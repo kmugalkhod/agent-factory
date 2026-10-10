@@ -5,6 +5,7 @@ import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from factory_engine.events import (
     EVENTS_FILE,
     Event,
     EventLog,
+    EventTail,
     GateResult,
     Message,
     NeedsYou,
@@ -210,3 +212,117 @@ def test_event_model_holds_the_header_fields() -> None:
         seq=1, at=START, repo="app", run_id=3, role="builder", body=NeedsYou(reason="cap")
     )
     assert (event.seq, event.at, event.run_id, event.role) == (1, START, 3, "builder")
+
+
+# ------------------------------------------------------------ PR #14 review
+
+
+class _FailingWrite:
+    """An append handle whose write fails after putting `written` bytes on disk."""
+
+    def __init__(self, real: Any, written: str) -> None:
+        self._real = real
+        self._written = written
+
+    def write(self, data: bytes) -> int:
+        self._real.write(data if self._written == "all" else data[: len(data) // 2])
+        self._real.flush()
+        raise OSError("disk full")
+
+    def flush(self) -> None:
+        self._real.flush()
+
+    def __enter__(self) -> "_FailingWrite":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._real.close()
+
+
+@pytest.mark.parametrize("written", ["half", "all"])
+def test_a_failed_write_is_recovered_before_the_next_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, written: str
+) -> None:
+    """Issue 1: a write that fails partway must not corrupt later appends or reuse a seq."""
+    log = _log(tmp_path)
+    log.append(NeedsYou(reason="one"))
+    real_open = Path.open
+    failed: list[bool] = []
+
+    def failing_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        handle = real_open(self, mode, *args, **kwargs)
+        if mode == "ab" and not failed:
+            failed.append(True)
+            return _FailingWrite(handle, written)
+        return handle
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(EventLogError) as exc:
+        log.append(NeedsYou(reason="two"))
+    assert str(tmp_path / EVENTS_FILE) in str(exc.value)
+    monkeypatch.undo()
+
+    third = log.append(NeedsYou(reason="three"))
+    expected = [1, 2] if written == "half" else [1, 2, 3]  # a fully written line stays
+    assert [e.seq for e in read_events(tmp_path)] == expected
+    assert third.seq == expected[-1]
+
+
+def test_tail_returns_only_new_events_on_each_poll(tmp_path: Path) -> None:  # AC3, issue 2
+    log = _log(tmp_path)
+    log.append(NeedsYou(reason="one"))
+    log.append(NeedsYou(reason="two"))
+    tail = EventTail(tmp_path, after=1)
+    assert [e.seq for e in tail.poll()] == [2]
+    assert tail.poll() == []
+    log.append(NeedsYou(reason="three"))
+    assert [e.seq for e in tail.poll()] == [3]
+
+
+def test_tail_doesnt_reread_lines_it_has_passed(tmp_path: Path) -> None:  # issue 2
+    log = _log(tmp_path)
+    log.append(NeedsYou(reason="one"))
+    tail = EventTail(tmp_path)
+    assert [e.seq for e in tail.poll()] == [1]
+    path = tmp_path / EVENTS_FILE
+    data = bytearray(path.read_bytes())
+    data[0:1] = b"X"  # damage line 1 in place; a full re-read would now fail
+    path.write_bytes(bytes(data))
+    log.append(NeedsYou(reason="two"))
+    assert [e.seq for e in tail.poll()] == [2]
+    with pytest.raises(EventLogError):
+        read_events(tmp_path)  # the standalone reader still checks everything
+
+
+def test_tail_waits_for_an_unfinished_line(tmp_path: Path) -> None:  # AC2, issue 2
+    log = _log(tmp_path)
+    first = log.append(NeedsYou(reason="one"))
+    tail = EventTail(tmp_path)
+    tail.poll()
+    line = first.model_dump_json().replace('"seq":1', '"seq":2') + "\n"
+    path = tmp_path / EVENTS_FILE
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line[:20])
+    assert tail.poll() == []
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line[20:])
+    assert [e.seq for e in tail.poll()] == [2]
+
+
+def test_tail_refuses_out_of_order_new_lines(tmp_path: Path) -> None:  # AC1, issue 2
+    log = _log(tmp_path)
+    first = log.append(NeedsYou(reason="one"))
+    tail = EventTail(tmp_path)
+    tail.poll()
+    with (tmp_path / EVENTS_FILE).open("a", encoding="utf-8") as handle:
+        handle.write(first.model_dump_json() + "\n")
+    with pytest.raises(EventLogError) as exc:
+        tail.poll()
+    assert "line 2" in str(exc.value)
+
+
+def test_tail_on_a_run_without_events_waits(tmp_path: Path) -> None:  # issue 2
+    tail = EventTail(tmp_path)
+    assert tail.poll() == []
+    _log(tmp_path).append(NeedsYou(reason="first"))
+    assert [e.seq for e in tail.poll()] == [1]
