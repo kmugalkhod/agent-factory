@@ -168,6 +168,38 @@ def test_bootstrap_default_is_data_in_settings() -> None:  # AC3
     assert patch.deny_paths == ["plan.md"]
 
 
+@pytest.mark.parametrize(
+    ("repo_builder", "run_builder", "write_paths", "deny_paths"),
+    [
+        # All four layers set write_paths; repo and bootstrap set deny_paths.
+        (
+            {"write_paths": ["repo/**"], "deny_paths": ["repo.md"]},
+            {"write_paths": ["run/**"]},
+            ["run/**"],
+            ["repo.md"],
+        ),
+        # Repo and run leave the paths alone: bootstrap still beats global.
+        ({"model": "opus"}, {"effort": "high"}, ["**"], ["plan.md"]),
+    ],
+)
+def test_bootstrap_sits_between_global_and_repo(
+    repo_builder: dict[str, object],
+    run_builder: dict[str, object],
+    write_paths: list[str],
+    deny_paths: list[str],
+) -> None:  # AC3, AC4: run > repo > bootstrap > global
+    """PR #9 review: the approved order must hold when bootstrap and patches combine."""
+    base = default_settings("win32")
+    repo = parse_overrides({"roles": {"builder": repo_builder}}, "factory.yaml")
+    run = parse_overrides({"roles": {"builder": run_builder}}, "run overrides")
+    builder = merge_settings(base, repo, run, bootstrap=True).roles.builder
+    assert builder.write_paths == write_paths
+    assert builder.deny_paths == deny_paths
+    expected = {**base.roles.builder.model_dump(), **repo_builder, **run_builder}
+    for field in ("model", "effort", "shell_read_only", "shell_allowlist", "skills"):
+        assert getattr(builder, field) == expected[field]
+
+
 # --------------------------------------------------------------------- AC4
 
 
@@ -419,6 +451,29 @@ def test_duplicate_key_in_global_file_reports_file(tmp_path: Path) -> None:
         load_global_settings(path, "win32")
     assert str(path) in str(exc.value)
     assert "provider" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "key_path"),
+    [
+        ("critical_flows: &loop [*loop]\n", "critical_flows"),
+        ("roles: &r\n  builder: *r\n", "roles"),
+    ],
+)
+def test_alias_cycle_reports_file(tmp_path: Path, text: str, key_path: str) -> None:
+    """PR #9 review: a self-referencing alias must give ConfigError, not RecursionError."""
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError) as exc:
+        load_repo_config(path)
+    assert str(path) in str(exc.value)
+    assert key_path in str(exc.value)
+
+
+def test_shared_alias_without_a_cycle_is_allowed(tmp_path: Path) -> None:
+    text = "critical_flows:\n  - name: a\n    tests: &t [test_a]\n  - name: b\n    tests: *t\n"
+    patch = load_repo_config(_write(tmp_path, text))
+    flows = merge_settings(default_settings("win32"), patch).critical_flows
+    assert [flow.tests for flow in flows] == [["test_a"], ["test_a"]]
 
 
 @pytest.mark.parametrize("text", ["", "   \n", "# only a comment\n"])

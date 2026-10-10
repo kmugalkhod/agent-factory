@@ -259,30 +259,46 @@ def _read_yaml(path: Path) -> object:
     except UnicodeDecodeError as err:
         raise ConfigError(f"{path}: not valid UTF-8 ({err}). Save the file as UTF-8.") from err
     try:
-        _reject_duplicate_keys(yaml.compose(text, Loader=yaml.SafeLoader), path, [])
+        _check_nodes(yaml.compose(text, Loader=yaml.SafeLoader), path, [], set(), set())
         return yaml.safe_load(text)
     except yaml.YAMLError as err:
         raise ConfigError(f"{path}: invalid YAML ({err}). Fix the syntax and retry.") from err
 
 
-def _reject_duplicate_keys(node: yaml.Node | None, path: Path, keys: list[str]) -> None:
-    """Fail on a repeated mapping key; YAML loaders otherwise keep the last one silently."""
+def _check_nodes(
+    node: yaml.Node | None, path: Path, keys: list[str], open_ids: set[int], done_ids: set[int]
+) -> None:
+    """Fail on a repeated mapping key (loaders keep the last one silently) or an alias cycle.
+
+    Aliases make the node tree a graph: `open_ids` holds the nodes on the current path, so
+    meeting one again is a cycle; `done_ids` skips shared nodes already checked.
+    """
+    if not isinstance(node, yaml.CollectionNode) or id(node) in done_ids:
+        return
+    if id(node) in open_ids:
+        line = node.start_mark.line + 1
+        raise ConfigError(
+            f"{path}: {'.'.join(keys)}: alias refers to itself (line {line}). "
+            "Write the values out instead of the alias."
+        )
+    open_ids.add(id(node))
     if isinstance(node, yaml.MappingNode):
         seen: set[str] = set()
         for key_node, value_node in node.value:
             key = str(key_node.value)
             if key in seen:
-                key_path = ".".join([*keys, key])
                 line = key_node.start_mark.line + 1
                 raise ConfigError(
-                    f"{path}: {key_path}: duplicate key (line {line}). "
+                    f"{path}: {'.'.join([*keys, key])}: duplicate key (line {line}). "
                     "Keep one entry and merge them."
                 )
             seen.add(key)
-            _reject_duplicate_keys(value_node, path, [*keys, key])
-    elif isinstance(node, yaml.SequenceNode):
+            _check_nodes(value_node, path, [*keys, key], open_ids, done_ids)
+    else:
         for index, item in enumerate(node.value):
-            _reject_duplicate_keys(item, path, [*keys, str(index)])
+            _check_nodes(item, path, [*keys, str(index)], open_ids, done_ids)
+    open_ids.discard(id(node))
+    done_ids.add(id(node))
 
 
 def load_repo_config(path: Path) -> SettingsPatch:
