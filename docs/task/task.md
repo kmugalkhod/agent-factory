@@ -201,10 +201,10 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Unit tests for append, tail, truncated-line recovery and schema validation.
 - **Depends on:** 2.2
 
-### [ ] 2.5 Run state machine
+### [x] 2.5 Run state machine
 
 - **What:** Add a pure transition function over run states:
-  - pending → planning → awaiting_plan_approval → testing → building → reviewing → updating → awaiting_merge → merged
+  - pending → planning → awaiting_plan_approval → testing → building → updating → reviewing → awaiting_merge → merged
   - plus needs_you, paused, failed, stopped and closed
 
   Illegal transitions raise. Every transition emits `state_changed`.
@@ -212,6 +212,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Acceptance criteria:** A table test covers every legal transition and asserts that every other pair raises.
 - **Tests:** Exhaustive table test, plus an event-emission test.
 - **Depends on:** 2.4
+- **Note:** the order was `building → reviewing → updating`; it now follows the design's git flow (step 3, rebase before review) and task 2.22. A rebase needed at merge time happens inside the merge action, so `merged` is reached only from `awaiting_merge`. Agreed with Kunal (Oct 10, 2026).
 
 ### [ ] 2.6 Provider profiles and credential isolation
 

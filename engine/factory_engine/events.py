@@ -137,6 +137,14 @@ class EventLog:
         self._last_seq = 0
         self._recover()
 
+    @property
+    def repo(self) -> str:
+        return self._repo
+
+    @property
+    def run_id(self) -> int:
+        return self._run_id
+
     def append(self, body: Body, *, role: Role | None = None) -> Event:
         with self._lock:
             if self._needs_recovery:
