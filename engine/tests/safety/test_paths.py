@@ -506,3 +506,43 @@ def test_a_symlink_loop_is_blocked(roots: dict[str, Path]) -> None:
     except OSError as err:
         pytest.skip(f"can't create symlinks here: {err}")
     _assert(_check(roots, "builder", "Read", {"file_path": "src/a"}), False, "")
+
+
+# ------------------------------------------------- the session's folder (cwd)
+
+
+def test_a_relative_path_is_judged_from_the_cwd(roots: dict[str, Path]) -> None:
+    (roots["wt"] / "src" / "tests").mkdir()
+    policy, src = _policy(roots, "builder"), roots["wt"] / "src"
+    # From src/, tests/test_lock.py is src/tests/test_lock.py: not the tester's locked file.
+    _assert(
+        check_file_tool(policy, "Write", {"file_path": "tests/test_lock.py"}, cwd=src), True, ""
+    )
+    _assert(check_file_tool(policy, "Write", {"file_path": "../factory.yaml"}, cwd=src), False, "")
+
+
+def test_a_search_without_a_path_searches_the_cwd(roots: dict[str, Path]) -> None:
+    policy = _policy(roots, "planner")
+    _assert(
+        check_file_tool(policy, "Glob", {"pattern": "*.py"}, cwd=roots["out"]), False, "outside"
+    )
+
+
+def test_a_relative_cwd_is_blocked(roots: dict[str, Path]) -> None:
+    policy = _policy(roots, "planner")
+    decision = check_file_tool(policy, "Read", {"file_path": "app.py"}, cwd=Path("src"))
+    _assert(decision, False, "current folder")
+
+
+def test_an_absolute_path_ignores_the_cwd(roots: dict[str, Path]) -> None:
+    policy = _policy(roots, "planner")
+    path = str(roots["wt"] / "src" / "app.py")
+    _assert(check_file_tool(policy, "Read", {"file_path": path}, cwd=roots["out"]), True, "")
+
+
+@WINDOWS
+def test_a_junction_relative_to_the_cwd_is_blocked(roots: dict[str, Path]) -> None:
+    _junction(roots["wt"] / "src" / "data", roots["out"])
+    policy, src = _policy(roots, "planner"), roots["wt"] / "src"
+    decision = check_file_tool(policy, "Grep", {"pattern": "x", "path": "data"}, cwd=src)
+    _assert(decision, False, "outside")

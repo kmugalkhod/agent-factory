@@ -14,6 +14,7 @@ from factory_engine.safety.secrets import (
     CONTENT_TOOLS,
     SecretFinding,
     check_tool_content,
+    redact,
     scan_diff,
     scan_text,
 )
@@ -370,6 +371,41 @@ def test_blocked_write_names_the_kind_file_and_line() -> None:
 def test_content_tool_lookup_is_read_only() -> None:
     with pytest.raises(TypeError):
         CONTENT_TOOLS["Write"] = "other"  # type: ignore[index]  # read-only mapping must refuse
+
+
+# ------------------------------------------------------------------ redaction
+
+
+# Each case: id, text, the secret that must not survive, a part that must survive.
+REDACT_CASES = [
+    ("token", f"git clone x --config auth={GH_CLASSIC}", GH_CLASSIC, "git clone x"),
+    ("url-password", f"curl https://bob:{URL_PASSWORD}@db.example.com/x", URL_PASSWORD, "bob:"),
+    ("query", f"https://example.com/v1?access_token={DB_PASSWORD}&page=2", DB_PASSWORD, "page=2"),
+    ("query-key", f"https://example.com/?api_key={SMTP}", SMTP, "api_key="),
+    ("inline-env", f"DB_PASSWORD={DB_PASSWORD} uv run pytest", DB_PASSWORD, "uv run pytest"),
+    ("flag", f"tool --password={DB_PASSWORD} -v", DB_PASSWORD, "-v"),
+    ("bearer", f"curl -H 'Authorization: Bearer {SMTP}' x", SMTP, "Authorization"),
+    ("curl-user", f"curl -u bob:{URL_PASSWORD} https://x", URL_PASSWORD, "bob:"),
+    ("curl-user-long", f"curl --user bob:{URL_PASSWORD} https://x", URL_PASSWORD, "bob:"),
+    ("second-line", f"echo a\nexport API_TOKEN={DB_PASSWORD}", DB_PASSWORD, "echo a"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "secret", "kept"), [c[1:] for c in REDACT_CASES], ids=[c[0] for c in REDACT_CASES]
+)
+def test_redact_hides_the_secret(text: str, secret: str, kept: str) -> None:
+    redacted = redact(text)
+    assert secret not in redacted
+    assert kept in redacted
+    assert "…" in redacted
+
+
+@pytest.mark.parametrize(
+    "text", ["uv run pytest -k test_token", "https://example.com/?page=2&sort=name", "ls src", ""]
+)
+def test_redact_leaves_clean_text_alone(text: str) -> None:
+    assert redact(text) == text
 
 
 def test_finding_is_a_frozen_value() -> None:

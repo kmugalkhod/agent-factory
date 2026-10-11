@@ -334,11 +334,70 @@ def test_blocked_call_stays_denied_when_it_cant_be_logged(roots: dict[str, Path]
 
 def test_skill_is_denied_when_skill_loaded_cant_be_logged(roots: dict[str, Path]) -> None:
     class _FailOnSkill:
+        def __init__(self) -> None:
+            self.saved: list[Body] = []
+
         def append(self, body: Body, *, role: Role | None = None) -> object:
             if isinstance(body, SkillLoaded):
                 raise EventLogError("disk full")
+            self.saved.append(body)
             return None
 
-    callback = make_safety_hook(_policy(roots, "planner"), _FailOnSkill())
+    log = _FailOnSkill()
+    callback = make_safety_hook(_policy(roots, "planner"), log)
     output = asyncio.run(callback(_input(roots, "Skill", {"skill": "write-plan"}), None, None))
-    _denied(output)
+    reason = _denied(output)
+    # The last saved decision for the call is the deny the agent got.
+    last = [body for body in log.saved if isinstance(body, ToolCall)][-1]
+    assert last == ToolCall(tool="Skill", target="write-plan", decision="blocked", reason=reason)
+
+
+# ---------------------------------------------------------------- the session's folder
+
+
+@pytest.mark.parametrize("tool", ["Read", "Grep"])
+def test_relative_file_path_is_checked_from_the_cwd(roots: dict[str, Path], tool: str) -> None:
+    # app.py exists only in src/; from the worktree root it would be judged as another file.
+    key = "file_path" if tool == "Read" else "path"
+    tool_input = {key: "app.py", "pattern": "main"}
+    assert _call(roots, "planner", tool, tool_input, cwd=str(roots["wt"] / "src")) == {}
+    # From a folder outside, the same relative path names a file outside the worktree.
+    output = _call(
+        roots, "planner", tool, {key: "notes.txt", "pattern": "x"}, cwd=str(roots["out"])
+    )
+    assert "outside" in _denied(output)
+
+
+def test_search_without_a_path_checks_the_cwd(roots: dict[str, Path]) -> None:
+    output = _call(roots, "planner", "Glob", {"pattern": "*.txt"}, cwd=str(roots["out"]))
+    assert "outside" in _denied(output)
+
+
+@pytest.mark.parametrize("cwd", [12, "", "src"])
+def test_file_tool_with_a_bad_cwd_is_blocked(roots: dict[str, Path], cwd: object) -> None:
+    output = _call(roots, "planner", "Read", {"file_path": "src/app.py"}, cwd=cwd)
+    assert "current folder" in _denied(output)
+
+
+# ---------------------------------------------------------------- secrets in targets
+
+
+@pytest.mark.parametrize(
+    ("tool", "tool_input"),
+    [
+        ("WebFetch", {"url": f"https://api.example.com/?access_token={SECRET}", "prompt": "x"}),
+        ("Bash", {"command": f"curl -u bob:{SECRET} https://example.com"}),
+        ("Bash", {"command": f"git clone https://bob:{SECRET}@github.com/x/y"}),
+        ("Bash", {"command": f"API_TOKEN={SECRET} uv run pytest"}),
+        ("Grep", {"pattern": SECRET}),
+    ],
+)
+def test_secret_in_a_target_is_never_logged(
+    roots: dict[str, Path], tool: str, tool_input: dict[str, object]
+) -> None:
+    output = _call(roots, "builder", tool, tool_input)
+    if output:
+        assert SECRET not in _denied(output)
+    assert SECRET not in (roots["run"] / "events.jsonl").read_text(encoding="utf-8")
+    [event] = _tool_calls(roots)
+    assert event.target and "…" in event.target
