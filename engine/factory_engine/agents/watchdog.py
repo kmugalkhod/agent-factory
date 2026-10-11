@@ -230,6 +230,16 @@ class Watchdog:
                 if not cancelled:
                     raise  # cancelled from outside, not by the watchdog
                 result = recorder.finish(interrupted=True)
+            except Exception as error:
+                # The agent failed after the watchdog tripped (a dropped connection, a failed
+                # disconnect while stopping): the stop is still saved, then the error goes on.
+                trip = monitor.trip
+                if trip is not None:
+                    try:
+                        _settle(recorder, spec, trip, events)
+                    except Exception as settle_error:
+                        error.add_note(f"The watchdog's stop couldn't be saved: {settle_error}")
+                raise
         finally:
             if not agent.done():
                 agent.cancel()

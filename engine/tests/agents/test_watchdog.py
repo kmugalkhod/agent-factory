@@ -6,7 +6,7 @@ real time. The agent is a `FakeAgentRunner`.
 """
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from factory_engine.agents.fake import (
     result,
     system_init,
 )
-from factory_engine.agents.runner import AgentSpec, SessionRecorder
+from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder
 from factory_engine.agents.watchdog import (
     FALLBACK_RESET,
     RESUME_PROMPT,
@@ -221,6 +221,43 @@ def test_runner_error_propagates(world: World, tmp_path: Path) -> None:
     assert load_run(world.folder).state == "building"
 
 
+class DropsWhenStopped(FakeAgentRunner):
+    """The agent stops when interrupted, then its connection fails (or disconnect raises)."""
+
+    async def run(self, spec: AgentSpec, recorder: SessionRecorder) -> AgentResult:
+        await super().run(spec, recorder)
+        raise AgentError("the connection to the agent dropped while it was stopping")
+
+
+def test_error_after_a_stall_still_saves_needs_you(world: World, tmp_path: Path) -> None:
+    runner = DropsWhenStopped([[system_init("sess-1"), HOLD]])
+
+    with pytest.raises(AgentError, match="dropped"):
+        world.watch(runner, _spec(tmp_path))
+
+    assert load_run(world.folder).state == "needs_you"
+    assert world.indexed().state == "needs_you"
+    assert len([b for b in _bodies(world) if isinstance(b, NeedsYou)]) == 1
+
+
+def test_error_after_a_usage_limit_still_saves_the_pause(world: World, tmp_path: Path) -> None:
+    reset = START + timedelta(hours=2)
+    runner = DropsWhenStopped([[system_init("sess-1"), rate_limit(int(reset.timestamp())), HOLD]])
+
+    with pytest.raises(AgentError, match="dropped"):
+        world.watch(runner, _spec(tmp_path, attempt=2))
+
+    saved = load_run(world.folder)
+    assert saved.state == "paused"
+    assert saved.pause is not None
+    assert (saved.pause.reason, saved.pause.resume_at, saved.pause.session_id) == (
+        "usage_limit",
+        reset,
+        "sess-1",
+    )
+    assert [b for b in _bodies(world) if isinstance(b, Paused)][0].resume_at == reset
+
+
 # ------------------------------------------------------------- the monitor
 
 
@@ -373,6 +410,47 @@ def test_usage_limit_pauses_with_a_resume_time(world: World, tmp_path: Path) -> 
     assert StateChanged(from_state="building", to_state="paused") in bodies
     paused = [b for b in bodies if isinstance(b, Paused)]
     assert paused == [Paused(reason="usage_limit", detail=watched.trip.detail, resume_at=reset)]
+
+
+class CountsInterrupts(FakeAgentRunner):
+    def __init__(self, turns: list[list[Step]]) -> None:
+        super().__init__(turns)
+        self.interrupts = 0
+
+    async def interrupt(self) -> None:
+        self.interrupts += 1
+        await super().interrupt()
+
+
+@pytest.mark.parametrize(
+    "limit_message",
+    [
+        pytest.param(lambda reset: rate_limit(int(reset.timestamp())), id="rate-limit-event"),
+        pytest.param(
+            lambda reset: assistant_text(
+                f"Claude AI usage limit reached|{int(reset.timestamp())}", error="rate_limit"
+            ),
+            id="rate-limit-error",
+        ),
+    ],
+)
+def test_a_usage_limit_mid_turn_interrupts_the_agent(
+    world: World, tmp_path: Path, limit_message: Callable[[datetime], Step]
+) -> None:
+    """The agent would wait forever after the limit message (HOLD): only the watchdog's
+    interrupt ends its turn, well before the stall limit, and the pause has the CLI's reset."""
+    reset = START + timedelta(hours=2)
+    runner = CountsInterrupts([[system_init("sess-1"), limit_message(reset), HOLD]])
+
+    watched = world.watch(runner, _spec(tmp_path))
+
+    assert runner.interrupts == 1
+    assert watched.result.outcome == "interrupted"
+    assert world.time.now - START < timedelta(minutes=1)
+    assert watched.trip is not None and watched.trip.kind == "usage_limit"
+    saved = load_run(world.folder)
+    assert saved.state == "paused"
+    assert saved.pause is not None and saved.pause.resume_at == reset
 
 
 def test_after_the_reset_the_same_session_resumes(world: World, tmp_path: Path) -> None:  # AC3
