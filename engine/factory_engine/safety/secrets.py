@@ -21,6 +21,7 @@ import codecs
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 
 ANTHROPIC = "Anthropic key"
 AWS_KEY_ID = "AWS access key ID"
@@ -59,10 +60,14 @@ _TOKENS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-# `NAME=value` as in a .env file: optional `export`, no space before `=`, any value.
+# `NAME=value` as in a .env file: optional `export`, no space before `=`, any value. A quoted
+# value may hold spaces and the other quote; a double-quoted one may hold `\"`.
 _ENV_TIGHT = re.compile(
-    r"^\s*(?:export\s+)?(?P<name>[A-Z][A-Z0-9_]*)=(?P<quote>[\"']?)(?P<value>[^\s\"']*)(?P=quote)\s*(?:#.*)?$"
+    r"^\s*(?:export\s+)?(?P<name>[A-Z][A-Z0-9_]*)="
+    r"(?:\"(?P<double>(?:[^\"\\]|\\.)*)\"|'(?P<single>[^']*)'|(?P<value>[^\s\"']*))"
+    r"\s*(?:#.*)?$"
 )
+_VALUE_GROUPS = ("double", "single", "value")
 # `NAME = value` with spaces: only an unquoted value counts. In code a quoted value is far more
 # often a header name or a label than a pasted secret.
 _ENV_SPACED = re.compile(
@@ -89,23 +94,15 @@ _KEY_WORDS = frozenset(
 )
 _URL = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s:/@\"'<>]*:(?P<value>[^\s@/\"'<>]+)@")
 
-_PLACEHOLDER_PARTS = (
-    "your",
-    "changeme",
-    "change_me",
-    "change-me",
-    "replace",
-    "example",
-    "placeholder",
-    "dummy",
-    "fake",
-    "sample",
-    "redacted",
-    "xxxx",
-    "****",
-    "...",
-    "<",
-    ">",
+# A placeholder is a whole-value form, never a fragment found inside a value: `<...>`,
+# `{{ ... }}`, a value led by a placeholder word (`your-api-key`, `REPLACE_ME`, `changeme`) and
+# a masked value (`sk_live_...`, `ab12****`, `sk_test_xxxx`).
+_PLACEHOLDER = re.compile(
+    r"<.*>|\{\{.*\}\}"
+    r"|(?:your|my|replace|insert|enter|put|change|example|sample|dummy|fake|placeholder|redacted)"
+    r"(?:me|[-_. ].*)?"
+    r"|.*(?:\.\.\.|…|\*{3,}).*|.*[-_](?:x{4,}|X{4,})",
+    re.IGNORECASE,
 )
 _PLACEHOLDER_WORDS = frozenset(
     {"password", "pass", "secret", "token", "pwd", "true", "false", "null", "none", "yes", "no"}
@@ -148,7 +145,7 @@ ALLOW = SecretDecision(True)
 def scan_text(text: str, *, path: str | None = None) -> list[SecretFinding]:
     """Every secret in `text`, in order. `path` is only used to label the findings."""
     findings: list[SecretFinding] = []
-    for number, line in enumerate(text.splitlines(), start=1):
+    for number, line in enumerate(_lines(text), start=1):
         findings.extend(_scan_line(line, number, path))
     return findings
 
@@ -163,7 +160,9 @@ def scan_diff(diff: str) -> list[SecretFinding]:
 
 
 # Tool -> the input field holding the new text. MultiEdit holds it in each of its `edits`.
-CONTENT_TOOLS = {"Write": "content", "Edit": "new_string", "NotebookEdit": "new_source"}
+CONTENT_TOOLS: Mapping[str, str] = MappingProxyType(
+    {"Write": "content", "Edit": "new_string", "NotebookEdit": "new_source"}
+)
 
 
 def check_tool_content(tool_name: str, tool_input: Mapping[str, object]) -> SecretDecision:
@@ -226,8 +225,8 @@ def _scan_line(line: str, number: int, path: str | None) -> list[SecretFinding]:
             value = match.group("value")
             preview = value if kind == PRIVATE_KEY else _mask(value)
             add(kind, match.start("value"), match.end("value"), preview)
-    for name, match in _env_assignments(line):
-        add(ENV, match.start("value"), match.end("value"), f"{name}={_mask(match.group('value'))}")
+    for name, value, start in _env_assignments(line):
+        add(ENV, start, start + len(value), f"{name}={_mask(value)}")
     for match in _URL.finditer(line):
         value = match.group("value")
         if len(value) >= _MIN_URL_VALUE and not _placeholder(value):
@@ -236,16 +235,20 @@ def _scan_line(line: str, number: int, path: str | None) -> list[SecretFinding]:
     return [finding for _, _, finding in found]
 
 
-def _env_assignments(line: str) -> Iterator[tuple[str, re.Match[str]]]:
+def _env_assignments(line: str) -> Iterator[tuple[str, str, int]]:
+    """(name, value, where the value starts) for a secret assignment on the line."""
     match = _ENV_TIGHT.match(line) or _ENV_SPACED.match(line)
     if match is None:
         return
-    name, value = match.group("name"), match.group("value")
+    group = next(
+        g for g in _VALUE_GROUPS if g in match.re.groupindex and match.group(g) is not None
+    )
+    name, value = match.group("name"), match.group(group)
     if not _secret_name(name) or len(value) < _MIN_ENV_VALUE or _placeholder(value):
         return
     if value.isdigit() or _REFERENCE.fullmatch(value):
         return
-    yield name, match
+    yield name, value, match.start(group)
 
 
 def _secret_name(name: str) -> bool:
@@ -261,7 +264,13 @@ def _placeholder(value: str) -> bool:
     lowered = value.lower()
     if lowered in _PLACEHOLDER_WORDS or value[0] in "$%" or len(set(value)) == 1:
         return True
-    return any(part in lowered for part in _PLACEHOLDER_PARTS)
+    return _PLACEHOLDER.fullmatch(value) is not None
+
+
+def _lines(text: str) -> list[str]:
+    """Split on `\\n` only, as git and editors do. `str.splitlines` also splits on form feeds and
+    Unicode separators inside a line, which shifts diff hunk counts and cuts values apart."""
+    return [line.removesuffix("\r") for line in text.split("\n")]
 
 
 def _mask(value: str) -> str:
@@ -281,7 +290,7 @@ def _added_lines(diff: str) -> Iterator[tuple[str | None, int, str]]:
     path: str | None = None
     old_left = new_left = 0
     number = 0
-    for line in diff.splitlines():
+    for line in _lines(diff):
         if old_left > 0 or new_left > 0:
             mark, text = line[:1], line[1:]
             if mark == "+":

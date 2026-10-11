@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from factory_engine.safety.secrets import (
+    CONTENT_TOOLS,
     SecretFinding,
     check_tool_content,
     scan_diff,
@@ -61,6 +62,12 @@ OPENAI = "sk-" + "proj-" + _body(48, URLSAFE, 83)
 SMTP = _body(16, ALNUM, 84)
 URL_PASSWORD = _body(18, ALNUM, 85)
 WORDS_PASSWORD = "correcthorsebatterystaple"
+SPACED_PASSWORD = _body(10, ALNUM, 86) + " " + _body(8, ALNUM, 87)
+APOSTROPHE_PASSWORD = _body(10, ALNUM, 88) + "'" + _body(8, ALNUM, 89)
+DQUOTE_PASSWORD = _body(10, ALNUM, 90) + '"' + _body(8, ALNUM, 91)
+ESCAPED_PASSWORD = _body(10, ALNUM, 92) + '\\"' + _body(8, ALNUM, 93)
+YOUR_INSIDE = _body(6, ALNUM, 94) + "your" + _body(6, ALNUM, 95)
+EXAMPLE_INSIDE = _body(6, ALNUM, 96) + "example" + _body(6, ALNUM, 97)
 
 ANTHROPIC = "Anthropic key"
 AWS_KEY_ID = "AWS access key ID"
@@ -104,6 +111,14 @@ SECRETS = [
     ("env-spaces", f"CLIENT_SECRET = {SESSION}", ENV, SESSION),
     ("url-password", f"DATABASE_URL=postgres://app:{URL_PASSWORD}@db:5432/app", URL, URL_PASSWORD),
     ("url-in-code", f'redis.from_url("redis://:{URL_PASSWORD}@cache:6379/0")', URL, URL_PASSWORD),
+    ("env-quoted-space", f'DATABASE_PASSWORD="{SPACED_PASSWORD}"', ENV, SPACED_PASSWORD),
+    ("env-quoted-apostrophe", f'DB_PASSWORD="{APOSTROPHE_PASSWORD}"', ENV, APOSTROPHE_PASSWORD),
+    ("env-single-quoted-space", f"API_TOKEN='{SPACED_PASSWORD}'", ENV, SPACED_PASSWORD),
+    ("env-single-quoted-dquote", f"API_TOKEN='{DQUOTE_PASSWORD}'", ENV, DQUOTE_PASSWORD),
+    ("env-escaped-quote", f'API_TOKEN="{ESCAPED_PASSWORD}"', ENV, ESCAPED_PASSWORD),
+    ("env-holds-your", f"DB_PASSWORD={YOUR_INSIDE}", ENV, YOUR_INSIDE),
+    ("env-holds-example", f"API_TOKEN={EXAMPLE_INSIDE}", ENV, EXAMPLE_INSIDE),
+    ("url-holds-your", f"postgres://app:{YOUR_INSIDE}@db/app", URL, YOUR_INSIDE),
 ]
 CLEAN_FILES = sorted(CLEAN.iterdir())
 
@@ -120,6 +135,25 @@ def test_every_fixture_secret_is_detected(text: str, kind: str) -> None:
 def test_clean_fixture_has_no_hits(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     assert scan_text(text, path=path.name) == []
+
+
+PLACEHOLDERS = [
+    "API_TOKEN=your-api-token-here",
+    "API_TOKEN=YOUR_API_TOKEN",
+    'DB_PASSWORD="your password here"',
+    "API_TOKEN=change_me_please",
+    "API_TOKEN=<api token>",
+    "API_TOKEN={{ api_token }}",
+    "API_TOKEN=sk_live_****************",
+    "API_TOKEN=sk_live_xxxxxxxx",
+    "API_TOKEN=example-token-value",
+    "postgres://app:your-password@db/app",
+]
+
+
+@pytest.mark.parametrize("text", PLACEHOLDERS)
+def test_whole_value_placeholders_are_skipped(text: str) -> None:
+    assert scan_text(text) == []
 
 
 def test_clean_fixtures_cover_lock_files_base64_and_uuids() -> None:
@@ -228,6 +262,18 @@ def test_diff_quoted_path_and_no_newline_marker() -> None:
     assert (finding.path, finding.line) == ("my dir/x.env", 1)
 
 
+@pytest.mark.parametrize("separator", ["\f", "\v", "\x1c", "\x85", " ", " ", "\r"])
+def test_diff_line_separator_in_content_does_not_hide_a_later_secret(separator: str) -> None:
+    added = f"+APP=a{separator}b\n+DB_PASSWORD={DB_PASSWORD}\n"
+    diff = _diff(f"@@ -0,0 +1,2 @@\n{added}", path=".env")
+    assert [(f.kind, f.line) for f in scan_diff(diff)] == [(ENV, 2)]
+
+
+def test_text_line_separator_inside_a_quoted_secret_is_one_line() -> None:
+    [finding] = scan_text(f'X=1\nAPI_TOKEN="{_body(10, ALNUM, 98)} {_body(8, ALNUM, 99)}"\n')
+    assert (finding.kind, finding.line) == (ENV, 2)
+
+
 def test_clean_diff_has_no_hits() -> None:
     added = "".join(
         f"+{line}\n" for line in (CLEAN / "uv.lock").read_text(encoding="utf-8").splitlines()
@@ -319,6 +365,11 @@ def test_blocked_write_names_the_kind_file_and_line() -> None:
     assert GITHUB in decision.reason
     assert "src/conf.py:2" in decision.reason
     assert ".env.factory" in decision.reason  # tells the agent where test secrets belong
+
+
+def test_content_tool_lookup_is_read_only() -> None:
+    with pytest.raises(TypeError):
+        CONTENT_TOOLS["Write"] = "other"  # type: ignore[index]  # read-only mapping must refuse
 
 
 def test_finding_is_a_frozen_value() -> None:
