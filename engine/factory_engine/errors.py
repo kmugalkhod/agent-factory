@@ -38,5 +38,10 @@ class AgentConfigError(FactoryError):
     or a file that can't be written."""
 
 
+class AgentError(FactoryError):
+    """An agent can't be set up or driven: a missing prompt, no session to resume, or a call
+    to an agent that isn't running."""
+
+
 class SafetyError(FactoryError):
     """A safety check can't be set up, for example a locked file outside the worktree."""
