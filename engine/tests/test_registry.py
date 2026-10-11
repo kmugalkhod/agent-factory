@@ -12,13 +12,14 @@ from factory_engine import registry as registry_module
 from factory_engine.errors import DataFolderError, RegistryError
 from factory_engine.paths import run_dir
 from factory_engine.registry import (
+    MIGRATIONS,
     SCHEMA_VERSION,
     Registry,
     Session,
     open_registry,
     registry_path,
 )
-from factory_engine.run import Metrics, Run, allocate_run, new_run, save_run
+from factory_engine.run import Metrics, Pause, Run, allocate_run, new_run, save_run
 
 NOW = datetime(2026, 10, 10, 9, 30, tzinfo=UTC)
 
@@ -165,6 +166,43 @@ def test_upsert_then_get_gives_an_equal_run(reg: Registry) -> None:  # AC1
     reg.upsert_run(run)
     assert reg.get_run("app", 3) == run
     assert reg.get_run("app", 4) is None
+
+
+def test_paused_run_keeps_its_pause_record(reg: Registry) -> None:
+    run = _busy_run("app", 3, "status-json").model_copy(
+        update={
+            "state": "paused",
+            "pause": Pause(
+                reason="usage_limit",
+                detail="usage limit reached",
+                state="building",
+                role="builder",
+                attempt=2,
+                session_id="s-build",
+                resume_at=NOW + timedelta(hours=3),
+            ),
+        }
+    )
+    reg.upsert_run(run)
+    assert reg.get_run("app", 3) == run
+
+
+def test_version_1_database_gains_the_pause_column(tmp_path: Path) -> None:
+    path = tmp_path / "registry.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(MIGRATIONS[0])
+        conn.execute("PRAGMA user_version = 1")
+        conn.execute(
+            "INSERT INTO runs (repo, id, slug, kind, state, stage, provider, isolation, "
+            "created_at, updated_at, last_completed_step, important_findings, "
+            "pr_lines_changed_by_you) VALUES "
+            "('app', 3, 'status-json', 'feature', 'pending', NULL, 'subscription', "
+            "'worktree', ?, ?, NULL, 0, NULL)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+    conn.close()
+    with open_registry(path) as reg:
+        assert reg.get_run("app", 3) == _run("app", 3, "status-json")
 
 
 def test_upsert_updates_the_run_and_its_sessions(reg: Registry) -> None:  # AC1

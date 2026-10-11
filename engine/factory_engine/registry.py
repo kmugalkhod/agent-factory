@@ -19,7 +19,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 from factory_engine.errors import RegistryError
 from factory_engine.paths import repo_runs_dir, run_dir
-from factory_engine.run import CLAIMS, RUN_FILE, Metrics, Role, Run, load_run
+from factory_engine.run import CLAIMS, RUN_FILE, Metrics, Pause, Role, Run, load_run
 
 REGISTRY_FILE = "registry.db"
 
@@ -60,12 +60,16 @@ MIGRATIONS = [
     );
     CREATE INDEX runs_by_state ON runs (state);
     """,
+    # Where a paused run stopped (task 2.13): the `Pause` as JSON, null when not paused.
+    """
+    ALTER TABLE runs ADD COLUMN pause TEXT;
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 RUN_COLUMNS = (
     "repo, id, slug, kind, state, stage, provider, isolation, created_at, updated_at, "
-    "last_completed_step, important_findings, pr_lines_changed_by_you"
+    "last_completed_step, important_findings, pr_lines_changed_by_you, pause"
 )
 ROLES: tuple[Role, ...] = ("planner", "tester", "builder", "reviewer")
 
@@ -315,6 +319,7 @@ class Registry:
                 pr_lines_changed_by_you=row["pr_lines_changed_by_you"],
             ),
             last_completed_step=row["last_completed_step"],
+            pause=Pause.model_validate_json(row["pause"]) if row["pause"] is not None else None,
         )
 
 
@@ -341,7 +346,7 @@ def _repo(row: sqlite3.Row) -> Repo:
 def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
     conn.execute("DELETE FROM runs WHERE repo = ? AND id = ?", (run.repo, run.id))  # cascades
     conn.execute(
-        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * 13)})",
+        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * 14)})",
         (
             run.repo,
             run.id,
@@ -356,6 +361,7 @@ def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
             run.last_completed_step,
             run.metrics.important_findings,
             run.metrics.pr_lines_changed_by_you,
+            run.pause.model_dump_json() if run.pause is not None else None,
         ),
     )
     for role in ROLES:

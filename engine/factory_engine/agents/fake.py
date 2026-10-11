@@ -2,9 +2,9 @@
 
 A script is a list of turns: the first turn plays when the agent runs, and each `send` plays
 the next one. A turn is a list of SDK messages (build them with `system_init`,
-`assistant_text` and `result`), recorded through the same `SessionRecorder` the real runner
-uses. `HOLD` in a turn waits there until the test calls `interrupt` or `send`, which end the
-turn; `started` is set when a turn reaches it.
+`assistant_text`, `rate_limit` and `result`), recorded through the same `SessionRecorder` the
+real runner uses. `HOLD` in a turn waits there until the test calls `interrupt` or `send`,
+which end the turn; `started` is set when a turn reaches it.
 """
 
 import asyncio
@@ -12,7 +12,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
-from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
+from claude_agent_sdk import (
+    AssistantMessage,
+    RateLimitEvent,
+    RateLimitInfo,
+    ResultMessage,
+    SystemMessage,
+    TextBlock,
+)
+from claude_agent_sdk.types import AssistantMessageError, RateLimitStatus
 
 from factory_engine.agents.runner import (
     AgentResult,
@@ -26,15 +34,37 @@ from factory_engine.errors import AgentError
 HOLD: Final = "hold"
 FAKE_MODEL = "fake-model"
 
-type Step = SystemMessage | AssistantMessage | ResultMessage | str
+type Step = SystemMessage | AssistantMessage | RateLimitEvent | ResultMessage | str
 
 
 def system_init(session_id: str) -> SystemMessage:
     return SystemMessage(subtype="init", data={"type": "system", "session_id": session_id})
 
 
-def assistant_text(text: str, session_id: str | None = None) -> AssistantMessage:
-    return AssistantMessage(content=[TextBlock(text=text)], model=FAKE_MODEL, session_id=session_id)
+def assistant_text(
+    text: str, session_id: str | None = None, *, error: AssistantMessageError | None = None
+) -> AssistantMessage:
+    return AssistantMessage(
+        content=[TextBlock(text=text)], model=FAKE_MODEL, session_id=session_id, error=error
+    )
+
+
+def rate_limit(
+    resets_at: int | None,
+    *,
+    status: RateLimitStatus = "rejected",
+    overage_status: RateLimitStatus | None = None,
+    session_id: str = "",
+) -> RateLimitEvent:
+    """The CLI's rate-limit update; `rejected` means the usage limit is hit until `resets_at`
+    (Unix seconds)."""
+    info = RateLimitInfo(
+        status=status,
+        resets_at=resets_at,
+        rate_limit_type="five_hour",
+        overage_status=overage_status,
+    )
+    return RateLimitEvent(rate_limit_info=info, uuid="fake-rate-limit", session_id=session_id)
 
 
 def result(
@@ -46,9 +76,13 @@ def result(
     cache_read: int = 0,
     cache_creation: int = 0,
     is_error: bool = False,
+    subtype: str | None = None,
+    api_error_status: int | None = None,
 ) -> ResultMessage:
+    if subtype is None:
+        subtype = "error_during_execution" if is_error else "success"
     return ResultMessage(
-        subtype="error_during_execution" if is_error else "success",
+        subtype=subtype,
         duration_ms=1,
         duration_api_ms=1,
         is_error=is_error,
@@ -61,6 +95,7 @@ def result(
             "cache_creation_input_tokens": cache_creation,
         },
         result=text,
+        api_error_status=api_error_status,
     )
 
 
