@@ -55,7 +55,8 @@ _LOCATION_VARS = frozenset(
 )
 # What cmd.exe interprets inside a batch file's arguments however they are quoted.
 _BATCH_UNSAFE = re.compile(r'["%^&|<>!\r\n]')
-_CONFLICT_MARKER = re.compile(r"^(<{7}|>{7})(?: |$)", re.MULTILINE)
+# Every line git writes into a conflict: start, base (diff3 and zdiff3), separator and end.
+_CONFLICT_MARKER = re.compile(r"^(?:(?:<{7}|\|{7}|>{7})(?: |\r?$)|={7}\r?$)", re.MULTILINE)
 
 
 # ------------------------------------------------------------------ running programs

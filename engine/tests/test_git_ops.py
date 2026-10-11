@@ -274,6 +274,30 @@ def test_rebase_continue_with_markers_left_reports_the_conflict_again(repos: Rep
     assert again.conflicts == ("README.md",)
 
 
+@pytest.mark.parametrize(
+    "left",
+    [
+        "run edit\n=======\nmain edit\n",
+        "run edit\r\n=======\r\nmain edit\r\n",
+        "run edit\n||||||| base\nseed\n",
+        "run edit\n|||||||\nseed\n",
+        "run edit\n>>>>>>> main\n",
+    ],
+    ids=["separator", "separator-crlf", "diff3-base", "diff3-base-bare", "end-marker"],
+)
+def test_rebase_continue_with_part_of_a_conflict_left_reports_it_again(
+    repos: Repos, left: str
+) -> None:
+    worktree = repos.worktree()
+    (worktree / "README.md").write_text("run edit\n", encoding="utf-8")
+    commit_stage(repos.git, worktree, run_id=3, slug=SLUG, role="builder", attempt=1)
+    repos.commit_on_seed("README.md", "main edit\n")
+    rebase_onto_main(repos.git, worktree, run_id=3, slug=SLUG)
+    (worktree / "README.md").write_bytes(left.encode("utf-8"))
+    again = rebase_continue(repos.git, worktree, run_id=3, slug=SLUG)
+    assert again.conflicts == ("README.md",)
+
+
 def test_rebase_refuses_when_the_worktree_is_on_another_branch(repos: Repos) -> None:
     worktree = repos.worktree()
     repos.run(worktree, "switch", "-c", "elsewhere")

@@ -169,6 +169,77 @@ def test_a_huge_plan_still_fits() -> None:
     assert len(body) <= MAX_BODY
 
 
+def test_cutting_the_test_output_never_leaves_a_secret_without_its_name(
+    fake: FakeGh, folders: tuple[Path, Path]
+) -> None:
+    filler = ("a" * 99 + "\n") * 2_000
+    probe = pr_body(run_label="run 3", plan="plan", test_output=filler, findings="none")
+    section = probe.split("```\n")[1].split("\n```")[0]
+    kept = len(section.split("\n", 1)[1])  # how much of the output's end is kept, after the note
+    value = "q8Zt" + "Lm3Rx" + "Vw71Kp"
+    # The tail is as long as what's kept, so a cut by characters drops `DEPLOY_TOKEN=`.
+    rest = kept - len(value) - 1
+    tail = value + "\n" + ("z" * 99 + "\n") * (rest // 100) + "z" * (rest % 100)
+    output = filler + "DEPLOY_TOKEN=" + tail
+    body = pr_body(run_label="run 3", plan="plan", test_output=output, findings="none")
+    assert value not in body
+    _open(fake, folders, body=body)
+    [call] = fake.calls()
+    assert value not in str(call["body"])
+
+
+def test_an_overlong_line_is_left_out_quickly() -> None:
+    value = "q8Zt" + "Lm3Rx" + "Vw71Kp"
+    line = "x" * 300_000 + f" DEPLOY_TOKEN={value}"
+    body = pr_body(run_label="run 3", plan=line, test_output=line, findings=line)
+    assert value not in body
+    assert "characters left out" in body
+    assert len(body) <= MAX_BODY
+
+
+def test_secrets_in_the_plan_and_findings_are_masked_in_the_body() -> None:
+    value = "q8Zt" + "Lm3Rx" + "Vw71Kp"
+    body = pr_body(
+        run_label="run 3",
+        plan=f"DEPLOY_TOKEN={value}",
+        test_output="ok",
+        findings=f"API_SECRET={value}",
+    )
+    assert value not in body
+
+
+def _fence_holds(body: str) -> bool:
+    """The test output's fence is closed only by its own closing line."""
+    lines = body.split("\n")
+    start = lines.index("## Test output") + 2
+    fence = lines[start]
+    end = next(
+        n
+        for n in range(start + 1, len(lines))
+        if lines[n].lstrip(" ").startswith(fence) and len(lines[n]) - len(lines[n].lstrip(" ")) < 4
+    )
+    return lines[end].strip() == fence and lines[end + 2] == "## Review findings"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "`" * 30_000 + "\nFAILED test_status - boom",
+        "```\n" + "`" * 1_500 + "\n   ````````````````````\nFAILED test_status - boom",
+        "x" + "`" * 1_500 + "x\nFAILED test_status - boom",
+        "````\nFAILED test_status - boom",
+    ],
+    ids=["huge-run", "indented-runs", "mid-line-run", "short-run"],
+)
+def test_backticks_in_the_test_output_never_push_out_the_findings(output: str) -> None:
+    body = pr_body(run_label="run 3", plan="plan", test_output=output, findings="Minor: rename x")
+    assert len(body) <= MAX_BODY
+    assert "FAILED test_status - boom" in body
+    assert "Minor: rename x" in body
+    assert _fence_holds(body)
+    assert max(len(line) for line in body.split("\n") if set(line) == {"`"}) <= 20
+
+
 # --- merge ---
 
 
@@ -178,7 +249,15 @@ def test_merge_runs_gh_pr_merge_pinned_to_the_tested_commit(
     pr = PullRequest(number=7, url="https://github.com/kunal/pilot/pull/7")
     merge_pr(fake.gh, folders[0], pr, head_sha=SHA, approval=MergeApproval(pr_number=7))
     [call] = fake.calls()
-    assert call["args"] == ["pr", "merge", "7", "--merge", "--match-head-commit", SHA]
+    # The URL, not the bare number, so the merge can't land on another repo's #7.
+    assert call["args"] == [
+        "pr",
+        "merge",
+        "https://github.com/kunal/pilot/pull/7",
+        "--merge",
+        "--match-head-commit",
+        SHA,
+    ]
 
 
 def test_merge_without_an_approval_for_this_pr_raises_and_calls_nothing(
@@ -195,6 +274,18 @@ def test_merge_needs_a_full_commit_id(fake: FakeGh, folders: tuple[Path, Path], 
     pr = PullRequest(number=7, url="https://github.com/kunal/pilot/pull/7")
     with pytest.raises(GitHubError):
         merge_pr(fake.gh, folders[0], pr, head_sha=sha, approval=MergeApproval(pr_number=7))
+    assert fake.calls() == []
+
+
+@pytest.mark.parametrize(
+    "url", ["", "--admin", "https://github.com/kunal/pilot/pull/8", "github.com/kunal/pilot/7"]
+)
+def test_merge_needs_the_url_of_this_pull_request(
+    fake: FakeGh, folders: tuple[Path, Path], url: str
+) -> None:
+    pr = PullRequest(number=7, url=url)
+    with pytest.raises(GitHubError, match="URL"):
+        merge_pr(fake.gh, folders[0], pr, head_sha=SHA, approval=MergeApproval(pr_number=7))
     assert fake.calls() == []
 
 
@@ -224,3 +315,22 @@ def test_gh_runs_without_prompts(fake: FakeGh, folders: tuple[Path, Path]) -> No
     _open(fake, folders)
     [call] = fake.calls()
     assert call["prompt"] == "1"
+
+
+@pytest.mark.parametrize("name", ["GH_REPO", "gh_repo"] if sys.platform == "win32" else ["GH_REPO"])
+def test_gh_ignores_a_repo_override_from_the_environment(
+    fake: FakeGh, folders: tuple[Path, Path], name: str
+) -> None:
+    script = fake.bin / "fake_gh.py"
+    script.write_text(
+        FAKE_GH.replace(
+            'entry = {"args": args, "cwd": os.getcwd()}',
+            'entry = {"args": args, "cwd": os.getcwd(), "repo": os.environ.get("GH_REPO")}',
+        ),
+        encoding="utf-8",
+    )
+    fake.env[name] = "someone-else/other-repo"
+    _open(fake, folders)
+    pr = PullRequest(number=7, url="https://github.com/kunal/pilot/pull/7")
+    merge_pr(fake.gh, folders[0], pr, head_sha=SHA, approval=MergeApproval(pr_number=7))
+    assert [call["repo"] for call in fake.calls()] == [None, None]
