@@ -45,3 +45,16 @@ class AgentError(FactoryError):
 
 class SafetyError(FactoryError):
     """A safety check can't be set up, for example a locked file outside the worktree."""
+
+
+class GitError(FactoryError):
+    """A git command failed, timed out or was refused: git missing, a push of a branch that
+    isn't the run's own, or a worktree that isn't on its run branch."""
+
+
+class PushRejectedError(GitError):
+    """The safe force-push was refused because the remote run branch changed unexpectedly."""
+
+
+class GitHubError(FactoryError):
+    """A `gh` command failed, timed out or was refused, for example a merge with no approval."""

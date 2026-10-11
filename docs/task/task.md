@@ -353,7 +353,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - The turn and time caps apply to each agent run (one stage attempt with its notes): the turn cap is the SDK's `max_turns` result and the time cap (`max_minutes`) counts from the agent's start. Both pause with the reason and no resume time; resuming is your decision.
   - Where a run stopped is a `pause` record on the run (reason, detail, the working state, role, attempt, session ID, resume time), saved in `run.json` and in a new registry column (schema version 2). A new `paused` event carries the reason and resume time. `unpause` moves the run back to the stage it stopped in and refuses before the reset time; `resume_spec` resumes the saved session in the same attempt with a "carry on" prompt.
 
-### [ ] 2.14 Git and GitHub operations
+### [x] 2.14 Git and GitHub operations
 
 - **What:** Add git and GitHub operations through `subprocess`:
   - Create branch `factory/run-<id>-<slug>` from the latest `main` in a new worktree under the data folder.
@@ -373,6 +373,13 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - No call uses `shell=True`.
 - **Tests:** Integration tests with temporary git repos and a fake `gh`.
 - **Depends on:** 2.2, S.2
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - Worktrees live in `<data>/worktrees/<repo>/<id>-<slug>/`, branched from the freshly fetched `origin/main` with no upstream. The main checkout isn't touched.
+  - Engine git commands never run repo hooks (`core.hooksPath` points at the null device): a hook is repo code, and through `core.hooksPath` it could come from the worktree an agent writes, while the engine runs with your credentials. Git and `gh` are looked up on absolute `PATH` entries only, so a `git.exe` or `gh.cmd` planted in the worktree never runs. Variables such as `GIT_DIR` (and `GH_REPO` for `gh`) are dropped, and git and `gh` never prompt.
+  - The push lease is the commit the engine itself last pushed, kept in `refs/factory/pushed/<branch>` (before the first push: "branch must not exist"), not the remote-tracking ref, so a background `git fetch` can't weaken it. A refused lease raises `PushRejectedError`. Any branch other than the run's own raises before git runs.
+  - A rebase conflict returns the conflicted files and leaves the rebase waiting for the builder; `rebase_continue` refuses files that still hold any conflict marker line (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`), and `rebase_abort` gives up. Empty stage commits are kept through a rebase.
+  - Merge is `gh pr merge <pr url> --merge --match-head-commit <tested sha>` and needs a `MergeApproval` for that pull request. The remote branch isn't deleted. The PR body is passed as `pr-body.md` in the run folder, after secret redaction, and cut to 60,000 characters (the test output keeps its end). Each part is cut between lines and then redacted, so a cut never separates a secret from its name. Lines over 2,000 characters are left out. The test output's fence is at most 16 backticks.
+  - "Abandoned" means a finished run (merged, failed, stopped, closed) last updated 7 or more days ago; its worktree is removed with uncommitted files, and the branch is kept. Runs waiting on you keep their worktree.
 
 ### [ ] 2.15 Post-stage engine check
 
