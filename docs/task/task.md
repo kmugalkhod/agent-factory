@@ -332,7 +332,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.3, 2.6, 2.7, 2.11
 - **Note:** The SDK starts the CLI with the engine's whole environment and lays `env` over it; it can't remove a variable. So the runner sets every parent variable that the clean environment (2.6) leaves out to an empty value (except the few the SDK sets itself), and no leftover `ANTHROPIC_*`, proxy or credential value reaches the agent. The system prompt is Claude Code's own preset with the factory prompt appended (`prompts/<role>.md`, `prompts/bootstrap.md` for the planner and builder on run 0, then the repo's `.claude/agents/<role>.md` with its frontmatter dropped, since the model comes from `factory.yaml`); a repo prompt that links outside the worktree is refused. Effort maps low/normal/high to the SDK's low/medium/high with adaptive thinking. "Allowed tools" is the set of built-in tools the agent is offered: Read, Glob, Grep, Write, Edit, NotebookEdit, Skill and TodoWrite, plus Bash and PowerShell for roles with a shell; web tools and subagents aren't loaded. Permission mode is `dontAsk`, setting sources are the config folder and the repo, skills follow the role's list (all when there is none), the run folder is an extra directory and `max_turns` is the cap. The session ID is saved to `run.json` and the registry as soon as the init or result message carries it. Each result message becomes one `tokens` event for the attempt, and the role's total in `metrics.tokens` adds input, output and both cache counts. A `send` while a turn runs interrupts it first, so each note gets its own turn and result. The runner takes the engine's parent environment and a client factory as arguments (tests pass a client over a fake transport).
 
-### [ ] 2.13 Watchdog and usage-limit pause
+### [x] 2.13 Watchdog and usage-limit pause
 
 - **What:** Add two behaviors to the runner:
   - If there is no tool activity for 10 minutes (configurable), stop the agent and flag the run as Needs you.
@@ -347,6 +347,11 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Hitting a cap pauses the run with the reason.
 - **Tests:** Unit tests with a fake clock and the fake runner.
 - **Depends on:** 2.5, 2.12
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - Activity is any message from the agent (its tool calls and their results arrive as messages); no message for `stall_minutes` (10 by default) stops it and moves the run to needs_you with a `needs_you` event. The watchdog interrupts first and cancels the agent if it hasn't stopped 30 seconds later.
+  - A usage limit is a rejected rate-limit update from the CLI (unless it carries on in overage), an assistant message with the `rate_limit` error, or an error result that is a 429 or says the limit was reached. The reset time is the CLI's own (`resets_at`, or `|<unix seconds>` in the text); when it gives none, the run resumes after 1 hour, since resuming early only pauses again.
+  - The turn and time caps apply to each agent run (one stage attempt with its notes): the turn cap is the SDK's `max_turns` result and the time cap (`max_minutes`) counts from the agent's start. Both pause with the reason and no resume time; resuming is your decision.
+  - Where a run stopped is a `pause` record on the run (reason, detail, the working state, role, attempt, session ID, resume time), saved in `run.json` and in a new registry column (schema version 2). A new `paused` event carries the reason and resume time. `unpause` moves the run back to the stage it stopped in and refuses before the reset time; `resume_spec` resumes the saved session in the same attempt with a "carry on" prompt.
 
 ### [ ] 2.14 Git and GitHub operations
 

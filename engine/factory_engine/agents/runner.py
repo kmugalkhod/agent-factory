@@ -9,7 +9,7 @@
 - `SessionRecorder` turns the agent's messages into the run's record, the same way for both:
   its text becomes `message` events, its session ID is saved to `run.json` and the registry as
   soon as it is known, and each turn's usage becomes a `tokens` event and is added to the
-  role's total.
+  role's total. Listeners (the watchdog, `watchdog.py`) see every message after it is recorded.
 
 A runner drives one agent at a time. While it runs, `interrupt` stops the current turn and
 `send` gives the agent a note: a turn in progress is interrupted first, then the agent carries
@@ -285,6 +285,7 @@ class SessionRecorder:
         self._clock = clock
         self._usage = Usage()
         self._last: ResultMessage | None = None
+        self._listeners: list[Callable[[object], None]] = []
 
     @property
     def run(self) -> Run:
@@ -294,8 +295,29 @@ class SessionRecorder:
     def session_id(self) -> str | None:
         return self._run.session_ids.get(self.role)
 
+    def listen(self, listener: Callable[[object], None]) -> None:
+        """Call `listener` with every message from the agent, after it is recorded."""
+        self._listeners.append(listener)
+
+    def save(self, run: Run) -> None:
+        """Make `run` (this run, changed by the engine) the current one: save it to `run.json`
+        and the registry."""
+        if (run.repo, run.id) != (self._run.repo, self._run.id):
+            raise AgentError(
+                f"the recorder for run {self._run.repo}/{self._run.id} can't save run "
+                f"{run.repo}/{run.id}."
+            )
+        save_run(run, self._folder)
+        self._run = run  # run.json is the truth, even if indexing it fails
+        self._registry.upsert_run(run)
+
     def record(self, message: object) -> None:
         """Take in one message from the agent."""
+        self._record(message)
+        for listener in self._listeners:
+            listener(message)
+
+    def _record(self, message: object) -> None:
         if isinstance(message, SystemMessage):
             if message.subtype == "init":
                 session = message.data.get("session_id")
@@ -353,10 +375,13 @@ class SessionRecorder:
             tokens = dict(self._run.metrics.tokens)
             tokens[self.role] = tokens.get(self.role, 0) + usage.total
             update["metrics"] = self._run.metrics.model_copy(update={"tokens": tokens})
-        run = self._run.model_copy(update=update)
-        save_run(run, self._folder)
-        self._run = run
-        self._registry.upsert_run(run)
+        self.save(self._run.model_copy(update=update))
+
+
+def persist(run: Run, run_folder: Path, registry: RunIndex) -> None:
+    """Save `run` to its `run.json`, then index it."""
+    save_run(run, run_folder)
+    registry.upsert_run(run)
 
 
 def _usage(raw: Mapping[str, object] | None) -> Usage:

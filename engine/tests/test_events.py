@@ -20,6 +20,7 @@ from factory_engine.events import (
     GateResult,
     Message,
     NeedsYou,
+    Paused,
     SkillLoaded,
     StageFinished,
     StageStarted,
@@ -46,6 +47,11 @@ ONE_OF_EACH = [
     (Tokens(attempt=1, input=1200, output=300, cache_read=50_000, cache_creation=900), "tester"),
     (Message(sender="you", text="Use the existing helper."), "builder"),
     (NeedsYou(reason="builder cap reached"), None),
+    (
+        Paused(reason="usage_limit", detail="usage limit", resume_at=START + timedelta(hours=2)),
+        "builder",
+    ),
+    (Paused(reason="turn_cap", detail="the builder used its 200 turns", resume_at=None), None),
 ]
 
 
@@ -144,9 +150,9 @@ def test_reader_returns_only_events_after_a_sequence_number(tmp_path: Path) -> N
     log = _log(tmp_path)
     for body, role in ONE_OF_EACH:
         log.append(body, role=role)
-    assert [e.seq for e in read_events(tmp_path, after=7)] == [8, 9, 10, 11]
-    assert read_events(tmp_path, after=11) == []
-    assert len(read_events(tmp_path, after=0)) == 11
+    assert [e.seq for e in read_events(tmp_path, after=7)] == list(range(8, len(ONE_OF_EACH) + 1))
+    assert read_events(tmp_path, after=len(ONE_OF_EACH)) == []
+    assert len(read_events(tmp_path, after=0)) == len(ONE_OF_EACH)
 
 
 def test_reader_picks_up_new_events_on_the_next_call(tmp_path: Path) -> None:  # AC3: tailing

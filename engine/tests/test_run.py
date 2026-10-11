@@ -11,7 +11,15 @@ import pytest
 from factory_engine import run as run_module
 from factory_engine.errors import DataFolderError, RunFileError
 from factory_engine.paths import run_dir
-from factory_engine.run import Metrics, Run, allocate_run, load_run, new_run, save_run
+from factory_engine.run import (
+    Metrics,
+    Pause,
+    Run,
+    allocate_run,
+    load_run,
+    new_run,
+    save_run,
+)
 
 NOW = datetime(2026, 10, 10, 9, 30, tzinfo=UTC)
 
@@ -52,6 +60,21 @@ def test_save_then_load_gives_an_equal_run(tmp_path: Path) -> None:  # AC1
     )
     save_run(run, tmp_path)
     assert load_run(tmp_path) == run
+
+
+def test_paused_run_saves_where_it_stopped(tmp_path: Path) -> None:
+    pause = Pause(
+        reason="usage_limit",
+        detail="usage limit reached",
+        state="building",
+        role="builder",
+        attempt=2,
+        session_id="s-3",
+        resume_at=NOW + timedelta(hours=3),
+    )
+    run = _run(state="paused", stage="builder", pause=pause)
+    save_run(run, tmp_path)
+    assert load_run(tmp_path).pause == pause
 
 
 def test_run_json_is_plain_utf8_json(tmp_path: Path) -> None:

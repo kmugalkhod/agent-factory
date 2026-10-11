@@ -17,7 +17,7 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from factory_engine.errors import EventLogError
-from factory_engine.run import NonNegative, Role, RunState
+from factory_engine.run import NonNegative, PauseReason, Role, RunState
 
 EVENTS_FILE = "events.jsonl"
 
@@ -98,6 +98,15 @@ class NeedsYou(_Model):
     reason: str
 
 
+class Paused(_Model):
+    """The run paused: a usage limit (resumes on its own at `resume_at`) or a cap (asks you)."""
+
+    type: Literal["paused"] = "paused"
+    reason: PauseReason
+    detail: str
+    resume_at: AwareDatetime | None
+
+
 Body = Annotated[
     StateChanged
     | StageStarted
@@ -108,7 +117,8 @@ Body = Annotated[
     | TestRun
     | Tokens
     | Message
-    | NeedsYou,
+    | NeedsYou
+    | Paused,
     Field(discriminator="type"),
 ]
 

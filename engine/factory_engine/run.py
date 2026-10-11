@@ -36,6 +36,7 @@ RunState = Literal[
     "stopped",
     "closed",
 ]
+PauseReason = Literal["usage_limit", "turn_cap", "time_cap"]
 NonNegative = Annotated[int, Field(ge=0)]
 
 RUN_FILE = "run.json"
@@ -55,6 +56,19 @@ class Metrics(_Model):
     pr_lines_changed_by_you: NonNegative | None = None
 
 
+class Pause(_Model):
+    """Where a paused run stopped, so it can carry on in the same session (design: failure
+    handling). A usage limit resumes on its own at `resume_at`; a cap waits for you."""
+
+    reason: PauseReason
+    detail: str
+    state: RunState  # the working state the run resumes into
+    role: Role
+    attempt: Annotated[int, Field(ge=1)]
+    session_id: str | None
+    resume_at: AwareDatetime | None
+
+
 class Run(_Model):
     id: NonNegative
     slug: str
@@ -70,6 +84,7 @@ class Run(_Model):
     updated_at: AwareDatetime
     metrics: Metrics = Metrics()
     last_completed_step: str | None = None
+    pause: Pause | None = None  # set while the run is paused
 
 
 def new_run(
