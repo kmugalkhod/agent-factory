@@ -15,6 +15,7 @@ It looks for:
 - Passwords in URLs (`postgres://user:pass@host`).
 
 A finding never carries the secret: only its kind, where it is and a short masked preview.
+`redact` masks secrets in text that is logged, such as a tool call's command or URL.
 """
 
 import codecs
@@ -209,10 +210,48 @@ def _block(reason: str) -> SecretDecision:
     return SecretDecision(False, f"Blocked: {reason}")
 
 
+# ------------------------------------------------------------------ redaction
+
+# Forms masked only when a command or URL is logged. In a file they are too common in code to
+# block on; in a log line they are cheap to hide.
+_INLINE_SECRET = re.compile(r"(?P<name>[A-Za-z_][A-Za-z0-9_.-]*)=(?P<value>[^\s&\"';#]+)")
+_BEARER = re.compile(r"(?i)\bbearer\s+(?P<value>[A-Za-z0-9._~+/=-]+)")
+_USER = re.compile(r"(?:^|\s)(?:-u|--user)[\s=]+[^\s:\"']+:(?P<value>[^\s\"']+)")
+
+
+def redact(text: str) -> str:
+    """`text` with each secret masked, for logging what an agent asked for: what the scan finds,
+    plus secret-named values in commands and URLs (`API_TOKEN=...`, `?access_token=...`,
+    `--password=...`), bearer tokens and `curl -u user:...` passwords."""
+    return "\n".join(_redact_line(line) for line in text.split("\n"))
+
+
+def _redact_line(line: str) -> str:
+    spans = [(start, end) for start, end, _ in _line_spans(line, 1, None)]
+    for match in _INLINE_SECRET.finditer(line):
+        if _secret_name(re.sub(r"[-.]", "_", match.group("name").upper())):
+            spans.append(match.span("value"))
+    for pattern in (_BEARER, _USER):
+        spans.extend(match.span("value") for match in pattern.finditer(line))
+    out: list[str] = []
+    last = 0
+    for start, end in sorted(spans):
+        start = max(start, last)  # overlapping spans: mask the rest only
+        if start < end:
+            out += [line[last:start], _mask(line[start:end])]
+            last = end
+    return "".join(out) + line[last:]
+
+
 # ------------------------------------------------------------------ one line
 
 
 def _scan_line(line: str, number: int, path: str | None) -> list[SecretFinding]:
+    return [finding for _, _, finding in _line_spans(line, number, path)]
+
+
+def _line_spans(line: str, number: int, path: str | None) -> list[tuple[int, int, SecretFinding]]:
+    """(start, end, finding) for each secret on the line, by position; start:end is the value."""
     found: list[tuple[int, int, SecretFinding]] = []
 
     def add(kind: str, start: int, end: int, preview: str) -> None:
@@ -232,7 +271,7 @@ def _scan_line(line: str, number: int, path: str | None) -> list[SecretFinding]:
         if len(value) >= _MIN_URL_VALUE and not _placeholder(value):
             add(URL, match.start("value"), match.end("value"), f"…:{_mask(value)}@…")
     found.sort(key=lambda item: item[0])
-    return [finding for _, _, finding in found]
+    return found
 
 
 def _env_assignments(line: str) -> Iterator[tuple[str, str, int]]:

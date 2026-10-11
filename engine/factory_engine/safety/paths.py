@@ -108,9 +108,15 @@ class PathPolicy:
 
 
 def check_file_tool(
-    policy: PathPolicy, tool_name: str, tool_input: Mapping[str, object]
+    policy: PathPolicy,
+    tool_name: str,
+    tool_input: Mapping[str, object],
+    *,
+    cwd: Path | None = None,
 ) -> PathDecision:
-    """Allow or block one file-tool call."""
+    """Allow or block one file-tool call. `cwd` is the session's folder: relative paths and
+    searches without a path start there, as the tools do. Without it they start in the
+    worktree."""
     if tool_name not in FILE_TOOLS:
         return _block(f"{tool_name} is not a file tool; the path check can't judge it.")
     path_key, writes, pattern_key = FILE_TOOLS[tool_name]
@@ -118,13 +124,16 @@ def check_file_tool(
         bad = _bad_pattern(tool_input[pattern_key])
         if bad:
             return bad
+    base = _base(cwd, policy)
+    if isinstance(base, PathDecision):
+        return base
     raw = tool_input.get(path_key)
     if raw is None and tool_name in OPTIONAL_PATH:
-        raw, located = ".", policy.worktree  # searches the working folder, the worktree
+        raw, located = ".", base  # searches the session's folder
     elif not isinstance(raw, str) or not raw.strip():
         return _block(f"{tool_name} needs a file path in `{path_key}`.")
     else:
-        located = _locate(raw, policy)
+        located = _locate(raw, policy, base)
         if isinstance(located, PathDecision):
             return located
     if writes:
@@ -258,8 +267,21 @@ def _outside(policy: PathPolicy, raw: str) -> PathDecision:
     )
 
 
-def _locate(raw: str, policy: PathPolicy) -> Path | PathDecision:
-    """The real path a tool call would touch, or a block for a path that can't be judged."""
+def _base(cwd: Path | None, policy: PathPolicy) -> Path | PathDecision:
+    """The real folder relative paths start from: the session's `cwd`, else the worktree."""
+    if cwd is None:
+        return policy.worktree
+    if not cwd.is_absolute():
+        return _block(f"the current folder {cwd} isn't a full path, so paths can't be judged.")
+    try:
+        return cwd.resolve()
+    except (OSError, ValueError, RuntimeError) as err:
+        return _block(f"the current folder {cwd} can't be resolved ({err}).")
+
+
+def _locate(raw: str, policy: PathPolicy, base: Path) -> Path | PathDecision:
+    """The real path a tool call would touch, or a block for a path that can't be judged.
+    A relative path starts from `base`."""
     if raw.startswith("~"):
         return _block(f"{raw} points into the home folder; use a path inside the worktree.")
     if raw.replace("\\", "/").startswith("//"):
@@ -277,7 +299,7 @@ def _locate(raw: str, policy: PathPolicy) -> Path | PathDecision:
         if any(name not in (".", "..") and name.endswith((".", " ")) for name in names):
             return _block(f"{raw} has a name with a trailing dot or space; Windows drops them.")
     try:
-        return (path if path.is_absolute() else policy.worktree / path).resolve()
+        return (path if path.is_absolute() else base / path).resolve()
     except (OSError, ValueError, RuntimeError) as err:  # RuntimeError: a symlink loop
         return _block(f"{raw} can't be resolved ({err}).")
 
