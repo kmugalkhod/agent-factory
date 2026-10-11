@@ -286,7 +286,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Depends on:** 2.1
 - **Note:** "read-only commands" is a fixed list in `safety/commands.py` (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `stat`, `diff`, `sort`, `pwd`, `which` and their PowerShell forms), minus flags that write or run something (`find -exec`/`-delete`, `rg --pre`, `sort -o`). Their paths must stay inside the worktree and the run folder, and a content read may not reach `.env*`, through wildcards, option values (`--from-file=x`, `-fx`) or links included. Programs given by path (`./cat`) never count as read-only or allowlisted. A search (`grep`, `rg`, `Select-String`) checks every argument as a path and its current folder too unless input is piped in, so it is blocked whenever a `.env*` file is in reach. The tester and builder run only their allowlist, plus `cd` inside the worktree. `gh` is blocked with `git`. Anything the check can't judge is blocked: expansion (`$`, backticks, `%X%`, `@splat`), braces, input redirects, output redirects except to the null device, `VAR=x` prefixes, and wrappers (`cmd /c`, `powershell -c`, `bash -c`, `env`, `xargs`, `iex`, ...), whose inner command is checked for the reason. Built on `main` before 2.8 merged, at Kunal's request (Oct 10, 2026).
 
-### [ ] 2.10 Secret scan
+### [x] 2.10 Secret scan
 
 - **What:** Add a scanner for secrets in text and diffs: Anthropic, AWS and GitHub tokens, private keys, and assignments copied from `.env` files. It is used by the hook on Write and Edit content and by the post-stage check.
 - **Touches:** `engine/factory_engine/safety/secrets.py`, `engine/tests/safety/`
@@ -296,6 +296,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Findings never include the full secret value.
 - **Tests:** Fixture-based unit tests.
 - **Depends on:** 1.1
+- **Note:** A `.env` assignment counts when an upper-case secret-sounding name (`*_PASSWORD`, `*_TOKEN`, `*_SECRET`, `*_API_KEY`, ...) is set to a real-looking value written as `NAME=value`, or as `NAME = value` without quotes. Placeholders, numbers, booleans and references to other names are skipped. Passwords in URLs are also reported. Diffs are scanned on added lines only. The secret fixtures are built from fragments at test time so the repo holds no token-shaped strings.
 
 ### [ ] 2.11 Hook wiring
 
