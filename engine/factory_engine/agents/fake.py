@@ -112,9 +112,9 @@ class FakeAgentRunner:
         active = self._active
         if active is None:
             raise not_running()
+        active.recorder.sent(text)  # a note that can't be logged isn't sent
         active.turns += 1
         active.interrupted = False
-        active.recorder.sent(text)
         self.sent.append(text)
         self._stop(active)
 

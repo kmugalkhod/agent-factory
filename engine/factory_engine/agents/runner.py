@@ -324,8 +324,8 @@ class SessionRecorder:
             self._save(session=session if self._is_new_session(session) else None, usage=usage)
 
     def sent(self, text: str) -> None:
-        """Log a note you sent the agent."""
-        self._events.append(Message(sender="you", text=text), role=self.role)
+        """Log a note you sent the agent, with any secret in it masked."""
+        self._events.append(Message(sender="you", text=redact(text)), role=self.role)
 
     def finish(self, *, interrupted: bool) -> AgentResult:
         if interrupted:
@@ -467,11 +467,18 @@ class ClaudeAgentRunner:
         active = self._active
         if active is None:
             raise not_running()
+        active.recorder.sent(text)  # a note that can't be logged isn't sent
         # Count the note's turn before any await, so the run waits for its result too.
         active.turns += 1
         active.interrupted = False
-        active.recorder.sent(text)
-        # A note mid-turn would be folded into that turn; stop the turn so the note starts one.
-        # The runner is only active while a turn is in progress.
-        await active.client.interrupt()
-        await active.client.query(text)
+        try:
+            # A note mid-turn would be folded into that turn; stop the turn so the note starts
+            # one. The runner is only active while a turn is in progress.
+            await active.client.interrupt()
+            await active.client.query(text)
+        except BaseException:
+            # The note's turn never started, so don't wait for its result. The current turn
+            # may have been stopped already; the attempt can't count as completed.
+            active.turns -= 1
+            active.interrupted = True
+            raise

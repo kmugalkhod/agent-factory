@@ -5,6 +5,7 @@ uses, so these tests cover how messages become events, session IDs and token tot
 """
 
 import asyncio
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from factory_engine.agents.fake import (
     result,
     system_init,
 )
-from factory_engine.agents.runner import AgentSpec, SessionRecorder
+from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder
 from factory_engine.errors import AgentError
 from factory_engine.events import EventLog, Message, Tokens, read_events
 from factory_engine.registry import Registry
@@ -31,11 +32,15 @@ def _clock() -> datetime:
     return NOW
 
 
-async def _no_hook(input_data: object, tool_use_id: str | None, context: object) -> dict:
+async def _no_hook(
+    input_data: object, tool_use_id: str | None, context: object
+) -> dict[str, object]:
     return {}
 
 
-def _spec(tmp_path: Path, role: Role = "builder", attempt: int = 1, resume: str | None = None):
+def _spec(
+    tmp_path: Path, role: Role = "builder", attempt: int = 1, resume: str | None = None
+) -> AgentSpec:
     return AgentSpec(
         role=role,
         attempt=attempt,
@@ -85,14 +90,16 @@ class World:
             clock=_clock,
         )
 
-    def play(self, runner: FakeAgentRunner, spec: AgentSpec, role: Role, attempt: int):
+    def play(
+        self, runner: FakeAgentRunner, spec: AgentSpec, role: Role, attempt: int
+    ) -> AgentResult:
         outcome = asyncio.run(runner.run(spec, self.recorder(role, attempt)))
         self.run = outcome.run
         return outcome
 
 
 @pytest.fixture
-def world(tmp_path: Path):
+def world(tmp_path: Path) -> Iterator[World]:
     w = World(tmp_path)
     yield w
     w.registry.close()
@@ -141,7 +148,7 @@ def test_tokens_per_role_and_attempt_equal_the_scripted_totals(
                 spec: AgentSpec = spec,
                 role: Role = role,
                 attempt: int = attempt,
-            ):
+            ) -> AgentResult:
                 task = asyncio.ensure_future(runner.run(spec, world.recorder(role, attempt)))
                 await runner.started.wait()
                 await runner.send("one more thing")
@@ -220,7 +227,7 @@ def test_interrupt_stops_the_turn(world: World, tmp_path: Path) -> None:
         [[system_init("s"), assistant_text("working"), HOLD, result("s", 9, 9)]]
     )
 
-    async def go():
+    async def go() -> AgentResult:
         task = asyncio.ensure_future(runner.run(_spec(tmp_path), world.recorder()))
         await runner.started.wait()
         await runner.interrupt()
@@ -240,7 +247,7 @@ def test_send_after_interrupt_continues_in_the_same_session(world: World, tmp_pa
         ]
     )
 
-    async def go():
+    async def go() -> AgentResult:
         task = asyncio.ensure_future(runner.run(_spec(tmp_path), world.recorder()))
         await runner.started.wait()
         await runner.interrupt()
@@ -254,6 +261,53 @@ def test_send_after_interrupt_continues_in_the_same_session(world: World, tmp_pa
     assert runner.sent == ["use the other API"]
     messages = [e.body for e in read_events(world.folder) if isinstance(e.body, Message)]
     assert Message(sender="you", text="use the other API") in messages
+
+
+def test_sent_note_has_secrets_masked_in_the_events(world: World, tmp_path: Path) -> None:
+    secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+    runner = FakeAgentRunner([[system_init("s"), HOLD, result("s", 1, 1)], [result("s", 1, 1)]])
+
+    async def go() -> AgentResult:
+        task = asyncio.ensure_future(runner.run(_spec(tmp_path), world.recorder()))
+        await runner.started.wait()
+        await runner.send(f"use the token {secret}")
+        return await task
+
+    asyncio.run(go())
+
+    assert runner.sent == [f"use the token {secret}"]  # the agent gets the note as written
+    assert secret not in (world.folder / "events.jsonl").read_text(encoding="utf-8")
+
+
+class _UnloggableNotes(SessionRecorder):
+    def sent(self, text: str) -> None:
+        raise OSError("disk full")
+
+
+def test_note_that_cant_be_logged_isnt_waited_for(world: World, tmp_path: Path) -> None:
+    runner = FakeAgentRunner([[system_init("s"), HOLD, result("s", 1, 1)]])
+    recorder = _UnloggableNotes(
+        world.run,
+        run_folder=world.folder,
+        events=world.events,
+        registry=world.registry,
+        role="builder",
+        attempt=1,
+        clock=_clock,
+    )
+
+    async def go() -> AgentResult:
+        task = asyncio.ensure_future(runner.run(_spec(tmp_path), recorder))
+        await runner.started.wait()
+        with pytest.raises(OSError, match="disk full"):
+            await runner.send("use the other API")
+        await runner.interrupt()
+        return await asyncio.wait_for(task, timeout=5)
+
+    outcome = asyncio.run(go())
+
+    assert outcome.outcome == "interrupted"
+    assert runner.sent == []
 
 
 def test_send_and_interrupt_need_a_running_agent() -> None:

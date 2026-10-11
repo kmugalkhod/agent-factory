@@ -6,7 +6,7 @@ speaks the SDK's stream-JSON control protocol, so no CLI or model is involved.
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk._internal.transport import Transport
 
 from factory_engine.agents.runner import (
+    AgentResult,
     AgentSpec,
     ClaudeAgentRunner,
     SessionRecorder,
@@ -75,7 +76,9 @@ def dirs(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-async def _no_hook(input_data: object, tool_use_id: str | None, context: object) -> dict:
+async def _no_hook(
+    input_data: object, tool_use_id: str | None, context: object
+) -> dict[str, object]:
     return {}
 
 
@@ -351,12 +354,16 @@ class FakeTransport(Transport):
         self._tasks: list[asyncio.Task[None]] = []
         self._ready = False
         self.cwd = "C:/wt"
+        self.refuse_notes = False  # fail writing any user message after the first
 
     async def connect(self) -> None:
         self._ready = True
 
     async def write(self, data: str) -> None:
         message = json.loads(data)
+        notes_refused = self.refuse_notes and any(m["type"] == "user" for m in self.written)
+        if message["type"] == "user" and notes_refused:
+            raise OSError("pipe closed")
         self.written.append(message)
         if message["type"] == "control_request":
             request = message["request"]
@@ -475,7 +482,7 @@ class World:
 
 
 @pytest.fixture
-def world(dirs: dict[str, Path]):
+def world(dirs: dict[str, Path]) -> Iterator[World]:
     w = World(dirs)
     yield w
     w.registry.close()
@@ -550,7 +557,7 @@ def test_sdk_interrupt_ends_the_turn(world: World) -> None:
     transport = FakeTransport([[_sdk_init("s-1"), WAIT]])
     runner = world.runner(transport)
 
-    async def go():
+    async def go() -> AgentResult:
         task = asyncio.ensure_future(runner.run(_build(world.dirs), world.recorder()))
         await transport.started.wait()
         await runner.interrupt()
@@ -571,7 +578,7 @@ def test_sdk_send_continues_the_session_with_the_note(world: World) -> None:
     )
     runner = world.runner(transport)
 
-    async def go():
+    async def go() -> AgentResult:
         task = asyncio.ensure_future(runner.run(_build(world.dirs), world.recorder()))
         await transport.started.wait()
         await runner.interrupt()
@@ -595,11 +602,61 @@ def test_sdk_send_needs_a_running_agent(world: World) -> None:
         asyncio.run(runner.send("hello"))
 
 
+class _UnloggableNotes(SessionRecorder):
+    def sent(self, text: str) -> None:
+        raise OSError("disk full")
+
+
+def test_sdk_note_that_cant_be_logged_doesnt_stall_the_run(world: World) -> None:
+    transport = FakeTransport([[_sdk_init("s-1"), WAIT]])
+    runner = world.runner(transport)
+    recorder = _UnloggableNotes(
+        world.run,
+        run_folder=world.folder,
+        events=world.events,
+        registry=world.registry,
+        role="builder",
+        attempt=1,
+        clock=_clock,
+    )
+
+    async def go() -> AgentResult:
+        task = asyncio.ensure_future(runner.run(_build(world.dirs), recorder))
+        await transport.started.wait()
+        with pytest.raises(OSError, match="disk full"):
+            await runner.send("Use the other API.")
+        await runner.interrupt()
+        return await asyncio.wait_for(task, timeout=5)
+
+    outcome = asyncio.run(go())
+
+    assert outcome.outcome == "interrupted"
+    assert [m for m in transport.written if m["type"] == "user"][1:] == []
+
+
+def test_sdk_note_that_cant_be_sent_doesnt_stall_the_run(world: World) -> None:
+    transport = FakeTransport([[_sdk_init("s-1"), WAIT]])
+    transport.refuse_notes = True
+    runner = world.runner(transport)
+
+    async def go() -> AgentResult:
+        task = asyncio.ensure_future(runner.run(_build(world.dirs), world.recorder()))
+        await transport.started.wait()
+        with pytest.raises(Exception, match="pipe closed"):
+            await runner.send("Use the other API.")
+        return await asyncio.wait_for(task, timeout=5)
+
+    outcome = asyncio.run(go())
+
+    # The note stopped the turn but never started one, so the attempt ends interrupted.
+    assert outcome.outcome == "interrupted"
+
+
 def test_sdk_runner_refuses_a_second_run_at_once(world: World) -> None:
     transport = FakeTransport([[_sdk_init("s-1"), WAIT]])
     runner = world.runner(transport)
 
-    async def go():
+    async def go() -> None:
         task = asyncio.ensure_future(runner.run(_build(world.dirs), world.recorder()))
         await transport.started.wait()
         with pytest.raises(AgentError, match="already running"):
