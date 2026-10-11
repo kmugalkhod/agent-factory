@@ -355,6 +355,9 @@ class FakeTransport(Transport):
         self._ready = False
         self.cwd = "C:/wt"
         self.refuse_notes = False  # fail writing any user message after the first
+        self.interrupt_seen = asyncio.Event()
+        self.release_interrupts = asyncio.Event()
+        self.release_interrupts.set()  # clear it to hold interrupts until it is set again
 
     async def connect(self) -> None:
         self._ready = True
@@ -370,18 +373,13 @@ class FakeTransport(Transport):
             if request["subtype"] == "initialize":
                 for matcher in (request.get("hooks") or {}).get("PreToolUse", []):
                     self._hook_ids += matcher["hookCallbackIds"]
-            await self._emit(
-                {
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": message["request_id"],
-                        "response": {},
-                    },
-                }
-            )
             if request["subtype"] == "interrupt":
-                self._interrupted.set()
+                # Answered apart from the write, so a caller that gives up waiting doesn't
+                # take the CLI's side of the interrupt with it.
+                self.interrupt_seen.set()
+                self._tasks.append(asyncio.ensure_future(self._answer_interrupt(message)))
+            else:
+                await self._answer(message)
         elif message["type"] == "control_response":
             response = message["response"]
             self.hook_answers.append(response)
@@ -389,6 +387,23 @@ class FakeTransport(Transport):
         elif message["type"] == "user":
             turn = self.turns.pop(0)
             self._tasks.append(asyncio.ensure_future(self._play(turn)))
+
+    async def _answer(self, request: dict[str, Any]) -> None:
+        await self._emit(
+            {
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": request["request_id"],
+                    "response": {},
+                },
+            }
+        )
+
+    async def _answer_interrupt(self, request: dict[str, Any]) -> None:
+        await self.release_interrupts.wait()
+        await self._answer(request)
+        self._interrupted.set()
 
     async def _play(self, turn: list[Any]) -> None:
         self._interrupted.clear()
@@ -650,6 +665,28 @@ def test_sdk_note_that_cant_be_sent_doesnt_stall_the_run(world: World) -> None:
 
     # The note stopped the turn but never started one, so the attempt ends interrupted.
     assert outcome.outcome == "interrupted"
+
+
+def test_sdk_note_cancelled_while_interrupting_doesnt_stall_the_run(world: World) -> None:
+    transport = FakeTransport([[_sdk_init("s-1"), WAIT]])
+    transport.release_interrupts.clear()
+    runner = world.runner(transport)
+
+    async def go() -> AgentResult:
+        task = asyncio.ensure_future(runner.run(_build(world.dirs), world.recorder()))
+        await transport.started.wait()
+        sending = asyncio.ensure_future(runner.send("Use the other API."))
+        await transport.interrupt_seen.wait()
+        sending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sending
+        transport.release_interrupts.set()
+        return await asyncio.wait_for(task, timeout=5)
+
+    outcome = asyncio.run(go())
+
+    assert outcome.outcome == "interrupted"
+    assert [m for m in transport.written if m["type"] == "user"][1:] == []
 
 
 def test_sdk_runner_refuses_a_second_run_at_once(world: World) -> None:
