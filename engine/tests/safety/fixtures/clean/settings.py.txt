@@ -1,0 +1,13 @@
+"""App settings: secrets come from the environment, never from this file."""
+
+import os
+
+API_TOKEN = os.environ.get("API_TOKEN", "")
+SECRET_KEY = os.environ["SECRET_KEY"]
+CLIENT_SECRET = settings.CLIENT_SECRET
+PASSWORD_HASHER = DEFAULT_PASSWORD_HASHER
+TOKEN_HEADER = "Authorization"
+token = request.headers["Authorization"].removeprefix("Bearer ")
+password = getpass.getpass()
+github_url = "https://github.com/kmugalkhod/agent-factory"
+key_header = "-----BEGIN PUBLIC KEY-----"
