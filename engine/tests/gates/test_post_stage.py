@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from factory_engine.config import RoleSettings, default_settings
+from factory_engine.errors import GateError
 from factory_engine.events import EventLog, GateResult, NeedsYou, read_events
 from factory_engine.gates.post_stage import (
     ALLOWED_PATHS,
@@ -180,6 +181,56 @@ def test_the_diff_counts_commits_the_agent_made_itself(stage: Stage) -> None:
     assert not results[SECRETS].passed
 
 
+def _commit_then_remove(stage: Stage, rel: str, text: str, message: str = "agent commit") -> None:
+    stage.write(stage.worktree, rel, text)
+    stage.run(stage.worktree, "add", "-A")
+    stage.run(stage.worktree, "commit", "-m", message)
+    (stage.worktree / rel).unlink()
+    stage.run(stage.worktree, "add", "-A")
+    stage.run(stage.worktree, "commit", "-m", "tidy up")
+
+
+def test_a_secret_committed_then_deleted_during_the_stage_fails(stage: Stage) -> None:
+    def change() -> None:
+        _commit_then_remove(stage, "tests/test_leak.py", f"TOKEN = '{GITHUB_TOKEN}'\n")
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [SECRETS]
+    assert "tests/test_leak.py" in results[SECRETS].reason
+    assert GITHUB_TOKEN not in results[SECRETS].reason
+
+
+def test_a_secret_committed_then_deleted_without_a_commit_fails(stage: Stage) -> None:
+    def change() -> None:
+        stage.write(stage.worktree, "tests/test_leak.py", f"TOKEN = '{GITHUB_TOKEN}'\n")
+        stage.run(stage.worktree, "add", "-A")
+        stage.run(stage.worktree, "commit", "-m", "agent commit")
+        (stage.worktree / "tests/test_leak.py").unlink()  # the stage commit removes it later
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert not results[SECRETS].passed
+
+
+def test_a_secret_in_a_commit_message_fails(stage: Stage) -> None:
+    def change() -> None:
+        stage.write(stage.worktree, "tests/test_new.py", "x = 1\n")
+        stage.run(stage.worktree, "add", "-A")
+        stage.run(stage.worktree, "commit", "-m", f"token {GITHUB_TOKEN}")
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [SECRETS]
+    assert GITHUB_TOKEN not in results[SECRETS].reason
+
+
+def test_a_path_touched_by_a_commit_and_put_back_fails(stage: Stage) -> None:
+    def change() -> None:
+        _commit_then_remove(stage, "src/sneaky.py", "X = 1\n")
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
+    assert "src/sneaky.py" in results[ALLOWED_PATHS].reason
+
+
 # --- 1. the main checkout ---
 
 
@@ -228,6 +279,44 @@ def test_a_changed_main_checkout_fails(
     assert not results[MAIN_CHECKOUT].passed
     assert says in results[MAIN_CHECKOUT].reason
     assert str(stage.repo) in results[MAIN_CHECKOUT].reason
+
+
+def _linked_checkout(stage: Stage, tmp_path: Path) -> Path:
+    """The user's checkout is itself a linked worktree of `stage.repo`: its `.git` is a file."""
+    linked = tmp_path / "linked"
+    stage.run(stage.repo, "worktree", "add", "-b", "user-branch", str(linked))
+    stage.watch = Watch(
+        repo=linked,
+        worktree=stage.watch.worktree,
+        run_folder=stage.watch.run_folder,
+        watched=stage.watch.watched,
+        allowed=stage.watch.allowed,
+    )
+    return linked
+
+
+@pytest.mark.parametrize(
+    ("rel", "says"),
+    [
+        ("hooks/pre-commit", "pre-commit"),
+        ("config", "config"),
+        ("info/exclude", "exclude"),
+    ],
+    ids=["hook", "config", "info"],
+)
+def test_the_shared_git_folder_of_a_linked_checkout_is_watched(
+    stage: Stage, tmp_path: Path, rel: str, says: str
+) -> None:
+    _linked_checkout(stage, tmp_path)
+    shared = stage.repo / ".git"
+    results = results_by_gate(check(stage, "tester", lambda: stage.write(shared, rel, "x\n")))
+    assert not results[MAIN_CHECKOUT].passed
+    assert says in results[MAIN_CHECKOUT].reason
+
+
+def test_a_linked_checkout_left_alone_passes(stage: Stage, tmp_path: Path) -> None:
+    _linked_checkout(stage, tmp_path)
+    assert failed_gates(check(stage, "reviewer", lambda: None)) == []
 
 
 # --- 2. outside the worktree ---
@@ -377,6 +466,20 @@ def test_a_check_that_cant_run_fails_closed(stage: Stage) -> None:
     results = check(stage, "tester", change)
     assert ALLOWED_PATHS in failed_gates(results)
     assert SECRETS in failed_gates(results)
+
+
+def test_a_baseline_whose_git_call_fails_raises_gate_error(stage: Stage, tmp_path: Path) -> None:
+    not_a_repo = tmp_path / "not-a-repo"
+    not_a_repo.mkdir()
+    stage.watch = Watch(
+        repo=stage.watch.repo,
+        worktree=not_a_repo,
+        run_folder=stage.watch.run_folder,
+        watched=stage.watch.watched,
+        allowed=stage.watch.allowed,
+    )
+    with pytest.raises(GateError, match="before the stage"):
+        take_baseline(stage.git, stage.watch)
 
 
 # --- stopping the run ---

@@ -6,7 +6,8 @@ write outside the worktree. Before a stage the engine takes a `Baseline`; after 
 
 1. `post_stage.main_checkout`: the main checkout is unchanged. HEAD (branch and commit), the
    index entries, every file in the working tree (ignored ones too) and the git hooks and config
-   that git runs or reads (`.git/config`, `.git/hooks/`, `.git/info/`).
+   that git runs or reads (`config`, `config.worktree`, `hooks/`, `info/` in the checkout's git
+   folder and, when the checkout is itself a linked worktree, in the shared one).
 2. `post_stage.outside_worktree`: nothing changed in the watched folders (the data folder by
    default: other runs, other worktrees, other agents' config folders), except the places that
    may change during a stage. In the run folder only the role's own run docs and the engine's
@@ -16,7 +17,9 @@ write outside the worktree. Before a stage the engine takes a `Baseline`; after 
 4. `post_stage.secrets`: the secret scan of the diff's added lines is clean.
 
 The diff is the worktree against the commit it started the stage on, untracked files included
-and ignored ones left out, which is what the stage commit will hold. Files outside git are
+and ignored ones left out, which is what the stage commit will hold. The push sends every commit
+made during the stage, so checks 3 and 4 also read each of those commits (and their messages):
+a path touched or a secret added and then taken back out still fails. Files outside git are
 compared by type, size, mode and modification time. A check that can't run fails (fail closed);
 any failure moves the run to needs_you (`post_stage_check`).
 """
@@ -30,7 +33,7 @@ from pathlib import Path
 
 from factory_engine.agents.runner import RunIndex, persist
 from factory_engine.config import RoleSettings
-from factory_engine.errors import GateError
+from factory_engine.errors import GateError, GitError
 from factory_engine.events import EVENTS_FILE, EventLog, GateResult, NeedsYou
 from factory_engine.git_ops import Git
 from factory_engine.registry import REGISTRY_FILE
@@ -46,10 +49,21 @@ SECRETS = "post_stage.secrets"
 GATES = (MAIN_CHECKOUT, OUTSIDE_WORKTREE, ALLOWED_PATHS, SECRETS)
 
 ENGINE_FILES = frozenset({RUN_FILE, EVENTS_FILE})  # the engine writes these during a stage
-GIT_WATCHED = ("config", "hooks", "info")  # in the main checkout's `.git` folder
+# in the main checkout's git folders (its own and, for a linked checkout, the shared one)
+GIT_WATCHED = ("config", "config.worktree", "hooks", "info")
 SQLITE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 MAX_LISTED = 10
 BINARY_PROBE = 8000  # bytes git looks at to decide a file is binary
+# The diff the secret scan reads: added lines only, and no helpers from the repo's config.
+DIFF_OPTIONS = (
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "-U0",
+)
 
 # (kind, size, mode, modification time in ns); a folder is ("dir", 0, 0, 0), since its time
 # changes whenever a skipped place inside it does.
@@ -124,7 +138,7 @@ def take_baseline(git: Git, watch: Watch) -> Baseline:
             run_folder=_tree(watch.run_folder.resolve(), frozenset()),
             base=git.out(["rev-parse", "HEAD"], watch.worktree),
         )
-    except (OSError, GateError) as err:
+    except (OSError, GateError, GitError) as err:
         raise GateError(
             f"can't record the state before the stage ({err}). Fix the folder, then start "
             "the stage again."
@@ -139,17 +153,34 @@ def _main_state(git: Git, watch: Watch) -> MainState:
     dot_git = repo / ".git"
     skip = _skips(watch)
     files: dict[str, Entry] = {}
-    if dot_git.is_dir():
-        files.update(_tree(repo, skip | {_key(dot_git)}))
+    files.update(_tree(repo, skip | {_key(dot_git)} if dot_git.is_dir() else skip))
+    for git_dir in _git_dirs(git, repo):
         for name in GIT_WATCHED:
-            files.update(_tree(dot_git / name, skip))
-    else:
-        files.update(_tree(repo, skip))
+            files.update(_tree(git_dir / name, skip))
     return MainState(
         head=f"{branch or 'detached'} {commit or 'no commit'}",
         index=hashlib.sha256(index.encode("utf-8", "replace")).hexdigest(),
-        files={_rel(Path(path), repo): entry for path, entry in files.items()},
+        files={_shown_main(Path(path), repo): entry for path, entry in files.items()},
     )
+
+
+def _git_dirs(git: Git, repo: Path) -> list[Path]:
+    """The checkout's own git folder and the shared one, as git finds them. They differ when the
+    checkout is itself a linked worktree (its `.git` is a file pointing elsewhere)."""
+    out = git.out(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], repo)
+    found: dict[str, Path] = {}
+    for line in out.splitlines():
+        if line.strip():
+            path = Path(line.strip()).resolve()
+            found.setdefault(_key(path), path)
+    if not found:
+        raise GateError(f"git found no git folder for {repo}.")
+    return list(found.values())
+
+
+def _shown_main(path: Path, repo: Path) -> str:
+    """Repo-relative inside the checkout; a shared git folder elsewhere keeps its full path."""
+    return _rel(path, repo) if path.is_relative_to(repo) else path.as_posix()
 
 
 def _watched_state(watch: Watch) -> dict[str, Entry]:
@@ -324,31 +355,30 @@ def _check_paths(role: Role, policy: PathPolicy, changed: Sequence[str]) -> Gate
 
 
 def _check_secrets(git: Git, worktree: Path, base: str, role: Role) -> GateResult:
-    diff = git.run(
-        [
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            "-U0",
-            base,
-            "--",
-        ],
-        worktree,
-    ).stdout
+    diff = git.run(["diff", *DIFF_OPTIONS, base, "--"], worktree).stdout
     findings = scan_diff(diff)
     for rel in _untracked(git, worktree):
         findings += _scan_file(worktree / rel, rel)
+    # The push sends every commit, so a secret committed and later deleted counts too.
+    commits = git.run(
+        ["log", "-p", "--format=", "--diff-merges=first-parent", *DIFF_OPTIONS]
+        + _new_commits(base),
+        worktree,
+    )
+    findings += scan_diff(commits.stdout)
+    messages = git.run(["log", "--format=%h%x1f%B%x1e", *_new_commits(base)], worktree).stdout
+    for record in messages.split("\x1e"):
+        sha, _, body = record.strip("\n").partition("\x1f")
+        if record.strip():
+            findings += scan_text(body, path=f"commit message {sha}")
     if not findings:
         return _pass(SECRETS, "the secret scan of the diff is clean.")
     listed = _listed([finding.describe() for finding in findings])
     return _fail(
         SECRETS,
-        f"the {role}'s diff adds secrets: {listed}. Secrets never go into the repo; remove "
-        "them and keep test secrets in the repo's `.env.factory` outside the worktree.",
+        f"the {role}'s diff or commits add secrets: {listed}. Secrets never go into the repo; "
+        "remove them (a later commit doesn't take one out of the history) and keep test "
+        "secrets in the repo's `.env.factory` outside the worktree.",
     )
 
 
@@ -369,11 +399,23 @@ def _scan_file(path: Path, rel: str) -> list[SecretFinding]:
 
 
 def _changed_paths(git: Git, worktree: Path, base: str) -> list[str]:
-    """Every worktree-relative path the stage added, changed or deleted since `base`."""
+    """Every worktree-relative path the stage added, changed or deleted since `base`, in the
+    final files or in any commit made during the stage (even if a later commit put it back)."""
     tracked = git.run(["diff", "--name-only", "--no-renames", "-z", base, "--"], worktree).stdout
     names = {name for name in tracked.split("\0") if name}
     names.update(_untracked(git, worktree))
+    committed = git.run(
+        ["log", "--format=", "--name-only", "--no-renames", "--diff-merges=first-parent", "-z"]
+        + _new_commits(base),
+        worktree,
+    ).stdout
+    names.update(name.strip("\n") for name in committed.split("\0") if name.strip("\n"))
     return sorted(names)
+
+
+def _new_commits(base: str) -> list[str]:
+    """The `git log` range of the commits made during the stage: those on HEAD and not `base`."""
+    return [f"{base}..HEAD", "--"]
 
 
 def _untracked(git: Git, worktree: Path) -> list[str]:
