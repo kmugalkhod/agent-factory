@@ -395,7 +395,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Integration tests with temporary repos.
 - **Depends on:** 2.8, 2.10, 2.14
 
-### [ ] 2.16 Planner gate
+### [x] 2.16 Planner gate
 
 - **What:** Parse `plan.md` using the headings fixed in 1.2. Pass only when it has:
   - files and steps
@@ -409,6 +409,12 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Split and Questions sections are returned when present.
 - **Tests:** Fixture `plan.md` files, good and bad.
 - **Depends on:** 1.2
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `check_plan(path)` returns the verdict, the reason (one line per problem, all reported at once, for the planner retry) and what it read: files, steps, criteria (each marked measurable or not), Split and Questions. `event()` gives the `gate_result` event, gate `plan`. A missing or unreadable `plan.md` fails; the gate never raises.
+  - The headings are the contract: each required heading once, optional ones at most once, no others, in the template's order. Code fences fail, since gates read headings line by line. The 60-line limit isn't checked: it doesn't change what the gate reads.
+  - Files are list items starting with a path in backticks; steps and criteria are numbered items (bullets don't count). An item that is only a template placeholder (`<step>`) doesn't count, so the unfilled template fails.
+  - A criterion is measurable when it has a code span in backticks, a digit, a test name (`test_...`) or an observable result from a fixed word list (returns, raises, exits, prints, writes, shows, ...; the list is in `gates/plan.py`). The plan passes with at least one measurable criterion; the passing reason names any that aren't, for plan approval.
+  - Split parts are numbered 1, 2, 3 in order, at least two, and each ends with `depends on none` or `depends on part N`, on earlier parts only; anything else fails, since milestone 3 schedules parts from this data. Questions only need numbering; `Why it matters:` and `Default if unanswered:` are read when present. A Split or Questions heading with no items fails. A plan with questions still needs files, steps and criteria (built on its defaults).
 
 ### [ ] 2.17 Tester gate
 
