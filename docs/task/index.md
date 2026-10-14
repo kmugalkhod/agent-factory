@@ -27,3 +27,4 @@ Milestone 6 starts only after milestones 2–4 have run reliably for one to two 
 | 2026-10-10 | 1 | Tasks 1.1–1.5 done; awaiting exit sign-off (1.X). Run-1 built task 2.1 by hand (PR #9) |
 | 2026-10-10 | 1 | Milestone 1 exit signed off by Kunal; milestone done |
 | 2026-10-10 | 2 | Milestone 2 in progress: 2.1 done in the 1.5 manual run (PR #9) |
+| 2026-10-14 | 2 | CI added: GitHub Actions runs `dev.py test` and `lint` on Windows for every pull request, since local runs are too slow on this machine. Kunal chose the shortest path to a working run: 2.15–2.22 and 2.28; 2.23–2.27 and 2.29 deferred |
