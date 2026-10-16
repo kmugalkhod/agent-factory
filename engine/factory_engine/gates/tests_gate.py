@@ -23,8 +23,10 @@ it, or one above it) under which every reported file exists. A file that could s
 than one such root counts as the tester's only if it is the tester's under each of them.
 
 The tester's files and their git blob ids go to `<run folder>/tester-files.json` for the test
-lock (task 2.18, `gates/build.py`). The gate returns its decision; the pipeline logs `event()`
-and retries the tester with `reason` on a fail.
+lock (task 2.18, `gates/build.py`); a passing run also records the IDs of the tester's tests
+that ran in `tester-cases.json`, which the builder gate requires to run and pass. The gate
+returns its decision; the pipeline logs `event()` and retries the tester with `reason` on a
+fail.
 """
 
 import re
@@ -55,6 +57,7 @@ from factory_engine.testrun import (
 
 GATE = "tests"
 TESTER_FILES = "tester-files.json"
+TESTER_CASES = "tester-cases.json"
 MAX_LISTED = 10
 # pytest's exit codes for an interrupted run, an internal error and a usage error, and for a
 # run that collected no tests.
@@ -91,6 +94,27 @@ class TesterFiles(BaseModel):
             if not BLOB_ID.fullmatch(blob):
                 raise ValueError(f"{blob!r} (for {rel}) is not a git blob id")
         return files
+
+
+class TesterCases(BaseModel):
+    """`tester-cases.json`: the IDs (`classname::name`) of the tests in the tester's files that
+    ran in the tester gate's passing run, failing or passing. The builder gate requires each of
+    them to run and pass, so a test can't be dropped by ignoring, deselecting or not collecting
+    its file. Empty when the runner writes no report."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cases: list[str]
+
+    @field_validator("cases")
+    @classmethod
+    def _check_cases(cls, cases: list[str]) -> list[str]:
+        for case in cases:
+            if not case.strip() or any(c in case for c in "\r\n\0"):
+                raise ValueError(f"{case!r} is not a test ID")
+        if len(set(cases)) != len(cases):
+            raise ValueError("a test ID is listed twice")
+        return cases
 
 
 def _safe_rel(rel: str) -> bool:
@@ -146,6 +170,7 @@ def check_tests(
             "`commands.test` in factory.yaml (for example `uv run pytest`)."
         )
     worktree, run_folder = worktree.resolve(), run_folder.resolve()
+    clear_tester_cases(run_folder)  # only a passing run records them
     files = tester_files(git, worktree=worktree, run_folder=run_folder, base=base, tester=tester)
     # Judge by every file a tester stage wrote: a retry or rerun starting from a commit that
     # already holds earlier tester files must not count their failing tests as someone else's.
@@ -174,7 +199,10 @@ def check_tests(
         runner=runner,
         timer=timer,
     )
-    return judge(result, recorded, worktree_index(git, worktree))
+    outcome = judge(result, recorded, worktree_index(git, worktree))
+    if outcome.passed:
+        record_tester_cases(run_folder, (*outcome.failing_new, *outcome.passing_new))
+    return outcome
 
 
 # ------------------------------------------------------------------ the decision
@@ -426,6 +454,43 @@ def load_tester_files(run_folder: Path) -> dict[str, str]:
         raise GateError(
             f"{path}: invalid ({err.error_count()} problems). It records the tester's files "
             "for the test lock; rerun the tester stage to rebuild it."
+        ) from err
+
+
+def record_tester_cases(run_folder: Path, cases: Iterable[str]) -> tuple[str, ...]:
+    """Save the IDs of the tester's tests that ran (`tester-cases.json`). Returns them."""
+    path = run_folder / TESTER_CASES
+    try:
+        saved = TesterCases(cases=sorted(set(cases)))
+    except ValidationError as err:
+        raise GateError(f"{path}: can't record the tester's tests ({err}).") from err
+    write_atomic(path, saved.model_dump_json(indent=2) + "\n")
+    return tuple(saved.cases)
+
+
+def clear_tester_cases(run_folder: Path) -> None:
+    path = run_folder / TESTER_CASES
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as err:
+        raise GateError(f"{path}: can't remove the old record ({err}).") from err
+
+
+def load_tester_cases(run_folder: Path) -> tuple[str, ...] | None:
+    """The IDs from `tester-cases.json`; None when there is no record."""
+    path = run_folder / TESTER_CASES
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as err:
+        raise GateError(f"{path}: can't read the tester's tests ({err}).") from err
+    try:
+        return tuple(TesterCases.model_validate_json(text).cases)
+    except ValidationError as err:
+        raise GateError(
+            f"{path}: invalid ({err.error_count()} problems). It records the tester's tests "
+            "for the builder gate; rerun the tester stage to rebuild it."
         ) from err
 
 

@@ -5,12 +5,15 @@ until it waits for you or stops. One attempt of a stage is:
 
 1. Before a retry, archive what the next attempt overwrites: `handoff-builder.md` is copied to
    `attempts/handoff-builder-<n>.md`, and `review.md` is moved to `attempts/review-<n>.md` (moved,
-   so a reviewer that writes nothing can never pass on the old review).
+   so a reviewer that writes nothing can never pass on the old review). Likewise an earlier
+   `plan.md` (failed, sent back or answered) is moved to `attempts/plan-<n>.md`.
 2. Count the attempt, write the agent's config folder and take the post-stage baseline.
 3. Run the agent through the `AgentRunner` under the watchdog. A usage limit pauses the run and,
    after the reset, resumes the same session in the same attempt. A stall (needs_you) or a turn
-   or time cap (paused) stops the pipeline.
-4. The post-stage check (`gates/post_stage.py`). A failure stops the run for you; no retry.
+   or time cap (paused) stops the pipeline, and so does a runner that fails (`RUNNER_ERRORS`:
+   needs_you, with the error); any other exception is an engine bug and is raised.
+4. The post-stage check (`gates/post_stage.py`), against the attempt's baseline, after every
+   agent run however it ended. A failure stops the run for you, no retry, and wins over a pause.
 5. The stage's gate. On a pass the engine commits the stage (`git_ops.commit_stage`; empty for
    the planner and the reviewer) and moves the run on. On a fail it tries again within the cap:
    - planner and tester: a new session, told the gate's reason;
@@ -30,10 +33,15 @@ Where later tasks plug in:
   (`decisions.py`) moves the run (to `testing`, or back to `planning`); the caller then builds
   a pipeline from the saved run and calls `advance` again, and `advance(note=...)` hands the
   decision's note to the next agent.
-- Update before review (2.22): `Hooks.update` runs in `updating`; by default it does nothing and
-  the run goes on to `reviewing`. `Hooks.publish` runs once the review passes, before
-  `awaiting_merge` (push and pull request). `Pipeline.tell_builder` sets what a builder that
-  resumes is told (for example a rebase conflict).
+- Update before review, pull request and merge (2.22, `merge.GitFlow`): `Hooks.update` runs in
+  `updating`; by default it does nothing and the run goes on to `reviewing`. A rebase conflict
+  sends the run back to the builder (`Pipeline.tell_builder`): while a rebase waits in the
+  worktree, each builder attempt resolves conflicts, then the engine carries the rebase on
+  (`git_ops.rebase_continue`) and the builder gate reruns the tests on the result. Tests that
+  still fail after a resolution, or a stop for you mid-rebase (which gives the rebase up), need
+  you. `Hooks.publish` runs once the review passes, before `awaiting_merge` (push and pull
+  request). `Hooks.merge` runs in `awaiting_merge` only once your approval is recorded
+  (`decisions.approve_merge`); the approval is used once, whatever the merge's outcome.
 - Feedback and crash recovery (2.23, 2.24): `advance` starts from whatever working state the run
   is in, with a new attempt of that stage.
 """
@@ -43,17 +51,20 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast, get_args
+
+from claude_agent_sdk import ClaudeSDKError
 
 from factory_engine.agent_config import agent_config_dir, write_agent_config
 from factory_engine.agents.runner import (
     AgentResult,
     AgentRunner,
     AgentSpec,
+    Outcome,
     RunIndex,
     SessionRecorder,
     build_spec,
@@ -68,17 +79,37 @@ from factory_engine.agents.watchdog import (
     wait_for_reset,
 )
 from factory_engine.config import RoleSettings, Settings
-from factory_engine.errors import ConfigError, FactoryError, GateError, GitError, PipelineError
+from factory_engine.errors import (
+    AgentError,
+    ConfigError,
+    FactoryError,
+    GateError,
+    GitError,
+    PipelineError,
+)
 from factory_engine.events import EventLog, GateResult, NeedsYou, StageFinished, StageStarted
-from factory_engine.gates.build import check_build
+from factory_engine.gates.build import BuildGateOutcome, check_build
 from factory_engine.gates.plan import PLAN_FILE, PlanCheck, check_plan
-from factory_engine.gates.post_stage import Baseline, Watch, post_stage_check, take_baseline
+from factory_engine.gates.post_stage import (
+    Baseline,
+    Watch,
+    check_stage,
+    post_stage_check,
+    take_baseline,
+)
 from factory_engine.gates.review import check_review_file, record_findings
 from factory_engine.gates.tests_gate import check_tests, load_tester_files
-from factory_engine.git_ops import Git, commit_stage
+from factory_engine.git_ops import (
+    Git,
+    commit_stage,
+    rebase_abort,
+    rebase_continue,
+    rebase_in_progress,
+)
 from factory_engine.providers import Profile
 from factory_engine.run import Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
+from factory_engine.safety.secrets import redact
 from factory_engine.states import move
 from factory_engine.testrun import DEFAULT_TIMEOUT, write_atomic
 
@@ -90,8 +121,14 @@ BASE_REF = "refs/remotes/origin/main"
 """The commit the reviewer's diff starts from is where the run branch meets this ref."""
 REVIEWER_ATTEMPTS = 3
 """Reviewer sessions per review round: a malformed `review.md` gets two more tries."""
+RUNNER_ERRORS: tuple[type[Exception], ...] = (ClaudeSDKError, AgentError, OSError)
+"""What a failing agent runner raises: the SDK's errors (a dropped connection, the CLI missing
+or exiting), the runner's own `AgentError` and OS errors (network, process, pipes). Anything
+else that escapes an agent run is an engine bug and is raised."""
 UPDATE_STEP = "update"
 """The step label saved once the update before review (`Hooks.update`) is done."""
+UPDATE_GATE = "update"
+"""The `gate_result` of the update before review: the rebase and the tests rerun after it."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
 PlanStop = Literal["plan_approval", "questions", "split"]
@@ -163,8 +200,9 @@ class PipelineResult:
 
 
 class Hooks:
-    """Hook points for later tasks (2.22). Each returns the run as it leaves it; the defaults
-    change nothing."""
+    """Hook points for the git flow (2.22, `merge.GitFlow`). Each returns the run as it leaves
+    it (use `Pipeline.move_to`, `stop_for_you` and `record`), and the pipeline saves that run
+    before acting on its state; the defaults push, open and merge nothing."""
 
     async def update(self, pipeline: "Pipeline", run: Run) -> Run:
         """In `updating`, before the review: rebase onto main and rerun the tests. Leave the run
@@ -176,6 +214,22 @@ class Hooks:
         """After the review passed, still in `reviewing`: push and open the pull request. Leave
         the run in `reviewing` to go on to `awaiting_merge`, or move it."""
         return run
+
+    async def merge(self, pipeline: "Pipeline", run: Run) -> Run:
+        """In `awaiting_merge`, with your approval recorded: merge, and move the run to
+        `merged` or needs_you. The default can't merge, so the run needs you."""
+        return pipeline.stop_for_you(
+            None, "this engine has no merge step, so nothing was merged. Merge it yourself."
+        )
+
+
+@dataclass(frozen=True)
+class _AgentStop:
+    """An agent that didn't finish: the watchdog stopped it, or its runner failed."""
+
+    outcome: Outcome
+    detail: str  # why, for you
+    failed: bool  # the runner failed; the run is still in its working state
 
 
 @dataclass(frozen=True)
@@ -241,6 +295,46 @@ class Pipeline:
         """What the builder is told when it next resumes (a hook's reason to send it back)."""
         self._builder_message = message
 
+    # ------------------------------------------------------------------ for the hooks
+
+    def move_to(self, target: RunState) -> Run:
+        """Move the run (logged and saved); returns it."""
+        self._move(target)
+        return self._run
+
+    def stop_for_you(self, role: Role | None, reason: str) -> Run:
+        """Move the run to needs_you with `reason` (logged and saved); returns it."""
+        self._needs_you(role, reason)
+        return self._run
+
+    def record(self, run: Run) -> Run:
+        """Save `run` (`run.json` and the registry) as the pipeline's run; returns it."""
+        self._persist(run)
+        return run
+
+    def attempts_left(self, role: Role) -> int:
+        """How many attempts `role` has left under its cap in this run."""
+        return max(0, self._cap(role) - self._attempts(role))
+
+    def build_gate(self, base: str) -> BuildGateOutcome:
+        """The builder gate on the worktree as it is: the test lock, the paths changed since
+        `base` and the repo's tests, run by the engine. The test output is saved as the
+        builder's latest attempt's (`test-output-builder-<n>.txt`). Raises ConfigError,
+        GateError or GitError when it can't run."""
+        return check_build(
+            self.git,
+            worktree=self.places.worktree,
+            run_folder=self.places.run_folder,
+            base=base,
+            builder=self.settings.roles.builder,
+            command=self.settings.commands.test,
+            attempt=max(1, self._attempts("builder")),
+            events=self.events,
+            parent_env=self._parent_env,
+            tester_stage=self._run.kind != "bootstrap",
+            timeout=self._test_timeout,
+        )
+
     # ------------------------------------------------------------------ the loop
 
     async def advance(self, *, note: str | None = None) -> PipelineResult:
@@ -255,7 +349,7 @@ class Pipeline:
             "updating": self._update,
             "reviewing": self._review,
         }
-        while (handler := handlers.get(self._run.state)) is not None:
+        while (handler := self._handler(handlers)) is not None:
             state = self._run.state
             await handler()
             if self._run.state == state:
@@ -264,6 +358,15 @@ class Pipeline:
                     f"still {state}. This is an engine bug; mark the run Needs you by hand."
                 )
         return self._result()
+
+    def _handler(
+        self, handlers: Mapping[RunState, Callable[[], Awaitable[None]]]
+    ) -> Callable[[], Awaitable[None]] | None:
+        """The step for the run's state. A run in `awaiting_merge` waits, unless your approval
+        is recorded: then it merges."""
+        if self._run.state == "awaiting_merge" and self._run.merge_approval is not None:
+            return self._merge
+        return handlers.get(self._run.state)
 
     def _result(self) -> PipelineResult:
         state = self._run.state
@@ -280,7 +383,10 @@ class Pipeline:
     async def _plan(self) -> None:
         reason: str | None = None
         while self._may_try("planner", reason):
-            prompt = _planner_prompt(self.places, reason, self._take_note())
+            previous = self._set_plan_aside()
+            if previous is False:
+                return
+            prompt = _planner_prompt(self.places, reason, self._take_note(), previous)
             if await self._attempt("planner", prompt, resume=False) is None:
                 return
             check = check_plan(self.places.run_folder / PLAN_FILE)
@@ -320,31 +426,38 @@ class Pipeline:
             reason = outcome.reason
 
     async def _build(self) -> None:
+        await self._build_attempts()
+        if self._run.state == "needs_you":
+            self._give_up_rebase()
+
+    async def _build_attempts(self) -> None:
         message, self._builder_message = self._builder_message, None
         reason: str | None = None
         while self._may_try("builder", reason):
             done = self._attempts("builder")
             if done and not self._archive(HANDOFF_BUILDER, f"handoff-builder-{done}.md", "builder"):
                 return
+            resolving = self._rebasing()
+            if resolving is None:
+                return
             resume = done > 0 and "builder" in self._run.session_ids
             prompt = _builder_prompt(self.places, message, self._take_note(), resume=resume)
             baseline = await self._attempt("builder", prompt, resume=resume)
             if baseline is None:
                 return
+            base = baseline.base
+            if resolving:
+                carried = self._carry_rebase_on()
+                if carried is None:
+                    return
+                if isinstance(carried, tuple):
+                    reason = f"the rebase onto main still has conflicts, in {', '.join(carried)}."
+                    self._gate("builder", GateResult(gate=UPDATE_GATE, passed=False, reason=reason))
+                    message = conflict_message(self.places, carried)
+                    continue
+                base = carried
             try:
-                outcome = check_build(
-                    self.git,
-                    worktree=self.places.worktree,
-                    run_folder=self.places.run_folder,
-                    base=baseline.base,
-                    builder=self.settings.roles.builder,
-                    command=self.settings.commands.test,
-                    attempt=self._attempts("builder"),
-                    events=self.events,
-                    parent_env=self._parent_env,
-                    tester_stage=self._run.kind != "bootstrap",
-                    timeout=self._test_timeout,
-                )
+                outcome = self.build_gate(base)
             except (ConfigError, GateError, GitError) as err:
                 self._needs_you("builder", f"the builder gate couldn't run: {err}")
                 return
@@ -355,13 +468,74 @@ class Pipeline:
             if outcome.flagged:
                 self._needs_you("builder", outcome.reason)
                 return
+            if resolving:
+                self._needs_you(
+                    "builder",
+                    "the tests still fail after the builder resolved the conflicts of the rebase "
+                    f"onto main: {outcome.reason}",
+                )
+                return
             reason, message = outcome.reason, outcome.resume_message()
 
+    def _rebasing(self) -> bool | None:
+        """Whether a rebase onto main waits in the worktree for the builder to resolve its
+        conflicts; None when that can't be told (the run stopped for you)."""
+        run = self._run
+        try:
+            return rebase_in_progress(self.git, self.places.worktree, run_id=run.id, slug=run.slug)
+        except GitError as err:
+            self._needs_you("builder", f"can't tell whether a rebase waits in the worktree: {err}")
+            return None
+
+    def _carry_rebase_on(self) -> str | tuple[str, ...] | None:
+        """After the builder edited the conflicted files: carry the rebase on. Returns the new
+        head once the rebase is done, the files still (or newly) in conflict, or None when it
+        failed (the run stopped for you)."""
+        run = self._run
+        try:
+            step = rebase_continue(self.git, self.places.worktree, run_id=run.id, slug=run.slug)
+            if step.conflicts:
+                return step.conflicts
+            return self.git.out(["rev-parse", "HEAD"], self.places.worktree)
+        except GitError as err:
+            self._needs_you("builder", f"the rebase onto main couldn't carry on: {err}")
+            return None
+
+    def _give_up_rebase(self) -> None:
+        """A run that stops for you mid-rebase gives the rebase up, so the run branch is back
+        where it was before the update and the worktree isn't left half rebased."""
+        run = self._run
+        worktree = self.places.worktree
+        try:
+            if not rebase_in_progress(self.git, worktree, run_id=run.id, slug=run.slug):
+                return
+            rebase_abort(self.git, worktree, run_id=run.id, slug=run.slug)
+            result = GateResult(
+                gate=UPDATE_GATE,
+                passed=False,
+                reason="the rebase onto main was given up; the run branch is back where it was "
+                "before the update.",
+            )
+        except GitError as err:
+            result = GateResult(
+                gate=UPDATE_GATE,
+                passed=False,
+                reason=f"the rebase onto main waits in {worktree} and couldn't be given up "
+                f"({err}). Run `git rebase --abort` there before resuming the run.",
+            )
+        self.events.append(result, role="builder")
+
     async def _update(self) -> None:
-        self._run = await self._hooks.update(self, self._run)
+        self._take_hooked(await self._hooks.update(self, self._run), "update")
         if self._run.state == "updating":
             self._save(UPDATE_STEP)
             self._move("reviewing")
+
+    async def _merge(self) -> None:
+        """Your approval is used once: whatever the merge does, it is cleared after."""
+        self._take_hooked(await self._hooks.merge(self, self._run), "merge")
+        if self._run.merge_approval is not None:
+            self._persist(self._run.model_copy(update={"merge_approval": None}))
 
     async def _review(self) -> None:
         reason: str | None = None
@@ -378,7 +552,7 @@ class Pipeline:
             outcome = check_review_file(self.places.run_folder / REVIEW_FILE)
             if self._gate("reviewer", outcome.event()):
                 if self._commit("reviewer"):
-                    self._run = await self._hooks.publish(self, self._run)
+                    self._take_hooked(await self._hooks.publish(self, self._run), "publish")
                     if self._run.state == "reviewing":
                         self._move("awaiting_merge")
                 return
@@ -391,6 +565,15 @@ class Pipeline:
             f"the reviewer wrote a malformed review.md {REVIEWER_ATTEMPTS} times in a row. "
             f"The last problem: {reason}",
         )
+
+    def _take_hooked(self, run: Run, hook: str) -> None:
+        """Save the run a hook returned (run.json and the registry) before acting on it."""
+        if (run.repo, run.id) != (self._run.repo, self._run.id):
+            raise PipelineError(
+                f"the {hook} hook returned run {run.repo}/{run.id} for run "
+                f"{self._run.repo}/{self._run.id}. Return the run it was given."
+            )
+        self._persist(run)
 
     def _send_back(self, run: Run, reason: str) -> None:
         """Important findings: resume the builder with `review.md`, within its cap."""
@@ -471,11 +654,13 @@ class Pipeline:
             return None
         self.events.append(StageStarted(stage=role, attempt=attempt), role=role)
         result = await self._run_agent(spec)
-        if result is None:
-            return None
         self.events.append(
             StageFinished(stage=role, attempt=attempt, outcome=result.outcome), role=role
         )
+        if isinstance(result, _AgentStop):
+            # Whatever stopped the agent, check what it left before the run waits.
+            self._check_after_stop(role, watch, baseline, role_settings, locked, result)
+            return None
         self._save(Step(role, attempt, "agent").label)
         checked = post_stage_check(
             self.git,
@@ -501,9 +686,10 @@ class Pipeline:
         self._save(Step(role, attempt, "checked").label)
         return baseline
 
-    async def _run_agent(self, spec: AgentSpec) -> AgentResult | None:
+    async def _run_agent(self, spec: AgentSpec) -> "AgentResult | _AgentStop":
         """Run the agent under the watchdog. A usage limit waits for the reset and resumes the
-        same session; None when the run stopped (a stall needs you, a cap pauses it)."""
+        same session. Returns an `_AgentStop` when the agent was stopped (a stall moved the run
+        to needs_you, a cap paused it) or its runner failed (the run is still working)."""
         while True:
             recorder = SessionRecorder(
                 self._run,
@@ -514,13 +700,21 @@ class Pipeline:
                 attempt=spec.attempt,
                 clock=self._clock,
             )
-            watched = await self._watchdog.run(self._runner, spec, recorder, events=self.events)
+            try:
+                watched = await self._watchdog.run(self._runner, spec, recorder, events=self.events)
+            except RUNNER_ERRORS as err:
+                # The runner or the agent's connection failed. Keep what the recorder saved
+                # (the session ID, tokens, a watchdog stop). Engine bugs aren't caught here.
+                self._run = recorder.run
+                detail = redact(f"{type(err).__name__}: {err}")
+                return _AgentStop("failed", f"the {spec.role}'s agent failed ({detail})", True)
             self._run = watched.result.run
-            if watched.trip is None:
+            trip = watched.trip
+            if trip is None:
                 return watched.result
             pause = self._run.pause
-            if watched.trip.kind != "usage_limit" or pause is None or pause.session_id is None:
-                return None
+            if trip.kind != "usage_limit" or pause is None or pause.session_id is None:
+                return _AgentStop(watched.result.outcome, trip.detail, False)
             await wait_for_reset(self._run, clock=self._clock, sleep=self._sleep)
             self._run = unpause(
                 self._run,
@@ -530,6 +724,48 @@ class Pipeline:
                 registry=self._registry,
             )
             spec = resume_spec(spec, pause)
+
+    def _check_after_stop(
+        self,
+        role: Role,
+        watch: Watch,
+        baseline: Baseline,
+        settings: RoleSettings,
+        locked: tuple[str, ...],
+        stop: "_AgentStop",
+    ) -> None:
+        """The post-stage check for an agent that didn't finish, against the attempt's own
+        baseline, each check logged. A failed check stops the run for you whatever stopped the
+        agent, and the reason says both; so does a runner failure. A watchdog stop with clean
+        checks stays as the watchdog left it (needs_you for a stall, paused for a cap)."""
+        results = check_stage(
+            self.git, watch, baseline, role=role, settings=settings, locked=locked
+        )
+        for result in results:
+            self.events.append(result, role=role)
+        failed = [result for result in results if not result.passed]
+        if failed:
+            listed = " ".join(f"{result.gate}: {result.reason}" for result in failed)
+            self._stop_for_you(
+                role,
+                f"the engine's check after the {role} stage failed. {listed} "
+                f"The agent had stopped: {stop.detail}",
+            )
+        elif stop.failed:
+            self._stop_for_you(
+                role,
+                f"{stop.detail}. The checks after the stage passed and the worktree is as the "
+                "agent left it; resume the run or decide it.",
+            )
+
+    def _stop_for_you(self, role: Role, reason: str) -> None:
+        """Needs you: from a working state, from paused (the pause no longer applies), or
+        again from needs_you (the new reason is logged too)."""
+        run = self._run
+        if run.state != "needs_you":
+            run = move(run, "needs_you", log=self.events)
+        self.events.append(NeedsYou(reason=reason), role=role)
+        self._persist(run.model_copy(update={"pause": None}))
 
     def _gate(self, role: Role, result: GateResult) -> bool:
         """Log the gate's result and save the step; whether it passed."""
@@ -578,7 +814,7 @@ class Pipeline:
         self._needs_you(role, f"the {role} reached its cap of {cap} attempts.{last}")
         return False
 
-    def _needs_you(self, role: Role, reason: str) -> None:
+    def _needs_you(self, role: Role | None, reason: str) -> None:
         moved = move(self._run, "needs_you", log=self.events)
         self.events.append(NeedsYou(reason=reason), role=role)
         self._persist(moved)
@@ -613,6 +849,22 @@ class Pipeline:
             self._needs_you(role, f"can't archive {source} before the next attempt ({err}).")
             return False
         return True
+
+    def _set_plan_aside(self) -> Path | None | Literal[False]:
+        """Before a planner runs: move an earlier `plan.md` (a failed one, or one you sent back
+        or answered) to `attempts/plan-<n>.md`, so only a plan written by this attempt is
+        judged. Returns where it went (None when there was none); False when the run stopped."""
+        path = self.places.run_folder / PLAN_FILE
+        archived = self.places.run_folder / ATTEMPTS_DIR / f"plan-{self._attempts('planner')}.md"
+        try:
+            if not path.is_file():
+                return None
+            _copy(path, archived)
+            path.unlink()
+        except OSError as err:
+            self._needs_you("planner", f"can't set the old {path} aside ({err}).")
+            return False
+        return archived
 
     def _set_review_aside(self, done: int) -> bool:
         """Before a reviewer runs: archive the last `review.md` as `attempts/review-<done>.md`
@@ -668,11 +920,18 @@ def _with_note(text: str, note: str | None) -> str:
     return f"{text}\n\nA note from the person running the factory:\n\n{note}" if note else text
 
 
-def _planner_prompt(places: Places, reason: str | None, note: str | None) -> str:
+def _planner_prompt(
+    places: Places, reason: str | None, note: str | None, previous: Path | None
+) -> str:
     text = (
         f"Plan this run. The run folder is {places.run_folder}: read intent.md there, then "
         f"write plan.md and handoff-planner.md there. The repo is the worktree, {places.worktree}."
     )
+    if previous is not None:
+        text += (
+            f"\n\nThe previous plan was moved to {previous}; read it if it helps, but write a "
+            "new plan.md: only the plan.md you write now is checked."
+        )
     if reason:
         text += (
             "\n\nYour last plan.md failed the planner gate. Fix every problem and write "
@@ -711,6 +970,18 @@ def _builder_prompt(places: Places, message: str | None, note: str | None, *, re
     if message:
         text += f"\n\nAn earlier attempt failed:\n\n{message}"
     return _with_note(text, note)
+
+
+def conflict_message(places: Places, files: Sequence[str]) -> str:
+    """What the builder is told when a rebase onto main stops on conflicts in `files`."""
+    listed = "\n".join(f"- {name}" for name in files)
+    return (
+        "The engine is rebasing the run branch onto the latest main, and the rebase stopped on "
+        f"conflicts in these files of the worktree, {places.worktree}:\n\n{listed}\n\n"
+        "Resolve each one: keep what main changed and what this run needs, and remove every "
+        "conflict marker line (<<<<<<<, |||||||, =======, >>>>>>>). Edit the files only; don't "
+        "run git. The engine carries the rebase on when you finish, then runs the tests."
+    )
 
 
 def _review_message(path: Path, review: str) -> str:

@@ -9,7 +9,9 @@ Every plan waits in `awaiting_plan_approval` (`Pipeline.advance` stops with `pla
   heading (→ planning).
 - Split approval: splits arrive in milestone 3. Until then `settle` (or `hold_split`) moves a run
   whose plan proposes a split to needs_you.
-- Merge approval arrives with task 2.22, as another action on `awaiting_merge`.
+- Merge approval: `approve_merge` on a run in `awaiting_merge` records your approval of its
+  pull request at its current head. The run stays in `awaiting_merge`; `Pipeline.advance` then
+  merges it (`merge.GitFlow.merge`): if main moved, it rebases and reruns the tests first.
 
 Each action loads the run from `run.json`, checks it waits for this decision and that what you
 gave is usable, and refuses with `DecisionError` otherwise, leaving the run, its files and its
@@ -29,8 +31,9 @@ from factory_engine.errors import DecisionError
 from factory_engine.events import Decision, DecisionAction, EventLog, NeedsYou
 from factory_engine.gates.plan import PLAN_FILE, PlanCheck, Question, check_plan, check_plan_text
 from factory_engine.intake import ANSWERS_HEADING, INTENT_FILE, write_bytes_atomic
+from factory_engine.merge import approval_text
 from factory_engine.pipeline import PipelineResult, PlanStop, plan_stop
-from factory_engine.run import Run, RunState, load_run
+from factory_engine.run import ApprovedMerge, Run, RunState, load_run
 from factory_engine.states import WORKING, move
 
 SPLIT_REASON = (
@@ -216,6 +219,44 @@ def settle(ctx: DecisionContext, result: PipelineResult) -> PipelineResult:
     if result.stop != "split":
         return result
     return PipelineResult(hold_split(ctx).run, "needs_you")
+
+
+# ------------------------------------------------------------------ merge approval
+
+
+def approve_merge(ctx: DecisionContext) -> Decided:
+    """Approve the run's pull request for merging, as it is now (its recorded head). Logs the
+    `approve_merge` decision and records the approval in `run.json`; the run stays in
+    `awaiting_merge`. The caller then builds a `Pipeline` from `Decided.run` (with the
+    `merge.GitFlow` hooks) and calls `advance()`, which merges: if main moved since the head
+    was tested, it rebases, reruns the tests and pushes first. The approval holds for this
+    head only and is used once."""
+    run = _load(ctx)
+    if run.state != "awaiting_merge":
+        raise DecisionError(
+            f"run {run.repo}/{run.id} is {run.state}, not waiting for your merge decision, so "
+            f"it can't be merged. {_merge_hint(run.state)}"
+        )
+    pr = run.pull_request
+    if pr is None:
+        raise DecisionError(
+            f"run {run.repo}/{run.id} has no pull request recorded, so there is nothing to "
+            "merge. Read its events; it needs a pull request before a merge can be approved."
+        )
+    ctx.events.append(Decision(action="approve_merge", text=approval_text(pr.number, pr.head)))
+    approved = run.model_copy(
+        update={"merge_approval": ApprovedMerge(pr_number=pr.number, head=pr.head)}
+    )
+    persist(approved, ctx.run_folder, ctx.registry)
+    return Decided(run=approved, note=None)
+
+
+def _merge_hint(state: RunState) -> str:
+    if state == "awaiting_plan_approval":
+        return "It waits for your plan decision first."
+    if state == "merged":
+        return "It is merged already."
+    return _hint(state)
 
 
 # ------------------------------------------------------------------ shared

@@ -16,10 +16,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import CLIConnectionError
 
 from factory_engine import events as ev
 from factory_engine.agents import fake
-from factory_engine.agents.fake import FakeAgentRunner, rate_limit, result, system_init
+from factory_engine.agents.fake import HOLD, FakeAgentRunner, rate_limit, result, system_init
 from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder, not_running
 from factory_engine.agents.watchdog import RESUME_PROMPT
 from factory_engine.config import Settings, default_settings, merge_settings, parse_overrides
@@ -163,6 +164,9 @@ class Act:
     worktree: dict[str, str] = field(default_factory=dict)
     docs: dict[str, str] = field(default_factory=dict)  # in the run folder
     extra: tuple[fake.Step, ...] = ()
+    ends: bool = True  # False: no closing result (the `extra` messages end the turn)
+    outside: dict[Path, str] = field(default_factory=dict)  # absolute paths an agent mustn't write
+    error: Exception | None = None  # the runner raises this after the session starts
 
 
 class Agents:
@@ -181,9 +185,15 @@ class Agents:
         self.specs.append(spec)
         write(spec.worktree, act.worktree)
         write(spec.run_folder, act.docs)
+        for path, text in act.outside.items():
+            path.write_text(text, encoding="utf-8")
         session = spec.resume or f"{spec.role}-{len(self.specs)}"
         self.sessions.append(session)
-        self._fake = FakeAgentRunner([[system_init(session), *act.extra, result(session, 100, 20)]])
+        if act.error is not None:
+            recorder.record(system_init(session))
+            raise act.error
+        ending = [result(session, 100, 20)] if act.ends else []
+        self._fake = FakeAgentRunner([[system_init(session), *act.extra, *ending]])
         return await self._fake.run(spec, recorder)
 
     async def interrupt(self) -> None:
@@ -227,6 +237,39 @@ class RecordingHooks(Hooks):
     async def publish(self, pipeline: Pipeline, run: Run) -> Run:
         self.calls.append(("publish", run.state))
         return run
+
+
+class StoppingHooks(Hooks):
+    """Hooks that stop the run in `stop_in` (`update` or `publish`) and return the moved run
+    without saving it: the pipeline must save it."""
+
+    def __init__(self, stop_in: str) -> None:
+        self.stop_in = stop_in
+
+    def _stop(self, pipeline: Pipeline, run: Run) -> Run:
+        moved = move(run, "needs_you", log=pipeline.events)
+        pipeline.events.append(ev.NeedsYou(reason=f"the {self.stop_in} hook stopped"))
+        return moved
+
+    async def update(self, pipeline: Pipeline, run: Run) -> Run:
+        return self._stop(pipeline, run) if self.stop_in == "update" else run
+
+    async def publish(self, pipeline: Pipeline, run: Run) -> Run:
+        return self._stop(pipeline, run) if self.stop_in == "publish" else run
+
+
+class ConflictHooks(Hooks):
+    """An update that sends the builder back once (as a rebase conflict would), then passes."""
+
+    def __init__(self) -> None:
+        self.updates = 0
+
+    async def update(self, pipeline: Pipeline, run: Run) -> Run:
+        self.updates += 1
+        if self.updates > 1:
+            return run
+        pipeline.tell_builder("rebase conflict in src/calc.py: resolve it.")
+        return move(run, "building", log=pipeline.events)
 
 
 # ------------------------------------------------------------------ the fixture repo
@@ -756,3 +799,147 @@ def test_a_malformed_review_retries_the_reviewer_not_the_builder(world_at: Maker
     assert world.doc("attempts/review-1.md") == REVIEW_MALFORMED
     assert done.run.metrics.important_findings == 0
     assert world.commits()[-1] == "factory(run-1): reviewer attempt 2"
+
+
+# ------------------------------------------------------------------ stops and failures
+
+
+def needs_you_reasons(folder: Path) -> list[str]:
+    return [
+        event.body.reason for event in read_events(folder) if isinstance(event.body, ev.NeedsYou)
+    ]
+
+
+def test_a_stalled_agent_that_wrote_outside_the_worktree_fails_the_check(
+    world_at: Maker,
+) -> None:
+    world = world_at("pending")
+    stalled = Act("planner", extra=(HOLD,), ends=False, outside={world.repo / "planted.txt": "x"})
+
+    done = world.advance(Agents([stalled]))
+
+    assert (done.stop, done.run.state) == ("needs_you", "needs_you")
+    assert summary(world.run_folder) == [
+        "state pending>planning",
+        "start planner 1",
+        "state planning>needs_you",
+        "needs_you",  # the stall
+        "finish planner 1 interrupted",
+        "needs_you",  # the check after it
+    ]
+    assert ("post_stage.main_checkout", False) in post_stage_results(world.run_folder)
+    reason = needs_you_reasons(world.run_folder)[-1]
+    assert "post_stage.main_checkout" in reason and "no tool activity" in reason
+    assert world.run() == done.run
+
+
+@pytest.mark.parametrize("planted", [False, True])
+def test_a_turn_cap_pauses_unless_the_check_after_it_fails(world_at: Maker, planted: bool) -> None:
+    world = world_at("pending")
+    capped = Act(
+        "planner",
+        extra=(result("planner-1", 10, 5, is_error=True, subtype="error_max_turns"),),
+        ends=False,
+        outside={world.repo / "planted.txt": "x"} if planted else {},
+    )
+
+    done = world.advance(Agents([capped]))
+
+    stopped = [
+        "state pending>planning",
+        "start planner 1",
+        "state planning>paused",
+        "paused turn_cap",
+        "finish planner 1 failed",
+    ]
+    checks = post_stage_results(world.run_folder)
+    assert len(checks) == 4
+    if planted:
+        assert (done.stop, done.run.state, done.run.pause) == ("needs_you", "needs_you", None)
+        assert summary(world.run_folder) == [*stopped, "state paused>needs_you", "needs_you"]
+        assert "turn cap" in needs_you_reasons(world.run_folder)[-1]
+    else:
+        assert (done.stop, done.run.state) == ("paused", "paused")
+        assert done.run.pause is not None and done.run.pause.reason == "turn_cap"
+        assert summary(world.run_folder) == stopped
+        assert all(passed for _, passed in checks)
+    assert world.run() == done.run
+
+
+def test_a_runner_error_stops_the_run_for_you_after_the_check(world_at: Maker) -> None:
+    world = world_at("pending")
+    secret = "zq81Kp0vXr4mWb7"
+    dropped = Act(
+        "planner",
+        docs={"plan.md": PLAN},
+        error=CLIConnectionError(f"connection dropped: API_TOKEN={secret}"),
+    )
+
+    done = world.advance(Agents([dropped]))
+
+    assert (done.stop, done.run.state) == ("needs_you", "needs_you")
+    assert summary(world.run_folder) == [
+        "state pending>planning",
+        "start planner 1",
+        "finish planner 1 failed",
+        "state planning>needs_you",
+        "needs_you",
+    ]
+    checks = post_stage_results(world.run_folder)
+    assert len(checks) == 4 and all(passed for _, passed in checks)
+    reason = needs_you_reasons(world.run_folder)[-1]
+    assert "CLIConnectionError" in reason and "connection dropped" in reason
+    log = (world.run_folder / "events.jsonl").read_text(encoding="utf-8")
+    assert secret not in log
+    run = world.run()
+    assert run == done.run
+    assert run.session_ids == {"planner": "planner-1"}  # kept for a resume
+    assert run.last_completed_step == "planner 1 started"
+    assert world.commits() == []
+
+
+def test_an_engine_bug_inside_an_agent_run_is_raised(world_at: Maker) -> None:
+    world = world_at("pending")
+    with pytest.raises(KeyError, match="oops"):
+        world.advance(Agents([Act("planner", error=KeyError("oops"))]))
+
+
+# ------------------------------------------------------------------ hooks
+
+
+@pytest.mark.parametrize("stop_in", ["update", "publish"])
+def test_a_hook_that_stops_the_run_is_saved(world_at: Maker, stop_in: str) -> None:
+    world = world_at("testing")
+    acts = [tester(), builder()] + ([reviewer()] if stop_in == "publish" else [])
+    agents = Agents(acts)
+
+    done = world.advance(agents, StoppingHooks(stop_in))
+
+    assert (done.stop, done.run.state) == ("needs_you", "needs_you")
+    assert not agents.acts
+    run = world.run()
+    assert run == done.run
+    assert world.registry.get_run(REPO, RUN_ID) == run
+    assert needs_you_reasons(world.run_folder) == [f"the {stop_in} hook stopped"]
+
+
+def test_an_update_hook_can_send_the_run_back_to_the_builder(world_at: Maker) -> None:
+    world = world_at("testing")
+    agents = Agents(
+        [
+            tester(),
+            builder(GOOD_BUILD, "attempt 1"),
+            builder(BETTER_BUILD, "attempt 2"),
+            reviewer(),
+        ]
+    )
+
+    done = world.advance(agents, ConflictHooks())
+
+    assert (done.stop, done.run.state) == ("awaiting_merge", "awaiting_merge")
+    events = summary(world.run_folder)
+    assert events[events.index("state building>updating") + 1] == "state updating>building"
+    first, second = agents.of("builder")
+    assert second.resume == agents.sessions[1]
+    assert second.prompt.startswith("rebase conflict in src/calc.py")
+    assert world.doc("attempts/handoff-builder-1.md") == handoff("attempt 1")

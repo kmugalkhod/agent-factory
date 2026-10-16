@@ -298,6 +298,29 @@ def test_rebase_continue_with_part_of_a_conflict_left_reports_it_again(
     assert again.conflicts == ("README.md",)
 
 
+def test_rebase_in_progress_is_true_only_while_a_conflict_waits(repos: Repos) -> None:
+    worktree = repos.worktree()
+    assert not git_ops.rebase_in_progress(repos.git, worktree, run_id=3, slug=SLUG)
+    (worktree / "README.md").write_text("run edit\n", encoding="utf-8")
+    commit_stage(repos.git, worktree, run_id=3, slug=SLUG, role="builder", attempt=1)
+    repos.commit_on_seed("README.md", "main edit\n")
+    rebase_onto_main(repos.git, worktree, run_id=3, slug=SLUG)
+    assert git_ops.rebase_in_progress(repos.git, worktree, run_id=3, slug=SLUG)
+    git_ops.rebase_abort(repos.git, worktree, run_id=3, slug=SLUG)
+    assert not git_ops.rebase_in_progress(repos.git, worktree, run_id=3, slug=SLUG)
+    assert repos.run(worktree, "branch", "--show-current") == "factory/run-3-status-json"
+
+
+def test_main_moved_tells_whether_main_has_commits_the_branch_lacks(repos: Repos) -> None:
+    worktree = repos.worktree()
+    commit_stage(repos.git, worktree, run_id=3, slug=SLUG, role="builder", attempt=1)
+    assert not git_ops.main_moved(repos.git, worktree)
+    repos.commit_on_seed("other.txt", "from main\n")
+    assert git_ops.main_moved(repos.git, worktree)  # it fetches main first
+    rebase_onto_main(repos.git, worktree, run_id=3, slug=SLUG)
+    assert not git_ops.main_moved(repos.git, worktree)
+
+
 def test_rebase_refuses_when_the_worktree_is_on_another_branch(repos: Repos) -> None:
     worktree = repos.worktree()
     repos.run(worktree, "switch", "-c", "elsewhere")
