@@ -61,40 +61,7 @@ _SUBSTITUTIONS = ("`", "$(", "\n", "\r")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _PROGRAM_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
 _PYTHON = re.compile(r"python[0-9.]*|py|pypy[0-9.]*")
-_PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
-_VITEST_COMMANDS = frozenset({"run", "watch", "dev"})
-_RUN_LAUNCHERS = frozenset({"uv", "poetry", "pipenv"})  # `<launcher> run [options] <program>`
-_NODE_LAUNCHERS = frozenset({"npx", "npm", "pnpm", "yarn", "bunx"})
-# Launcher options followed by a separate value, so the value isn't taken for the program.
-_UV_VALUE_OPTIONS = frozenset(
-    {
-        "--with",
-        "--with-editable",
-        "--with-requirements",
-        "--python",
-        "-p",
-        "--project",
-        "--directory",
-        "--extra",
-        "--group",
-        "--only-group",
-        "--no-group",
-        "--env-file",
-        "--package",
-        "--index",
-        "--default-index",
-        "--index-url",
-        "-i",
-        "--extra-index-url",
-        "--find-links",
-        "-f",
-        "--config-file",
-        "--cache-dir",
-    }
-)
-_NODE_VALUE_OPTIONS = frozenset(
-    {"-p", "--package", "-c", "--call", "--filter", "-F", "--dir", "-C", "--workspace", "-w"}
-)
+_PYTEST = re.compile(r"py\.?test(-?[0-9.]+)?")
 _COLLECTION_FAILURE = "collection failure"  # pytest's message for a file it couldn't collect
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 # A test case's child element and the outcome it means, most serious first.
@@ -149,41 +116,70 @@ def _needs_shell(command: str, what: str) -> str:
     )
 
 
+type _Found = tuple[Framework | None, int]
+"""A way the command could start: the runner (None for any other program) and the index just
+after the runner's name in argv."""
+_NOT_A_RUNNER: _Found = (None, 0)
+
+
 def detect_runner(argv: Sequence[str]) -> Framework | None:
-    """`pytest` or `vitest` when the command runs one of them, else None."""
+    """`pytest` or `vitest` when the command runs one of them, else None. Raises ConfigError
+    when that can't be told for certain (see `locate_runner`)."""
     return locate_runner(argv)[0]
 
 
 def locate_runner(argv: Sequence[str]) -> tuple[Framework | None, int]:
-    """The test runner the command starts, and the index in `argv` right after the runner's
-    own name (`pytest`, `-m pytest`, `vitest` or `vitest run`): where the engine's options go,
-    ahead of the runner's arguments and any `--`. Only the command position is looked at:
-    the program itself, `<python> -m pytest`, or the program a known launcher starts (`uv
-    run`, `poetry run`, `pipenv run`, `npx`, `npm exec`, `pnpm [exec|dlx]`, `yarn [exec|dlx]`).
-    Arguments never pick the runner. Returns (None, 0) for anything else."""
-    i = 0
-    while i < len(argv):
-        name = _program_name(argv[i])
-        if name in ("pytest", "py.test"):
-            return "pytest", i + 1
-        if name == "vitest":
-            after = i + 2 if i + 1 < len(argv) and argv[i + 1] in _VITEST_COMMANDS else i + 1
-            return "vitest", after
-        if _PYTHON.fullmatch(name):
-            return _python_module(argv, i + 1)
-        if name in _RUN_LAUNCHERS:
-            if i + 1 >= len(argv) or argv[i + 1] != "run":
-                return None, 0
-            i = _skip_options(argv, i + 2, _UV_VALUE_OPTIONS if name == "uv" else frozenset())
-        elif name in _NODE_LAUNCHERS:
-            i = _skip_options(argv, i + 1, _NODE_VALUE_OPTIONS)
-            if i < len(argv) and argv[i] in ("exec", "dlx", "x"):
-                i = _skip_options(argv, i + 1, _NODE_VALUE_OPTIONS)
-            elif name == "npm":
-                return None, 0  # `npm test` and other npm commands run a package script
-        else:
-            return None, 0
-    return None, 0
+    """The test runner the command starts, and where the engine's report options go.
+
+    Only the command position counts, never an argument: the program itself (`pytest`,
+    `py.test`, `vitest`, with any folder or Windows extension), `<python> [options] -m
+    pytest`, or the program a known launcher starts after its own options: `uv [options] run
+    [options]` (also `uv run -m pytest`, `uv tool run`, `uvx`), `poetry`/`pdm`/`pipenv ...
+    run`, `npx`, `npm exec`, `pnpm [exec|dlx]`, `yarn [exec|dlx]`.
+
+    The options go after the user's own (so the engine's win: pytest and vitest take the last
+    value given) and before the runner's `--`, after which they would be file names. Returns
+    `(None, len(argv))` for any other program.
+
+    Raises ConfigError when the command form can't be read for certain: a launcher option the
+    engine doesn't know, if one reading of it starts pytest or vitest and another doesn't;
+    `npm`/`pnpm`/`yarn run pytest|vitest` (a package script or the program, can't tell); and
+    options that would stop the report (`-p no:junitxml`, vitest's own `--outputFile`).
+    """
+    found = _starts(argv, 0)
+    if len(found) > 1 and any(runner is not None for runner, _ in found):
+        raise ConfigError(_unclear(argv, "it uses a launcher option the engine doesn't know"))
+    runner, after = found.pop() if len(found) == 1 else _NOT_A_RUNNER
+    if runner is None:
+        return None, len(argv)
+    end = next((i for i in range(after, len(argv)) if argv[i] == "--"), len(argv))
+    _refuse_report_blockers(argv, runner, after, end)
+    return runner, end
+
+
+def _unclear(argv: Sequence[str], why: str) -> str:
+    return (
+        f"the engine can't tell for certain how `{shlex.join(argv)}` starts its tests: {why}. "
+        "Write the command in a plain form in factory.yaml `commands`, for example "
+        "`uv run pytest -x`, `python -m pytest` or `npx vitest run`."
+    )
+
+
+def _refuse_report_blockers(argv: Sequence[str], runner: Framework, start: int, end: int) -> None:
+    args = list(argv[start:end])
+    if runner == "pytest":
+        for i, arg in enumerate(args):
+            plugin = args[i + 1] if arg == "-p" and i + 1 < len(args) else arg.removeprefix("-p")
+            if arg.startswith("-p") and plugin.strip() == "no:junitxml":
+                raise ConfigError(
+                    f"`{shlex.join(argv)}` turns off pytest's JUnit report (`-p no:junitxml`), "
+                    "which the tester and builder gates read. Remove that option."
+                )
+    elif any(arg.startswith(("--outputFile", "--output-file")) for arg in args):
+        raise ConfigError(
+            f"`{shlex.join(argv)}` sets vitest's `--outputFile`; the engine sets it to write "
+            "its own JUnit report. Remove that option from factory.yaml `commands`."
+        )
 
 
 def _program_name(arg: str) -> str:
@@ -194,30 +190,343 @@ def _program_name(arg: str) -> str:
     return name
 
 
-def _python_module(argv: Sequence[str], start: int) -> tuple[Framework | None, int]:
-    """`python [options] -m pytest`: pytest, with options going after `pytest`."""
+def _starts(argv: Sequence[str], i: int) -> set[_Found]:
+    """Every way the program at `argv[i]` could start (more than one when a launcher option
+    the engine doesn't know may or may not take a value)."""
+    if i >= len(argv):
+        return {_NOT_A_RUNNER}
+    name = _program_name(argv[i])
+    if _PYTEST.fullmatch(name):
+        return {("pytest", i + 1)}
+    if name == "vitest":
+        return {("vitest", i + 1)}
+    if _PYTHON.fullmatch(name):
+        return {_python_module(argv, i + 1)}
+    if name in _LAUNCHERS:
+        return _launcher(argv, i, name)
+    return {_NOT_A_RUNNER}
+
+
+def _python_module(argv: Sequence[str], start: int) -> _Found:
+    """`python [options] -m pytest`. Python's own option grammar: short flags may be combined
+    (`-Bu`), `-W` and `-X` take a value (attached or next), `-m` and `-c` end the options."""
     i = start
     while i < len(argv):
         arg = argv[i]
-        if arg == "-m":
-            module = argv[i + 1] if i + 1 < len(argv) else ""
-            return ("pytest", i + 2) if module in ("pytest", "py.test") else (None, 0)
-        if arg.startswith("-m"):  # `-mpytest`
-            return ("pytest", i + 1) if arg[2:] in ("pytest", "py.test") else (None, 0)
-        if not arg.startswith("-") or arg in ("-", "-c"):
-            return None, 0  # a script, stdin or `-c code`: not pytest
-        i += 2 if arg in _PYTHON_VALUE_OPTIONS else 1
-    return None, 0
+        if arg == "--check-hash-based-pycs":
+            i += 2
+            continue
+        if not arg.startswith("-") or arg in ("-", "--") or arg in ("--help", "--version"):
+            return _NOT_A_RUNNER  # a script, stdin, or nothing runs
+        if arg.startswith("--"):
+            i += 1
+            continue
+        step = 1
+        for k, char in enumerate(arg[1:], start=1):
+            rest = arg[k + 1 :]
+            if char == "m":
+                module, after = (rest, i + 1) if rest else (_at(argv, i + 1), i + 2)
+                return ("pytest", after) if _PYTEST.fullmatch(module) else _NOT_A_RUNNER
+            if char == "c":
+                return _NOT_A_RUNNER
+            if char in "WX":
+                step = 1 if rest else 2
+                break
+        i += step
+    return _NOT_A_RUNNER
 
 
-def _skip_options(argv: Sequence[str], start: int, takes_value: frozenset[str]) -> int:
-    """The index of the first argument from `start` that isn't a launcher option (or `--`)."""
-    i = start
-    while i < len(argv) and argv[i].startswith("-"):
-        if argv[i] == "--":
-            return i + 1
-        i += 2 if argv[i] in takes_value else 1
-    return i
+def _launcher(argv: Sequence[str], i: int, name: str) -> set[_Found]:
+    found: set[_Found] = set()
+    if name in ("uvx", "bunx", "npx"):
+        options = _UV_RUN_OPTIONS if name == "uvx" else _NODE_OPTIONS
+        for k in _after_options(argv, i + 1, options):
+            found |= _uv_program(argv, k) if name == "uvx" else _starts(argv, k)
+        return found
+    for k in _after_options(argv, i + 1, _GLOBAL_OPTIONS[name]):
+        command = _at(argv, k)
+        if name == "uv":
+            if command == "run":
+                run_options = k + 1
+            elif command == "tool" and _at(argv, k + 1) == "run":
+                run_options = k + 2
+            else:
+                found.add(_NOT_A_RUNNER)
+                continue
+            for j in _after_options(argv, run_options, _UV_RUN_OPTIONS):
+                found |= _uv_program(argv, j)
+        elif name in ("poetry", "pdm", "pipenv"):
+            if command == "run":
+                for j in _after_options(argv, k + 1, _GLOBAL_OPTIONS[name]):
+                    found |= _starts(argv, j)
+            else:
+                found.add(_NOT_A_RUNNER)
+        else:  # npm, pnpm, yarn
+            found |= _node_command(argv, k, name)
+    return found
+
+
+def _uv_program(argv: Sequence[str], k: int) -> set[_Found]:
+    """What `uv run` starts at `argv[k]`: a program, or a module with `-m`/`--module`."""
+    arg = _at(argv, k)
+    if arg in ("-m", "--module") or arg.startswith("--module="):
+        module, after = (_at(argv, k + 1), k + 2) if "=" not in arg else (arg[9:], k + 1)
+        return {("pytest", after) if _PYTEST.fullmatch(module) else _NOT_A_RUNNER}
+    return _starts(argv, k)
+
+
+def _node_command(argv: Sequence[str], k: int, name: str) -> set[_Found]:
+    """`npm|pnpm|yarn <command>`: `exec`/`dlx`/`x` start a program; `pnpm`/`yarn` also run a
+    program named directly (`pnpm vitest`); `run` runs a package script, or for some the
+    program of that name, so `run vitest` can't be read for certain."""
+    command = _at(argv, k)
+    if command in ("exec", "dlx", "x"):
+        found: set[_Found] = set()
+        for j in _after_options(argv, k + 1, _NODE_OPTIONS):
+            found |= _starts(argv, j)
+        return found
+    if command in ("run", "run-script"):
+        script = next((a for a in argv[k + 1 :] if not a.startswith("-")), "")
+        if _PYTEST.fullmatch(_program_name(script)) or _program_name(script) == "vitest":
+            raise ConfigError(
+                _unclear(argv, f"`{name} {command} {script}` may run a package script")
+            )
+        return {_NOT_A_RUNNER}
+    if name != "npm" and command and not command.startswith("-"):
+        program = _program_name(command)
+        if _PYTEST.fullmatch(program) or program == "vitest":
+            return _starts(argv, k)
+    return {_NOT_A_RUNNER}
+
+
+def _after_options(argv: Sequence[str], start: int, options: "_Options") -> set[int]:
+    """Where a launcher's options starting at `start` may end: the index of the first argument
+    that isn't one of them (after a `--`, the next one). An option the engine doesn't know
+    may or may not take a value, so both readings are kept."""
+    ends: set[int] = set()
+    seen: set[int] = set()
+    todo = [start]
+    while todo:
+        i = todo.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        arg = _at(argv, i)
+        stop = arg in options.stops or ("--module" in options.stops and arg.startswith("--module="))
+        if not arg.startswith("-") or arg == "-" or stop:
+            ends.add(i)
+        elif arg == "--":
+            ends.add(i + 1)
+        elif arg in options.values:
+            todo.append(i + 2)
+        elif arg in options.flags or (arg.startswith("--") and "=" in arg):
+            todo.append(i + 1)
+        elif not arg.startswith("--") and arg[:2] in options.values:
+            todo.append(i + 1)  # a short option with its value attached: `-Fweb`
+        else:
+            todo += [i + 1, i + 2]  # unknown: a flag, or followed by its value
+    return ends
+
+
+def _at(argv: Sequence[str], i: int) -> str:
+    return argv[i] if 0 <= i < len(argv) else ""
+
+
+@dataclass(frozen=True)
+class _Options:
+    """A launcher's options: those followed by a value, flags, and those that end them."""
+
+    values: frozenset[str]
+    flags: frozenset[str] = frozenset()
+    stops: frozenset[str] = frozenset()
+
+
+_UV_GLOBAL_FLAGS = frozenset(
+    {
+        "-q",
+        "--quiet",
+        "-v",
+        "--verbose",
+        "-n",
+        "--no-cache",
+        "--offline",
+        "--no-offline",
+        "--native-tls",
+        "--no-native-tls",
+        "--no-progress",
+        "--no-config",
+        "--preview",
+        "--no-preview",
+        "--managed-python",
+        "--no-managed-python",
+        "--no-python-downloads",
+        "--allow-python-downloads",
+    }
+)
+_UV_GLOBAL_VALUES = frozenset(
+    {
+        "--directory",
+        "--project",
+        "--cache-dir",
+        "--config-file",
+        "--python",
+        "-p",
+        "--color",
+        "--allow-insecure-host",
+        "--python-preference",
+    }
+)
+_UV_RUN_OPTIONS = _Options(
+    values=_UV_GLOBAL_VALUES
+    | {
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--from",
+        "--extra",
+        "--no-extra",
+        "--group",
+        "--only-group",
+        "--no-group",
+        "--env-file",
+        "--package",
+        "--index",
+        "--default-index",
+        "--index-url",
+        "-i",
+        "--extra-index-url",
+        "--find-links",
+        "-f",
+        "--index-strategy",
+        "--keyring-provider",
+        "--resolution",
+        "--prerelease",
+        "--exclude-newer",
+        "--link-mode",
+        "--refresh-package",
+        "--reinstall-package",
+        "--upgrade-package",
+        "-P",
+        "--no-binary-package",
+        "--no-build-package",
+        "--python-platform",
+    },
+    flags=_UV_GLOBAL_FLAGS
+    | {
+        "--frozen",
+        "--locked",
+        "--no-sync",
+        "--all-extras",
+        "--all-groups",
+        "--all-packages",
+        "--dev",
+        "--no-dev",
+        "--only-dev",
+        "--no-default-groups",
+        "--isolated",
+        "--active",
+        "--no-active",
+        "--no-editable",
+        "--exact",
+        "--inexact",
+        "--no-project",
+        "--no-env-file",
+        "--no-install-project",
+        "--no-install-workspace",
+        "--no-install-local",
+        "--compile-bytecode",
+        "--refresh",
+        "-U",
+        "--upgrade",
+        "--reinstall",
+        "--no-build-isolation",
+        "--no-build",
+        "--no-binary",
+        "--no-sources",
+        "-s",
+        "--script",
+        "--gui-script",
+        "--show-resolution",
+    },
+    stops=frozenset({"-m", "--module"}),
+)
+_NODE_OPTIONS = _Options(
+    values=frozenset(
+        {
+            "-p",
+            "--package",
+            "-c",
+            "--call",
+            "--prefix",
+            "-w",
+            "--workspace",
+            "--filter",
+            "-F",
+            "--dir",
+            "-C",
+            "--cwd",
+            "--userconfig",
+            "--cache",
+            "--loglevel",
+            "--reporter",
+        }
+    ),
+    flags=frozenset(
+        {
+            "-y",
+            "--yes",
+            "--no",
+            "-q",
+            "--quiet",
+            "-s",
+            "--silent",
+            "--no-install",
+            "--ignore-existing",
+            "-ws",
+            "--workspaces",
+            "--include-workspace-root",
+            "-r",
+            "--recursive",
+            "--workspace-root",
+            "--parallel",
+            "--stream",
+            "--if-present",
+            "--shell-mode",
+        }
+    ),
+)
+_POETRY_OPTIONS = _Options(
+    values=frozenset({"-C", "--directory", "-P", "--project"}),
+    flags=frozenset(
+        {
+            "-q",
+            "--quiet",
+            "-v",
+            "-vv",
+            "-vvv",
+            "--verbose",
+            "-n",
+            "--no-interaction",
+            "--ansi",
+            "--no-ansi",
+            "--no-plugins",
+            "--no-cache",
+        }
+    ),
+)
+_GLOBAL_OPTIONS: Mapping[str, _Options] = {
+    "uv": _Options(values=_UV_GLOBAL_VALUES, flags=_UV_GLOBAL_FLAGS),
+    "poetry": _POETRY_OPTIONS,
+    "pdm": _Options(
+        values=frozenset({"-p", "--project"}),
+        flags=frozenset({"-q", "--quiet", "-v", "--verbose", "-g", "--global", "-l", "--list"}),
+    ),
+    "pipenv": _Options(values=frozenset({"--python"}), flags=frozenset({"-q", "--quiet"})),
+    "npm": _NODE_OPTIONS,
+    "pnpm": _NODE_OPTIONS,
+    "yarn": _NODE_OPTIONS,
+}
+_LAUNCHERS = frozenset({"uvx", "bunx", "npx", *_GLOBAL_OPTIONS})
 
 
 def report_args(runner: Framework | None, report: Path, cache: Path) -> list[str]:
@@ -241,9 +550,8 @@ def report_args(runner: Framework | None, report: Path, cache: Path) -> list[str
 def with_report_args(
     argv: Sequence[str], report: Path, cache: Path
 ) -> tuple[list[str], Framework | None]:
-    """`argv` with `report_args` placed right after the runner's name, ahead of the runner's
-    own arguments and any `--` (after which they would be taken as file names), and the
-    runner. Unchanged for other runners."""
+    """`argv` with `report_args` placed where `locate_runner` says (after the user's own
+    options, before the runner's `--`), and the runner. Unchanged for other runners."""
     runner, at = locate_runner(argv)
     full = list(argv)
     full[at:at] = report_args(runner, report, cache)
@@ -449,11 +757,11 @@ def run_repo_command(
     program = resolve_program(argv[0], worktree, env)
     report_path = run_folder / f"junit-{stage}-{attempt}.xml"
     output_path = run_folder / f"test-output-{stage}-{attempt}.txt"
+    full, framework = with_report_args([str(program), *argv[1:]], report_path, run_folder / "cache")
     try:  # a report left from an earlier run must never stand in for this one
         report_path.unlink(missing_ok=True)
     except OSError as err:
         raise GateError(f"{report_path}: can't remove the old report ({err}).") from err
-    full, framework = with_report_args([str(program), *argv[1:]], report_path, run_folder / "cache")
 
     started = timer()
     try:

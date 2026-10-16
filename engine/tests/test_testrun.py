@@ -126,9 +126,11 @@ def test_parse_command_refuses_unusable_commands(command: str) -> None:
     [
         (["pytest"], "pytest"),
         (["py.test", "-q"], "pytest"),
+        (["pytest-3"], "pytest"),
         (["uv", "run", "pytest"], "pytest"),
         (["python", "-m", "pytest", "tests"], "pytest"),
         (["C:/venv/Scripts/pytest.exe"], "pytest"),
+        (["C:\\venv\\Scripts\\py.test.EXE"], "pytest"),
         (["uv", "run", "pytest", "tests/test_pytest_helpers.py"], "pytest"),
         (["npx", "vitest", "run"], "vitest"),
         (["pnpm", "exec", "vitest"], "vitest"),
@@ -140,27 +142,83 @@ def test_parse_command_refuses_unusable_commands(command: str) -> None:
         # Only the command position picks the runner, never an argument.
         (["python", "-m", "unittest", "discover", "-s", "tests/pytest"], None),
         (["python", "scripts/run.py", "pytest"], None),
+        (["python", "-c", "import pytest; pytest.main()"], None),
+        (["python", "-m", "pytest_helper"], None),
         (["node", "scripts/vitest.js"], None),
         (["make", "pytest"], None),
         (["uv", "run", "python", "-m", "unittest", "tests/test_vitest.py"], None),
         (["uv", "sync", "pytest"], None),
-        # Launchers and their options.
-        (["python3.12", "-X", "utf8", "-m", "pytest"], "pytest"),
+        (["uv", "run", "--unknown-flag", "python", "check.py"], None),  # unclear, but no runner
+        # Python's own options.
+        (["python3.12", "-X", "dev", "-m", "pytest"], "pytest"),
+        (["python", "-Xdev", "-Wdefault", "-m", "pytest"], "pytest"),
+        (["python", "-B", "-W", "error", "-m", "pytest"], "pytest"),
+        (["python", "-Bu", "-m", "pytest"], "pytest"),
         (["python", "-mpytest"], "pytest"),
+        (["py", "-3.12", "-m", "pytest"], "pytest"),
         (["C:/Python312/python.exe", "-m", "pytest"], "pytest"),
+        # Launchers and their options.
+        (["uv", "--directory", "app", "run", "pytest"], "pytest"),
+        (["uv", "--directory=app", "run", "pytest"], "pytest"),
+        (["uv", "-q", "--project", ".", "run", "--frozen", "pytest", "-x"], "pytest"),
         (["uv", "run", "--frozen", "--with", "pytest-xdist", "pytest"], "pytest"),
         (["uv", "run", "--", "pytest"], "pytest"),
         (["uv", "run", "python", "-m", "pytest"], "pytest"),
-        (["poetry", "run", "pytest"], "pytest"),
+        (["uv", "run", "-m", "pytest"], "pytest"),
+        (["uv", "run", "--module=pytest"], "pytest"),
+        (["uv", "tool", "run", "pytest"], "pytest"),
+        (["uvx", "--from", "pytest==9.1", "pytest"], "pytest"),
+        (["poetry", "-C", "app", "run", "pytest"], "pytest"),
+        (["poetry", "run", "python", "-m", "pytest"], "pytest"),
+        (["pdm", "run", "pytest"], "pytest"),
+        (["pipenv", "run", "pytest"], "pytest"),
         (["npx", "--yes", "vitest"], "vitest"),
         (["npm", "exec", "--", "vitest"], "vitest"),
+        (["npm", "--prefix", "web", "exec", "vitest"], "vitest"),
         (["pnpm", "vitest", "run"], "vitest"),
         (["pnpm", "--filter", "web", "exec", "vitest"], "vitest"),
+        (["pnpm", "-F", "web", "exec", "vitest"], "vitest"),
+        (["pnpm", "-Fweb", "exec", "vitest"], "vitest"),
+        (["pnpm", "-C", "web", "dlx", "vitest"], "vitest"),
         (["yarn", "vitest"], "vitest"),
+        (["yarn", "--cwd", "web", "exec", "vitest"], "vitest"),
     ],
 )
 def test_detect_runner(argv: list[str], runner: str | None) -> None:
     assert detect_runner(argv) == runner
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["uv", "--new-global-option", "run", "pytest"],  # takes a value, or not?
+        ["uv", "run", "--new-run-option", "pytest"],
+        ["poetry", "--new-option", "run", "pytest"],
+        ["pnpm", "--new-option", "vitest"],
+        ["npm", "run", "vitest"],  # a package script named vitest, or vitest itself?
+        ["pnpm", "run", "vitest"],
+        ["yarn", "run", "vitest"],
+        ["npm", "run-script", "pytest"],
+    ],
+)
+def test_a_command_form_that_cant_be_read_for_certain_is_refused(argv: list[str]) -> None:
+    with pytest.raises(ConfigError, match="plain form"):
+        detect_runner(argv)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pytest", "-p", "no:junitxml"],
+        ["pytest", "-pno:junitxml", "tests"],
+        ["uv", "run", "pytest", "-x", "-p", "no:junitxml"],
+        ["npx", "vitest", "run", "--outputFile=results.json"],
+        ["npx", "vitest", "--outputFile.json", "out.json"],
+    ],
+)
+def test_options_that_stop_the_report_are_refused(argv: list[str]) -> None:
+    with pytest.raises(ConfigError, match="Remove that option"):
+        detect_runner(argv)
 
 
 R = "REPORT"  # stands for the engine's options in the expected commands below
@@ -170,20 +228,30 @@ R = "REPORT"  # stands for the engine's options in the expected commands below
     ("argv", "expected"),
     [
         (["pytest"], ["pytest", R]),
-        (["pytest", "-x", "tests"], ["pytest", R, "-x", "tests"]),
+        (["pytest", "-x", "tests"], ["pytest", "-x", "tests", R]),
         (["pytest", "--", "tests"], ["pytest", R, "--", "tests"]),
         (["python", "-m", "pytest", "--", "tests"], ["python", "-m", "pytest", R, "--", "tests"]),
         (
             ["uv", "run", "pytest", "-x", "--", "tests"],
-            ["uv", "run", "pytest", R, "-x", "--", "tests"],
+            ["uv", "run", "pytest", "-x", R, "--", "tests"],
         ),
         (["uv", "run", "--", "pytest", "--", "t"], ["uv", "run", "--", "pytest", R, "--", "t"]),
+        (["uv", "run", "--", "pytest", "-q"], ["uv", "run", "--", "pytest", "-q", R]),
+        # The user's own report options come first, so the engine's (the last given) win.
+        (["pytest", "--junitxml=results.xml"], ["pytest", "--junitxml=results.xml", R]),
+        (
+            ["pytest", "-o", "junit_family=xunit2", "--", "tests"],
+            ["pytest", "-o", "junit_family=xunit2", R, "--", "tests"],
+        ),
         (["npx", "vitest", "run", "--", "src"], ["npx", "vitest", "run", R, "--", "src"]),
-        (["pnpm", "vitest", "--", "src"], ["pnpm", "vitest", R, "--", "src"]),
+        (
+            ["pnpm", "vitest", "--reporter=dot", "--", "src"],
+            ["pnpm", "vitest", "--reporter=dot", R, "--", "src"],
+        ),
         (["python", "check.py", "--", "x"], ["python", "check.py", "--", "x"]),
     ],
 )
-def test_report_options_go_right_after_the_runner(
+def test_report_options_go_after_the_users_and_before_the_runners_double_dash(
     tmp_path: Path, argv: list[str], expected: list[str]
 ) -> None:
     report, cache = tmp_path / "junit.xml", tmp_path / "cache"
