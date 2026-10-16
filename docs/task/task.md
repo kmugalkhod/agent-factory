@@ -623,7 +623,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Unit and scenario tests.
 - **Depends on:** 2.20, 2.22
 
-### [ ] 2.28 CLI: run commands
+### [x] 2.28 CLI: run commands
 
 - **What:** Add the `factory` command (Typer) with these subcommands:
   - `start` (`--feature`, `--spec`, `--new-project`; the repo is taken from the current folder unless given)
@@ -637,6 +637,15 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - `status` lists runs with state, stage, attempts and tokens.
 - **Tests:** Typer `CliRunner` tests against an engine stub.
 - **Depends on:** 2.21, 2.23, 2.24, 2.26
+- **Note:** Built before 2.23, 2.24 and 2.26 at Kunal's request (Oct 14, 2026: shortest path to a first real run). Design gaps settled without Kunal, safest option chosen:
+  - Commands: `start --feature "<text>" | --spec <file>` (`--slug`), `status [<run>] [--all]`, `approve <run>` (or `--edit <file>`, `--send-back "<notes>"`, `--answer "<a>"` once per question or `--answers <file>` with answers separated by `---` lines), `stop <run>`, `resume <run> [--note]`, `attach <run> [--role]`. Every command takes `--repo <folder>`, else the git repo around the current folder; a repo is registered on its first start, named after its folder. `start --new-project` and `feedback` exit 1 saying they arrive with 2.26 and 2.23. `approve` on a run in `awaiting_merge` exits 1 ("merge approval arrives with task 2.22"); the one place to wire `decisions.approve_merge` is marked in `cli/factory_cli/engine.py` (`Engine.approve`), and the one place a `Pipeline` is built is `Engine._pipeline`, where 2.22 passes its git-flow hooks (`hooks=None` until then, so nothing is pushed yet).
+  - `factory_cli/actions.py` holds the `EngineActions` protocol; `engine.py` is the real one, built from `Deps` (environment, current folder, clock, sleep, platform, the factory's own folder, the agent runner factory), so tests pass a fake runner. Settings are the built-in defaults, then the global file `<data>/settings.yaml` if present (where `token_expires` goes), then the repo's `factory.yaml` from its main checkout. A repo with no `factory.yaml` is refused (readiness arrives with 2.25). The provider preflight runs before a run is created and before a decision is applied, so a missing or near-expiry token changes nothing. The factory's own folder (`prompts/`, `plugin/skills/`) is the checkout the CLI is installed from, or `AGENT_FACTORY_HOME`. `requested_by` is the repo's git `user.name`, else the login name.
+  - Exit codes: 0 when the run is merged or closed, 2 when it waits for you (plan approval, questions, needs_you, paused, awaiting_merge, or interrupted by Ctrl-C), 1 for an error or a run that ended failed or stopped. Engine errors (`FactoryError`) print their message without a traceback. Usage errors also exit 1 (Click's default is 2), so 2 always means a run waits for you.
+  - One factory process drives a run at a time: an OS lock on `engine.lock` in the run folder (`msvcrt` on Windows, `flock` elsewhere), held while a decision is applied and the pipeline runs, dropped by the OS if the process dies. A second process's `approve`, `resume` or `stop` is refused. The file is created once, never changed or removed, and checking it never creates it, so the post-stage check of a running stage doesn't see it change. `status` shows a working run nobody holds as `<state> (interrupted)`.
+  - `resume` carries on a run in `pending` or a working state (left by Ctrl-C or a crash) with a new attempt of that stage, and a `paused` one through `unpause` (refused before a usage-limit reset). No crash-recovery logic beyond `Pipeline.advance` (2.24). A run that needs you is refused: rerunning its stage would take a new post-stage baseline over whatever went wrong; feedback (2.23) brings the safe way. Stop it and start a new run.
+  - `stop` moves any run that hasn't ended to `stopped` and clears its pause record; the worktree, branch and run folder are kept (clean-up of abandoned worktrees isn't wired yet).
+  - `attach` prints a one-line command for the agent's saved session (the current stage's, or `--role`): in its worktree, with `CLAUDE_CONFIG_DIR` set to the agent's config folder and `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` removed, then `claude --resume <session>`. PowerShell on Windows, `env -u` elsewhere. That session runs without the engine's PreToolUse hook (its config folder's rules still apply); the next stage's checks see what it changed in the worktree.
+  - Typer is pinned `>=0.27,<0.28` (0.27.3 in `uv.lock`); 0.27 bundles its own copy of Click, so the CLI uses only Typer's exceptions.
 
 ### [ ] 2.29 CLI: usage
 

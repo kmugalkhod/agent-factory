@@ -3,7 +3,13 @@ name = "factory-cli"
 version = "0.1.0"
 description = "The `factory` command for the agent factory."
 requires-python = ">=3.12,<3.13"
-dependencies = ["factory-engine"]
+dependencies = [
+    "factory-engine",
+    "typer>=0.27,<0.28",
+]
+
+[project.scripts]
+factory = "factory_cli.app:main"
 
 [tool.uv.sources]
 factory-engine = { workspace = true }
