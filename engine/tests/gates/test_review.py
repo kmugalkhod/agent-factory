@@ -228,15 +228,34 @@ MALFORMED = [
         id="request changes with no Important finding",
     ),
     pytest.param(
-        doc(criteria="- AC1: met.\n- AC2: not met. 200 on a wrong password."),
+        doc(criteria="- AC1: met. Tests pass.\n- AC2: not met. 200 on a wrong password."),
         "the verdict is approve but 1 criterion is not met",
         id="approve with a criterion not met",
     ),
     pytest.param(doc(criteria="All good."), "marks no criterion", id="no criterion marked"),
     pytest.param(
-        doc(criteria="- AC1: met.\n- AC2: partly met."),
+        doc(criteria="- AC1: met. Tests pass.\n- AC2: partly met. Half the cases."),
         "doesn't say `met` or `not met`",
         id="unclear criterion",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met | not met. Evidence pending."),
+        "doesn't say `met` or `not met`",
+        id="criterion with both statuses",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met, mostly. Tests pass."),
+        "doesn't say `met` or `not met`",
+        id="criterion status with more words",
+    ),
+    pytest.param(doc(criteria="- AC1: met"), "then its evidence", id="criterion without evidence"),
+    pytest.param(
+        doc(criteria="- AC1: met."), "then its evidence", id="criterion with empty evidence"
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met Tests pass."),
+        "then its evidence",
+        id="criterion without the full stop",
     ),
 ]
 
