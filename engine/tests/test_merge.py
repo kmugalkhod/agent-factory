@@ -33,16 +33,26 @@ from factory_engine.git_ops import Git, create_worktree, rebase_in_progress, run
 from factory_engine.github import GitHub
 from factory_engine.merge import (
     CLEANUP_GATE,
+    MERGE_REBASES,
     MERGE_UPDATE_GATE,
     GitFlow,
     approval_text,
     pr_title,
 )
 from factory_engine.paths import run_dir
-from factory_engine.pipeline import Hooks, Pipeline, PipelineResult, Places
+from factory_engine.pipeline import TEST_LOCK_GATE, Hooks, Pipeline, PipelineResult, Places
 from factory_engine.providers import get_profile
 from factory_engine.registry import Registry, registry_path
-from factory_engine.run import ApprovedMerge, Role, Run, RunState, load_run, new_run, save_run
+from factory_engine.run import (
+    ApprovedMerge,
+    PullRequestInfo,
+    Role,
+    Run,
+    RunState,
+    load_run,
+    new_run,
+    save_run,
+)
 
 START = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 REPO = "pilot"
@@ -920,4 +930,187 @@ def test_the_default_hooks_merge_nothing(world_at: Maker) -> None:
 
     assert done.run.state == "needs_you"
     assert done.run.merge_approval is None
+    assert world.fake_gh.merges() == []
+
+
+# ------------------------------------------------------------------ review fixes: what is tested
+# is exactly what is pushed, main is checked again before the merge, the test lock follows a
+# clean rebase
+
+
+SCRIBBLER = {
+    "tests/conftest.py": (
+        "from pathlib import Path\n\nPath('src/scribble.txt').write_text('left by the tests\\n')\n"
+    )
+}
+"""A change on main whose test run leaves an untracked file in the worktree."""
+CALC_TEST = BASE_FILES["tests/test_calc.py"]
+TESTER_EDIT = CALC_TEST + "\n\n" + TESTER_TEST  # the tester adds its test to an existing file
+MAIN_EDIT = {"tests/test_calc.py": '"""Tests for calc."""\n\n' + CALC_TEST}  # merges cleanly
+
+
+def tester_editing_calc_tests() -> Act:
+    return Act(
+        "tester",
+        worktree={"tests/test_calc.py": TESTER_EDIT},
+        docs={"handoff-tester.md": handoff("tests/test_calc.py")},
+    )
+
+
+def lock(world: World) -> dict[str, str]:
+    return json.loads((world.run_folder / "tester-files.json").read_text(encoding="utf-8"))["files"]
+
+
+class MainMovesDuringTests(GitFlow):
+    """The git flow, with main moving again while each of the first `times` merge-time test
+    runs goes on (pushed right after the run, before the engine looks at main again)."""
+
+    def __init__(self, world: World, times: int) -> None:
+        super().__init__(world.fake_gh.gh)
+        self.world = world
+        self.times = times
+        self.moves = 0
+
+    def _rebase_for_merge(self, pipeline: Pipeline, run: Run, pr: PullRequestInfo) -> str | Run:
+        outcome = super()._rebase_for_merge(pipeline, run, pr)
+        if self.moves < self.times:
+            self.moves += 1
+            self.world.push_main({f"src/extra_{self.moves}.py": f"EXTRA = {self.moves}\n"})
+        return outcome
+
+
+def test_a_test_run_that_changes_the_worktree_after_the_update_needs_you(
+    world_at: Maker,
+) -> None:
+    world = world_at("testing")
+    hooks = MovingMain(world, SCRIBBLER)
+
+    done = world.advance(Agents([tester(), builder()]), hooks)
+
+    assert done.run.state == "needs_you"
+    reason = world.needs_you_reasons()[-1]
+    assert "scribble.txt" in reason and "isn't exactly the commit" in reason
+    assert world.fake_gh.calls() == []
+
+
+def test_a_test_run_that_changes_the_worktree_at_merge_time_merges_and_pushes_nothing(
+    world_at: Maker,
+) -> None:
+    world = world_at("testing")
+    to_awaiting_merge(world)
+    approved = world.head()
+    approve_merge(world.ctx)
+    world.push_main(SCRIBBLER)
+
+    done = world.advance(Agents([]))
+
+    assert done.run.state == "needs_you"
+    assert "scribble.txt" in world.needs_you_reasons()[-1]
+    assert world.fake_gh.merges() == []
+    assert world.remote_sha(f"refs/heads/{BRANCH}") == approved  # nothing pushed
+
+
+def test_uncommitted_changes_at_merge_time_merge_nothing(world_at: Maker) -> None:
+    world = world_at("testing")
+    to_awaiting_merge(world)
+    approve_merge(world.ctx)
+    (world.worktree / "src" / "calc.py").write_text(WRONG_BUILD, encoding="utf-8")
+
+    done = world.advance(Agents([]))
+
+    assert done.run.state == "needs_you"
+    assert "src/calc.py" in world.needs_you_reasons()[-1]
+    assert world.fake_gh.merges() == []
+
+
+def test_main_moving_during_the_merge_time_tests_is_rebased_and_tested_again(
+    world_at: Maker,
+) -> None:
+    world = world_at("testing")
+    to_awaiting_merge(world)
+    approve_merge(world.ctx)
+    world.push_main(UNRELATED_ON_MAIN)
+    hooks = MainMovesDuringTests(world, times=1)
+
+    world.advance(Agents([]), hooks)
+
+    run = world.run()
+    assert run.state == "merged"
+    assert run.pull_request is not None
+    head = run.pull_request.head
+    main = world.remote_sha("refs/heads/main")
+    sh(world.remote, "merge-base", "--is-ancestor", main, head, env=world.env)  # the latest main
+    assert world.fake_gh.merges() == [
+        ["pr", "merge", PR_URL, "--merge", "--match-head-commit", head]
+    ]
+    assert summary(world.run_folder).count(f"gate {MERGE_UPDATE_GATE} pass") == 2
+    assert world.remote_sha(f"refs/heads/{BRANCH}") == head
+
+
+def test_main_that_keeps_moving_during_the_merge_needs_you(world_at: Maker) -> None:
+    world = world_at("testing")
+    to_awaiting_merge(world)
+    approved = world.head()
+    approve_merge(world.ctx)
+    world.push_main(UNRELATED_ON_MAIN)
+    hooks = MainMovesDuringTests(world, times=MERGE_REBASES)
+
+    done = world.advance(Agents([]), hooks)
+
+    assert done.run.state == "needs_you"
+    assert f"each of {MERGE_REBASES} rebases" in world.needs_you_reasons()[-1]
+    assert summary(world.run_folder).count(f"gate {MERGE_UPDATE_GATE} pass") == MERGE_REBASES
+    assert world.fake_gh.merges() == []
+    assert world.remote_sha(f"refs/heads/{BRANCH}") == approved
+
+
+def test_a_clean_rebase_that_changes_a_locked_test_re_bases_the_lock(world_at: Maker) -> None:
+    world = world_at("testing")
+    hooks = MovingMain(world, MAIN_EDIT)
+    agents = Agents([tester_editing_calc_tests(), builder(), reviewer()])
+
+    done = world.advance(agents, hooks)
+
+    assert done.run.state == "awaiting_merge"
+    story = summary(world.run_folder)
+    assert story[story.index("state building>updating") :][:3] == [
+        "state building>updating",
+        f"gate {TEST_LOCK_GATE} pass",
+        "gate update pass",
+    ]
+    rebased = sh(world.worktree, "rev-parse", "HEAD:tests/test_calc.py", env=world.env)
+    assert lock(world)["tests/test_calc.py"] == rebased
+    text = (world.worktree / "tests" / "test_calc.py").read_text(encoding="utf-8")
+    assert text.startswith('"""Tests for calc."""') and "def test_mul" in text
+
+
+def test_a_conflict_in_a_locked_test_needs_you_without_the_builder(world_at: Maker) -> None:
+    world = world_at("testing")
+    other = {"tests/test_mul.py": "def test_mul():\n    assert 2 * 3 == 6\n"}  # add/add conflict
+    hooks = MovingMain(world, other)
+
+    done = world.advance(Agents([tester(), builder()]), hooks)
+
+    assert done.run.state == "needs_you"
+    assert done.run.attempts["builder"] == 1  # the builder isn't asked to resolve a locked test
+    reason = world.needs_you_reasons()[-1]
+    assert "tests/test_mul.py" in reason and "locked" in reason
+    assert not world.rebasing()
+    assert world.head() == hooks.before
+
+
+def test_a_test_lock_broken_before_the_merge_time_rebase_needs_you(world_at: Maker) -> None:
+    world = world_at("testing")
+    to_awaiting_merge(world)
+    approve_merge(world.ctx)
+    world.push_main(UNRELATED_ON_MAIN)
+    path = world.run_folder / "tester-files.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["files"]["tests/test_mul.py"] = "0" * 40
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    done = world.advance(Agents([]))
+
+    assert done.run.state == "needs_you"
+    assert "test lock fails before the rebase" in world.needs_you_reasons()[-1]
     assert world.fake_gh.merges() == []

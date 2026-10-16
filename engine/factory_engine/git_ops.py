@@ -347,6 +347,40 @@ def main_moved(git: Git, worktree: Path, *, remote: str = "origin", base: str = 
     )
 
 
+def worktree_changes(git: Git, worktree: Path) -> tuple[str, ...]:
+    """Every path where the worktree differs from HEAD: tracked changes (staged or not) and
+    untracked files that aren't ignored. Empty when the worktree is exactly HEAD."""
+    out = git.run(
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], worktree
+    ).stdout
+    names: set[str] = set()
+    skip = False
+    for entry in out.split("\0"):
+        if skip:  # the source name of a rename or copy
+            skip = False
+            continue
+        if len(entry) < 4:
+            continue
+        names.add(entry[3:])
+        skip = entry[0] in "RC"
+    return tuple(sorted(names))
+
+
+def tree_blobs(git: Git, worktree: Path, rev: str, paths: Sequence[str]) -> dict[str, str]:
+    """The blob id of each of `paths` (worktree-relative, `/`) in `rev`'s tree, for the paths
+    that are regular files there (mode 100644 or 100755); any other path is left out."""
+    found: dict[str, str] = {}
+    for start in range(0, len(paths), 200):
+        chunk = list(paths[start : start + 200])
+        out = git.run(["ls-tree", "-r", "-z", "--full-tree", rev, "--", *chunk], worktree).stdout
+        for record in out.split("\0"):
+            meta, _, name = record.partition("\t")
+            parts = meta.split(" ")
+            if len(parts) == 3 and parts[1] == "blob" and parts[0] in ("100644", "100755"):
+                found[name] = parts[2]
+    return {rel: found[rel] for rel in paths if rel in found}
+
+
 def _rebasing(git: Git, worktree: Path) -> str:
     """The branch a rebase in the worktree is rebasing (`refs/heads/...`), or ""."""
     head_name = Path(git.out(["rev-parse", "--git-path", "rebase-merge/head-name"], worktree))
@@ -369,12 +403,20 @@ def _require_rebasing(git: Git, worktree: Path, branch: str) -> None:
 
 
 def push_run_branch(
-    git: Git, worktree: Path, *, run_id: int, slug: str, branch: str, remote: str = "origin"
+    git: Git,
+    worktree: Path,
+    *,
+    run_id: int,
+    slug: str,
+    branch: str,
+    remote: str = "origin",
+    commit: str | None = None,
 ) -> None:
     """Safe force-push of the run branch, and only the run branch. The lease is the commit the
     engine last pushed (or "absent" before the first push), kept under `refs/factory/pushed/`,
     so a fetch by anyone else can't weaken it. Raises `PushRejectedError` if the remote branch
-    changed unexpectedly."""
+    changed unexpectedly. With `commit` (the commit whose tests passed), the worktree's HEAD
+    must be that commit and exactly that commit is pushed."""
     expected = run_branch(run_id, slug)
     if branch != expected:
         raise GitError(
@@ -387,8 +429,13 @@ def push_run_branch(
     found = git.run(["rev-parse", "-q", "--verify", f"{lease}^{{commit}}"], worktree, check=False)
     last = found.stdout.strip() if found.returncode == 0 else ""
     head = git.out(["rev-parse", "HEAD"], worktree)
+    if commit is not None and head != commit:
+        raise GitError(
+            f"refusing to push {expected}: its head is {head}, not the tested commit {commit}. "
+            "Only a tested commit is pushed; check what changed the worktree."
+        )
     done = git.run(
-        ["push", "--porcelain", f"--force-with-lease={ref}:{last}", remote, f"{ref}:{ref}"],
+        ["push", "--porcelain", f"--force-with-lease={ref}:{last}", remote, f"{head}:{ref}"],
         worktree,
         check=False,
     )

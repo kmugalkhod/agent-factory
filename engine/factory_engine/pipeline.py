@@ -98,7 +98,11 @@ from factory_engine.gates.post_stage import (
     take_baseline,
 )
 from factory_engine.gates.review import check_review_file, record_findings
-from factory_engine.gates.tests_gate import check_tests, load_tester_files
+from factory_engine.gates.tests_gate import (
+    check_tests,
+    load_tester_files,
+    rebase_tester_files,
+)
 from factory_engine.git_ops import (
     Git,
     commit_stage,
@@ -129,6 +133,8 @@ UPDATE_STEP = "update"
 """The step label saved once the update before review (`Hooks.update`) is done."""
 UPDATE_GATE = "update"
 """The `gate_result` of the update before review: the rebase and the tests rerun after it."""
+TEST_LOCK_GATE = "update.test_lock"
+"""The `gate_result` saying the test lock now follows main's version of a tester's file."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
 PlanStop = Literal["plan_approval", "questions", "split"]
@@ -492,12 +498,20 @@ class Pipeline:
         head once the rebase is done, the files still (or newly) in conflict, or None when it
         failed (the run stopped for you)."""
         run = self._run
+        places = self.places
         try:
-            step = rebase_continue(self.git, self.places.worktree, run_id=run.id, slug=run.slug)
+            step = rebase_continue(self.git, places.worktree, run_id=run.id, slug=run.slug)
             if step.conflicts:
+                locked = locked_conflicts(places.run_folder, step.conflicts)
+                if locked:
+                    self._needs_you("builder", locked_conflict_reason(locked))
+                    return None
                 return step.conflicts
-            return self.git.out(["rev-parse", "HEAD"], self.places.worktree)
-        except GitError as err:
+            rebased = rebase_tester_files(self.git, places.run_folder, places.worktree)
+            if rebased:
+                self.events.append(lock_rebased(rebased), role="builder")
+            return self.git.out(["rev-parse", "HEAD"], places.worktree)
+        except (GitError, GateError) as err:
             self._needs_you("builder", f"the rebase onto main couldn't carry on: {err}")
             return None
 
@@ -970,6 +984,30 @@ def _builder_prompt(places: Places, message: str | None, note: str | None, *, re
     if message:
         text += f"\n\nAn earlier attempt failed:\n\n{message}"
     return _with_note(text, note)
+
+
+def locked_conflicts(run_folder: Path, files: Sequence[str]) -> tuple[str, ...]:
+    """The conflicted `files` that the test lock holds: the builder may not resolve those."""
+    locked = load_tester_files(run_folder)
+    return tuple(name for name in files if name in locked)
+
+
+def locked_conflict_reason(files: Sequence[str]) -> str:
+    return (
+        f"the rebase onto main conflicts in {', '.join(files)}, written by the tester and locked "
+        "from the builder, so the builder can't resolve it. Resolve those tests yourself, or "
+        "send the run back to the tester."
+    )
+
+
+def lock_rebased(files: Sequence[str]) -> GateResult:
+    """The event for a test lock that now follows main's changes to the tester's files."""
+    return GateResult(
+        gate=TEST_LOCK_GATE,
+        passed=True,
+        reason=f"the engine's rebase onto main changed {', '.join(files)}, written by the tester; "
+        "the test lock now holds their rebased versions.",
+    )
 
 
 def conflict_message(places: Places, files: Sequence[str]) -> str:

@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 from factory_engine.config import RoleSettings
 from factory_engine.errors import ConfigError, GateError, GitError
 from factory_engine.events import EventLog, GateResult
-from factory_engine.git_ops import Git, run_command
+from factory_engine.git_ops import Git, run_command, tree_blobs
 from factory_engine.providers import BASE_VARS
 from factory_engine.safety.paths import PathPolicy, check_worktree_name
 from factory_engine.testrun import (
@@ -437,6 +437,33 @@ def record_tester_files(
         ) from err
     write_atomic(path, saved.model_dump_json(indent=2) + "\n")
     return saved.files
+
+
+def rebase_tester_files(git: Git, run_folder: Path, worktree: Path) -> tuple[str, ...]:
+    """After the engine rebased the run branch onto main itself: take each locked file's blob id
+    from the new HEAD's tree, since main may have changed a file the tester changed too. Returns
+    the files whose id changed. Call it only after a rebase that the engine finished without a
+    conflict in a locked file, with the lock checked before the rebase. Raises GateError when a
+    locked file is no longer a regular file at HEAD."""
+    locked = load_tester_files(run_folder)
+    if not locked:
+        return ()
+    try:
+        now = tree_blobs(git, worktree, "HEAD", sorted(locked))
+    except GitError as err:
+        raise GateError(f"can't read the tester's files at HEAD in {worktree} ({err}).") from err
+    gone = sorted(set(locked) - set(now))
+    if gone:
+        raise GateError(
+            f"the rebase onto main left {', '.join(gone)}, written by the tester and locked, "
+            "missing or no longer a regular file, so the test lock can't follow it."
+        )
+    changed = tuple(rel for rel in sorted(locked) if now[rel] != locked[rel])
+    if changed:
+        path = run_folder / TESTER_FILES
+        saved = TesterFiles(files=dict(sorted(now.items())))
+        write_atomic(path, saved.model_dump_json(indent=2) + "\n")
+    return changed
 
 
 def load_tester_files(run_folder: Path) -> dict[str, str]:

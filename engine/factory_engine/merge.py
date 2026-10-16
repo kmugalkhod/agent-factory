@@ -2,18 +2,25 @@
 
 `GitFlow` is the pipeline's `Hooks` for a repo with a remote on GitHub:
 
-- `update`, in `updating` before the review: fetch main and rebase the run branch onto it.
-  - No conflicts: the builder gate reruns the tests on the result (the test lock included). A
-    pass goes on to the review; a fail needs you.
+- `update`, in `updating` before the review: check the worktree is exactly the run branch's
+  head and the test lock holds, then fetch main and rebase the run branch onto it.
+  - No conflicts: the test lock follows main's changes to the tester's files (their blob ids
+    are taken from the rebased head), and the builder gate reruns the tests on the result. A
+    pass that left the worktree exactly the tested head goes on to the review; anything else
+    needs you.
   - Conflicts: the builder resumes, told the conflicted files (→ building), if it has an
-    attempt left; otherwise the rebase is given up and the run needs you. How the rebase
-    carries on after the builder's edits is in `pipeline.py`.
-- `publish`, once the review passed: push the run branch (the safe force-push) and open the
-  pull request, or move an open one to the new head. Its number, URL and head go to `run.json`.
+    attempt left and none of them is locked; otherwise the rebase is given up and the run needs
+    you. How the rebase carries on after the builder's edits is in `pipeline.py`.
+- `publish`, once the review passed: push exactly the worktree's head (the safe force-push)
+  and open the pull request, or move an open one to the new head. Its number, URL and head go
+  to `run.json`.
 - `merge`, in `awaiting_merge` once your approval is recorded (`decisions.approve_merge`): if
   main moved since the pull request's head was tested, rebase onto it, rerun the tests and push
-  first. Then merge through `gh`, pinned to the tested head, and remove the worktree (→ merged).
-  Anything that fails stops the run for you, with nothing merged.
+  the tested commit, then fetch main again (at most `MERGE_REBASES` rebases). Then merge through
+  `gh`, pinned to the tested head, and remove the worktree (→ merged). Anything that fails stops
+  the run for you, with nothing merged. `gh pr merge` can pin the head but not main: a push to
+  main between the last fetch and the merge isn't seen, which branch protection's "Require
+  branches to be up to date before merging" closes on GitHub's side.
 
 No code path merges without your approval: `merge_approved` is the engine's only call of
 `github.merge_pr`, and it refuses unless `run.json` holds an approval for this pull request at
@@ -33,7 +40,9 @@ from factory_engine.errors import (
     MergeError,
 )
 from factory_engine.events import Decision, GateResult, read_events
+from factory_engine.gates.build import check_lock
 from factory_engine.gates.plan import PLAN_FILE
+from factory_engine.gates.tests_gate import load_tester_files, rebase_tester_files
 from factory_engine.git_ops import (
     main_moved,
     push_run_branch,
@@ -42,15 +51,28 @@ from factory_engine.git_ops import (
     rebase_onto_main,
     remove_worktree,
     run_branch,
+    worktree_changes,
 )
 from factory_engine.github import GitHub, MergeApproval, PullRequest, merge_pr, open_pr, pr_body
-from factory_engine.pipeline import REVIEW_FILE, UPDATE_GATE, Hooks, Pipeline, conflict_message
+from factory_engine.pipeline import (
+    REVIEW_FILE,
+    UPDATE_GATE,
+    Hooks,
+    Pipeline,
+    conflict_message,
+    lock_rebased,
+    locked_conflict_reason,
+    locked_conflicts,
+)
 from factory_engine.run import PullRequestInfo, Run
 
 MERGE_UPDATE_GATE = "merge.update"
 """The `gate_result` of a rebase onto a main that moved after your approval, and its tests."""
 CLEANUP_GATE = "merge.cleanup"
 """The `gate_result` of removing the worktree after the merge."""
+MERGE_REBASES = 3
+"""How many times main may move during one merge (each a rebase and a test run) before the run
+needs you."""
 _TITLE_UNSAFE = '"%^&|<>!\r\n'  # what a `gh.cmd` launcher can't be given (git_ops.run_command)
 
 
@@ -149,42 +171,40 @@ class GitFlow(Hooks):
         try:
             if rebase_in_progress(git, worktree, run_id=run.id, slug=run.slug):
                 rebase_abort(git, worktree, run_id=run.id, slug=run.slug)  # start it again
+            problem = _before_rebase(pipeline)
+            if problem is not None:
+                return pipeline.stop_for_you(None, f"the run isn't rebased onto main: {problem}")
             step = rebase_onto_main(
                 git, worktree, run_id=run.id, slug=run.slug, remote=self.remote, base=self.base
             )
-        except GitError as err:
+        except (GitError, GateError) as err:
             return pipeline.stop_for_you(None, f"the rebase onto {self.base} couldn't run: {err}")
         if step.conflicts:
             return self._conflicts(pipeline, run, step.conflicts)
-        try:
-            outcome = pipeline.build_gate(git.out(["rev-parse", "HEAD"], worktree))
-        except (ConfigError, GateError, GitError) as err:
-            return pipeline.stop_for_you(
-                None, f"the tests couldn't rerun after the rebase onto {self.base}: {err}"
-            )
-        pipeline.events.append(
-            GateResult(gate=UPDATE_GATE, passed=outcome.passed, reason=outcome.reason),
-            role="builder",
-        )
-        if not outcome.passed:
-            return pipeline.stop_for_you(
-                None, f"the tests fail after the rebase onto {self.base}: {outcome.reason}"
-            )
-        return pipeline.run
+        tested = _retest(pipeline, UPDATE_GATE, f"after the rebase onto {self.base}")
+        return tested if isinstance(tested, Run) else pipeline.run
 
     def _conflicts(self, pipeline: Pipeline, run: Run, files: Sequence[str]) -> Run:
         listed = ", ".join(files)
-        if pipeline.attempts_left("builder") == 0:
+        problem: str | None = None
+        try:
+            locked = locked_conflicts(pipeline.places.run_folder, files)
+            if locked:
+                problem = locked_conflict_reason(locked).removesuffix(".")
+        except GateError as err:
+            problem = f"the test lock can't be read ({err})"
+        if problem is None and pipeline.attempts_left("builder") == 0:
+            problem = (
+                f"the rebase onto {self.base} stopped on conflicts in {listed}, and the builder "
+                "has used all its attempts, so nobody can resolve them"
+            )
+        if problem is not None:
             try:
                 rebase_abort(pipeline.git, pipeline.places.worktree, run_id=run.id, slug=run.slug)
                 undone = "The rebase was given up, so the run branch is as it was."
             except GitError as err:
                 undone = f"The rebase couldn't be given up ({err}); run `git rebase --abort`."
-            return pipeline.stop_for_you(
-                None,
-                f"the rebase onto {self.base} stopped on conflicts in {listed}, and the builder "
-                f"has used all its attempts, so nobody can resolve them. {undone}",
-            )
+            return pipeline.stop_for_you(None, f"{problem}. {undone}")
         pipeline.events.append(
             GateResult(
                 gate=UPDATE_GATE,
@@ -203,6 +223,13 @@ class GitFlow(Hooks):
         places, git = pipeline.places, pipeline.git
         run = pipeline.run
         try:
+            head = git.out(["rev-parse", "HEAD"], places.worktree)
+            changes = worktree_changes(git, places.worktree)
+            if changes:
+                raise GitError(
+                    f"the worktree has changes that aren't committed ({_listed(changes)}), so "
+                    f"what was reviewed isn't exactly {head}"
+                )
             push_run_branch(
                 git,
                 places.worktree,
@@ -210,8 +237,8 @@ class GitFlow(Hooks):
                 slug=run.slug,
                 branch=run_branch(run.id, run.slug),
                 remote=self.remote,
+                commit=head,
             )
-            head = git.out(["rev-parse", "HEAD"], places.worktree)
         except GitError as err:
             return pipeline.stop_for_you(None, f"the run branch couldn't be pushed: {err}")
         if run.pull_request is not None:
@@ -240,6 +267,9 @@ class GitFlow(Hooks):
     # ------------------------------------------------------------------ merge
 
     async def merge(self, pipeline: Pipeline, run: Run) -> Run:
+        """Merge on your approval. Main is fetched again after every rebase and push, so the
+        merge starts only once main holds nothing the tested head lacks; if main keeps moving,
+        `MERGE_REBASES` rebases are tried before the run needs you."""
         places, git = pipeline.places, pipeline.git
         run = pipeline.run
         try:
@@ -247,19 +277,51 @@ class GitFlow(Hooks):
             pr = run.pull_request
             if pr is None:
                 raise MergeError("no pull request is recorded")
-            head = git.out(["rev-parse", "HEAD"], places.worktree)
-            if head != pr.head:
-                raise MergeError(
-                    f"the worktree's head {head} isn't the pull request's tested head {pr.head}"
-                )
-            moved = main_moved(git, places.worktree, remote=self.remote, base=self.base)
+            _require_tested(pipeline, pr.head)
         except FactoryError as err:
             return pipeline.stop_for_you(None, f"nothing was merged: {err}")
-        if moved:
-            run = self._rebase_for_merge(pipeline, run, pr)
-            if run.state != "awaiting_merge":
-                return run
+        approved = run.merge_approval.head if run.merge_approval is not None else pr.head
+        tested = pr.head
+        rebases = 0
+        while True:
+            try:
+                moved = main_moved(git, places.worktree, remote=self.remote, base=self.base)
+            except GitError as err:
+                return pipeline.stop_for_you(None, f"nothing was merged: {err}")
+            if not moved and tested == pr.head:
+                break
+            if not moved:  # push what was tested, then look at main again
+                try:
+                    push_run_branch(
+                        git,
+                        places.worktree,
+                        run_id=run.id,
+                        slug=run.slug,
+                        branch=run_branch(run.id, run.slug),
+                        remote=self.remote,
+                        commit=tested,
+                    )
+                except GitError as err:
+                    return pipeline.stop_for_you(
+                        None,
+                        f"the rebased run branch couldn't be pushed, so nothing was merged: {err}",
+                    )
+                pr = pr.model_copy(update={"head": tested, "rebased_from": approved})
+                run = pipeline.record(run.model_copy(update={"pull_request": pr}))
+                continue
+            if rebases == MERGE_REBASES:
+                return pipeline.stop_for_you(
+                    None,
+                    f"{self.base} moved again after each of {MERGE_REBASES} rebases and test "
+                    "runs, so nothing was merged. Resume the run when it is quieter.",
+                )
+            rebases += 1
+            outcome = self._rebase_for_merge(pipeline, run, pr)
+            if isinstance(outcome, Run):
+                return outcome
+            tested = outcome
         try:
+            _require_tested(pipeline, pr.head)
             merge_approved(self.gh, places.repo, run, places.run_folder)
         except FactoryError as err:
             return pipeline.stop_for_you(None, f"the merge failed: {err}")
@@ -268,57 +330,41 @@ class GitFlow(Hooks):
         self._clean_up(pipeline)
         return pipeline.run
 
-    def _rebase_for_merge(self, pipeline: Pipeline, run: Run, pr: PullRequestInfo) -> Run:
-        """Main moved after your approval: rebase onto it, rerun the tests and push, so what
-        merges is tested. Returns the run, stopped for you if any of it failed."""
-        places, git = pipeline.places, pipeline.git
-        worktree = places.worktree
+    def _rebase_for_merge(self, pipeline: Pipeline, run: Run, pr: PullRequestInfo) -> str | Run:
+        """Main moved after your approval: rebase onto it and rerun the tests. Returns the new
+        head, tested and not yet pushed, or the run, stopped for you."""
+        git, worktree = pipeline.git, pipeline.places.worktree
         try:
+            problem = _before_rebase(pipeline)
+            if problem is not None:
+                return pipeline.stop_for_you(
+                    None, f"{self.base} moved after your approval, but {problem}"
+                )
             step = rebase_onto_main(
                 git, worktree, run_id=run.id, slug=run.slug, remote=self.remote, base=self.base
             )
             if step.conflicts:
                 rebase_abort(git, worktree, run_id=run.id, slug=run.slug)
+                locked = locked_conflicts(pipeline.places.run_folder, step.conflicts)
+                also = f" ({locked_conflict_reason(locked)})" if locked else ""
                 return pipeline.stop_for_you(
                     None,
                     f"{self.base} moved after your approval, and the rebase onto it stopped on "
-                    f"conflicts in {', '.join(step.conflicts)}. The rebase was given up and "
-                    f"nothing was merged; pull request #{pr.number} is as you approved it.",
+                    f"conflicts in {', '.join(step.conflicts)}{also}. The rebase was given up "
+                    f"and nothing was merged; pull request #{pr.number} is as you approved it.",
                 )
-            head = git.out(["rev-parse", "HEAD"], worktree)
-            outcome = pipeline.build_gate(head)
-        except (ConfigError, GateError, GitError) as err:
+        except (GateError, GitError) as err:
             return pipeline.stop_for_you(
                 None,
-                f"{self.base} moved after your approval, and the rebase onto it and the tests "
-                f"couldn't run, so nothing was merged: {err}{_still_rebasing(pipeline, run)}",
+                f"{self.base} moved after your approval, and the rebase onto it couldn't run, "
+                f"so nothing was merged: {err}{_still_rebasing(pipeline, run)}",
             )
-        pipeline.events.append(
-            GateResult(gate=MERGE_UPDATE_GATE, passed=outcome.passed, reason=outcome.reason),
-            role="builder",
+        return _retest(
+            pipeline,
+            MERGE_UPDATE_GATE,
+            f"after the rebase onto the {self.base} that moved after your approval, so nothing "
+            "was merged or pushed",
         )
-        if not outcome.passed:
-            return pipeline.stop_for_you(
-                None,
-                f"{self.base} moved after your approval, and the tests fail after the rebase "
-                f"onto it, so nothing was merged or pushed: {outcome.reason}",
-            )
-        try:
-            push_run_branch(
-                git,
-                worktree,
-                run_id=run.id,
-                slug=run.slug,
-                branch=run_branch(run.id, run.slug),
-                remote=self.remote,
-            )
-        except GitError as err:
-            return pipeline.stop_for_you(
-                None, f"the rebased run branch couldn't be pushed, so nothing was merged: {err}"
-            )
-        approved = run.merge_approval.head if run.merge_approval is not None else pr.head
-        info = pr.model_copy(update={"head": head, "rebased_from": approved})
-        return pipeline.record(run.model_copy(update={"pull_request": info}))
 
     def _clean_up(self, pipeline: Pipeline) -> None:
         """Remove the worktree after the merge; the run branch stays. A failure is logged:
@@ -340,6 +386,81 @@ class GitFlow(Hooks):
                 "clean-up of finished runs after 7 days.",
             )
         pipeline.events.append(result)
+
+
+# ------------------------------------------------------------------ shared steps
+
+
+def _before_rebase(pipeline: Pipeline) -> str | None:
+    """What stops the engine from rebasing: changes not committed, or a test lock that fails
+    already. None when the run branch can be rebased."""
+    git, places = pipeline.git, pipeline.places
+    changes = worktree_changes(git, places.worktree)
+    if changes:
+        return (
+            f"the worktree has changes that aren't committed ({_listed(changes)}), so it isn't "
+            "the run branch's head."
+        )
+    changed, deleted = check_lock(git, places.worktree, load_tester_files(places.run_folder))
+    if changed or deleted:
+        return (
+            f"the test lock fails before the rebase: {_listed([*changed, *deleted])}, written by "
+            "the tester, changed or gone."
+        )
+    return None
+
+
+def _retest(pipeline: Pipeline, gate: str, context: str) -> str | Run:
+    """After a rebase the engine finished without conflicts: let the test lock follow main's
+    changes to the tester's files, run the builder gate on HEAD, and check the tests left the
+    worktree exactly HEAD. Returns the tested head, or the run, stopped for you."""
+    git, places = pipeline.git, pipeline.places
+    worktree = places.worktree
+    try:
+        rebased = rebase_tester_files(git, places.run_folder, worktree)
+        if rebased:
+            pipeline.events.append(lock_rebased(rebased), role="builder")
+        head = git.out(["rev-parse", "HEAD"], worktree)
+        before = worktree_changes(git, worktree)
+        if before:
+            raise GateError(f"the worktree isn't its head: {_listed(before)} differ")
+        outcome = pipeline.build_gate(head)
+        after = worktree_changes(git, worktree)
+        now = git.out(["rev-parse", "HEAD"], worktree)
+    except (ConfigError, GateError, GitError) as err:
+        return pipeline.stop_for_you(None, f"the tests couldn't rerun {context}: {err}")
+    pipeline.events.append(
+        GateResult(gate=gate, passed=outcome.passed, reason=outcome.reason), role="builder"
+    )
+    if not outcome.passed:
+        return pipeline.stop_for_you(None, f"the tests fail {context}: {outcome.reason}")
+    if after or now != head:
+        changed = _listed(after) if after else f"HEAD moved to {now}"
+        return pipeline.stop_for_you(
+            None,
+            f"the tests passed {context}, but the test run changed the worktree ({changed}), so "
+            f"what passed isn't exactly the commit {head}. Make the tests leave the worktree "
+            "as it is, or ignore what they write in .gitignore.",
+        )
+    return head
+
+
+def _require_tested(pipeline: Pipeline, head: str) -> None:
+    """The worktree must be exactly `head`, the commit whose tests passed."""
+    git, worktree = pipeline.git, pipeline.places.worktree
+    now = git.out(["rev-parse", "HEAD"], worktree)
+    if now != head:
+        raise MergeError(f"the worktree's head {now} isn't the pull request's tested head {head}")
+    changes = worktree_changes(git, worktree)
+    if changes:
+        raise MergeError(
+            f"the worktree has changes that aren't in the tested head {head}: {_listed(changes)}"
+        )
+
+
+def _listed(items: Sequence[str]) -> str:
+    shown = ", ".join(items[:10])
+    return f"{shown} and {len(items) - 10} more" if len(items) > 10 else shown
 
 
 def _still_rebasing(pipeline: Pipeline, run: Run) -> str:
