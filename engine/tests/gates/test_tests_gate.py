@@ -1,6 +1,5 @@
 """Tests for the tester gate: real pytest runs on small fixture repos made in `tmp_path`."""
 
-import hashlib
 import json
 import os
 import shlex
@@ -21,6 +20,7 @@ from factory_engine.gates.tests_gate import (
     belongs,
     check_tests,
     load_tester_files,
+    tester_files,
 )
 from factory_engine.git_ops import Git
 
@@ -220,11 +220,11 @@ def test_a_test_run_event_is_logged_and_the_gate_result_is_returned(world: World
     assert (result.gate, result.passed, result.reason) == (GATE, True, outcome.reason)
 
 
-def test_the_tester_files_are_recorded_with_their_hashes(world: World) -> None:
+def test_the_tester_files_are_recorded_with_their_blob_ids(world: World) -> None:
     write(world.repo, {"tests/test_mul.py": FAILING_MUL, "tests/helpers/data.txt": "1 2 3\n"})
     outcome = world.check()
     expected = {
-        rel: hashlib.sha256((world.repo / rel).read_bytes()).hexdigest()
+        rel: world.git.out(["hash-object", "--", rel], world.repo)
         for rel in ("tests/helpers/data.txt", "tests/test_mul.py")
     }
     assert dict(outcome.files) == expected
@@ -240,6 +240,22 @@ def test_files_outside_the_tester_paths_and_bytecode_are_not_recorded(world: Wor
     (world.repo / "tests" / "__pycache__" / "test_mul.cpython-312.pyc").write_bytes(b"\0")
     outcome = world.check()
     assert set(outcome.files) == {"tests/test_mul.py"}
+
+
+def test_a_link_is_not_recorded_as_a_tester_file(world: World) -> None:
+    write(world.repo, {"tests/test_mul.py": FAILING_MUL})
+    try:
+        (world.repo / "tests" / "test_alias.py").symlink_to(world.repo / "tests" / "test_mul.py")
+    except OSError as err:
+        pytest.skip(f"this machine can't create symlinks ({err})")
+    found = tester_files(
+        world.git,
+        worktree=world.repo,
+        run_folder=world.run_folder,
+        base=world.base,
+        tester=world.tester,
+    )
+    assert set(found) == {"tests/test_mul.py"}
 
 
 def test_a_later_tester_attempt_keeps_earlier_files_that_still_exist(world: World) -> None:

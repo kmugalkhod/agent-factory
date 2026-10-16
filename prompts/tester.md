@@ -21,6 +21,8 @@ has to clear.
   feature is missing, not a typo, a wrong import path or a broken fixture. Fix any test that fails
   for the wrong reason. The exception is a test that existing behaviour is unchanged: it passes
   before the build and must still pass after.
+- Import the code under test inside each test function, not at the top of the file. A missing
+  module imported at the top stops the whole file loading, and the gate reads that as broken tests.
 - Tests that already exist must still pass.
 - Run the lint command and fix what it reports in your test files; the builder can't touch them.
   Type errors that come only from code or dependencies the builder hasn't added yet are expected;
