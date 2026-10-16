@@ -5,7 +5,7 @@ bare "remote"; no network and no real model."""
 
 import asyncio
 import subprocess
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,11 +18,12 @@ from factory_cli.lock import RunLock
 from factory_engine.agent_config import agent_config_dir
 from factory_engine.agents.fake import FakeAgentRunner, result, system_init
 from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder, not_running
+from factory_engine.agents.watchdog import RESUME_PROMPT
 from factory_engine.errors import DecisionError, FactoryError, ProviderError
 from factory_engine.git_ops import worktree_dir
 from factory_engine.paths import repo_runs_dir, run_dir
 from factory_engine.registry import Registry, registry_path
-from factory_engine.run import RunState, load_run, save_run
+from factory_engine.run import Pause, RunState, load_run, save_run
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 FACTORY = Path(__file__).resolve().parents[2]
@@ -66,8 +67,11 @@ class Planner:
         self.plans = list(plans)
         self.specs: list[AgentSpec] = []
         self._fake: FakeAgentRunner | None = None
+        self.before: Callable[[], None] | None = None  # runs when a pipeline gets its runner
 
     def factory(self, parent_env: object) -> "Planner":
+        if self.before is not None:
+            self.before()
         return self
 
     async def run(self, spec: AgentSpec, recorder: SessionRecorder) -> AgentResult:
@@ -160,9 +164,9 @@ def world(tmp_path: Path, git_env: dict[str, str]) -> Iterator[World]:
     yield World(repo=repo, data=data, env=env, planner=Planner([PLAN]))
 
 
-def set_state(world: World, state: RunState) -> None:
+def set_state(world: World, state: RunState, pause: Pause | None = None) -> None:
     folder = world.folder()
-    run = load_run(folder).model_copy(update={"state": state})
+    run = load_run(folder).model_copy(update={"state": state, "pause": pause})
     save_run(run, folder)
     registry = Registry(registry_path(world.data))
     try:
@@ -206,6 +210,23 @@ def test_start_lists_the_plans_questions(world: World) -> None:
     assert len(done.questions) == 1
     assert "Should `mul` take floats?" in done.questions[0]
     assert "yes" in done.questions[0]
+
+
+def test_a_stop_while_the_run_is_starting_is_refused(world: World) -> None:
+    refused: list[str] = []
+
+    def stop_now() -> None:  # after intake published the run, before the pipeline drives it
+        with pytest.raises(CliError, match="another factory process") as caught:
+            world.engine().stop(0)
+        refused.append(str(caught.value))
+
+    world.planner.before = stop_now
+
+    done = world.engine().start_feature("Add mul to calc", slug=None)
+
+    assert refused
+    assert done.run.state == "awaiting_plan_approval"
+    assert load_run(world.folder()).state == "awaiting_plan_approval"
 
 
 def test_the_repo_option_beats_the_current_folder(world: World, tmp_path: Path) -> None:
@@ -336,6 +357,31 @@ def test_resume_carries_an_interrupted_stage_on(world: World) -> None:
     assert "Carry on." in world.planner.specs[-1].prompt
 
 
+def test_resume_carries_on_a_paused_attempt_in_its_session(world: World) -> None:
+    world.engine().start_feature("Add mul to calc", slug=None)
+    pause = Pause(
+        reason="turn_cap",
+        detail="the planner used its 200 turns",
+        state="planning",
+        role="planner",
+        attempt=1,
+        session_id="planner-1",
+        resume_at=None,
+    )
+    set_state(world, "paused", pause)
+    world.planner.plans = [PLAN]
+
+    done = world.engine().resume(0, note="Keep it short.")
+
+    assert done.stop == "plan_approval"
+    spec = world.planner.specs[-1]
+    assert (spec.resume, spec.attempt) == ("planner-1", 1)
+    assert spec.prompt.startswith(RESUME_PROMPT)
+    assert "Keep it short." in spec.prompt
+    assert done.run.attempts == {"planner": 1}  # the paused attempt, not a new one
+    assert done.run.pause is None
+
+
 @pytest.mark.parametrize(
     ("state", "match"),
     [
@@ -399,3 +445,16 @@ def test_attach_needs_a_saved_session(world: World) -> None:
 
     with pytest.raises(CliError, match="no saved session"):
         world.engine().attach(0, role="builder")
+
+
+def test_commands_find_the_run_from_inside_its_worktree(world: World) -> None:
+    world.engine().start_feature("Add mul to calc", slug=None)
+    worktree = worktree_dir(world.data, "pilot", 0, "add-mul-to-calc")
+
+    [row] = world.engine(cwd=worktree / "src").runs(all_repos=False)
+    detail = world.engine(worktree).describe(0)
+    stopped = world.engine(cwd=worktree).stop(0)
+
+    assert (row.run.repo, row.run.id) == ("pilot", 0)
+    assert detail.run_folder == world.folder()
+    assert stopped.state == "stopped"

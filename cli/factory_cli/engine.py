@@ -9,7 +9,8 @@ pipeline in the foreground until the run waits for you or stops.
 
 A process holds the run's lock (`lock.py`) while it decides on a run or drives it, so two
 factory processes never write the same run. Ctrl-C stops the pipeline; the run stays in the
-state it was in, and `resume` carries it on with a new attempt of that stage.
+state it was in, and `resume` carries it on with a new attempt of that stage. A paused run
+instead carries on the attempt it paused in, in the same session (`Pipeline.resume_paused`).
 """
 
 import asyncio
@@ -29,7 +30,7 @@ from factory_cli.lock import RunLock
 from factory_engine import decisions
 from factory_engine.agent_config import agent_config_dir
 from factory_engine.agents.runner import AgentRunner, ClaudeAgentRunner, persist
-from factory_engine.agents.watchdog import Sleep, unpause
+from factory_engine.agents.watchdog import Sleep
 from factory_engine.config import (
     Settings,
     load_global_settings,
@@ -129,6 +130,16 @@ class Engine:
             profile = self._preflight(settings)
             if registry.get_repo(repo) is None:  # after the checks: a refused start adds nothing
                 registry.add_repo(repo, path, now=self._deps.clock())
+            held: list[RunLock] = []
+
+            def lock(folder: Path) -> None:
+                # Taken as soon as the run's folder is claimed, before intake publishes the
+                # run, and held until the pipeline stops: no other process can stop or decide
+                # the run in between.
+                run_lock = RunLock(folder / LOCK_FILE)
+                run_lock.acquire()
+                held.append(run_lock)
+
             intake = Intake(
                 data=self._data(),
                 repo=repo,
@@ -137,9 +148,10 @@ class Engine:
                 git=self._git,
                 registry=registry,
                 clock=self._deps.clock,
+                on_claim=lock,
             )
-            started = make(intake, self._requested_by(path))
-            with RunLock(started.run_folder / LOCK_FILE):
+            try:
+                started = make(intake, self._requested_by(path))
                 return self._drive(
                     started.run,
                     started.run_folder,
@@ -150,6 +162,9 @@ class Engine:
                     events=started.events,
                     note=None,
                 )
+            finally:
+                for run_lock in held:
+                    run_lock.release()
 
     # ------------------------------------------------------------------ decisions
 
@@ -231,15 +246,6 @@ class Engine:
                     raise CliError(_not_resumable(run, folder))
                 settings = self._settings(path, run.kind)
                 profile = self._preflight(settings)
-                events = self._events(run, folder)
-                if run.state == "paused":
-                    run = unpause(
-                        run,
-                        now=self._deps.clock(),
-                        events=events,
-                        run_folder=folder,
-                        registry=registry,
-                    )
                 return self._drive(
                     run,
                     folder,
@@ -247,8 +253,10 @@ class Engine:
                     settings=settings,
                     profile=profile,
                     registry=registry,
-                    events=events,
+                    events=self._events(run, folder),
                     note=note,
+                    # A paused run carries on the attempt it paused in, in the same session.
+                    continue_paused=run.state == "paused",
                 )
 
     # ------------------------------------------------------------------ status and attach
@@ -333,6 +341,7 @@ class Engine:
         registry: Registry,
         events: EventLog,
         note: str | None,
+        continue_paused: bool = False,
     ) -> Outcome:
         """Run the pipeline in the foreground until the run waits for you or stops."""
         pipeline = self._pipeline(
@@ -345,7 +354,10 @@ class Engine:
             events=events,
         )
         try:
-            result = asyncio.run(pipeline.advance(note=note))
+            if continue_paused:
+                result = asyncio.run(pipeline.resume_paused(note=note))
+            else:
+                result = asyncio.run(pipeline.advance(note=note))
         except KeyboardInterrupt:
             return Outcome(load_run(folder), "interrupted", folder)
         result = decisions.settle(self._context(folder, events, registry), result)
@@ -423,7 +435,7 @@ class Engine:
                 f"{start} isn't inside a git repo. Run factory from the repo's folder, or pass "
                 "--repo with it."
             )
-        path = Path(top).resolve()
+        path = _main_checkout(self._git, start, Path(top))
         for known in registry.list_repos():
             if _same_path(known.path, path):
                 return known.name, path
@@ -564,6 +576,18 @@ def _attach_command(platform: str, worktree: Path, config: Path, session: str) -
 
 def _ps_quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
+
+
+def _main_checkout(git: Git, start: Path, top: Path) -> Path:
+    """The repo's main checkout. From a linked worktree (a run's), that is the folder holding
+    the shared git folder; otherwise the top of the checkout `start` is in."""
+    done = git.run(["rev-parse", "--path-format=absolute", "--git-common-dir"], start, check=False)
+    common = done.stdout.strip()
+    if done.returncode == 0 and common:
+        shared = Path(common).resolve()
+        if shared.name.lower() == ".git":
+            return shared.parent
+    return top.resolve()
 
 
 def _repo_name(path: Path) -> str:

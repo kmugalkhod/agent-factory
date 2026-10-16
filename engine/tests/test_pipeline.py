@@ -24,6 +24,7 @@ from factory_engine.agents.fake import HOLD, FakeAgentRunner, rate_limit, result
 from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder, not_running
 from factory_engine.agents.watchdog import RESUME_PROMPT
 from factory_engine.config import Settings, default_settings, merge_settings, parse_overrides
+from factory_engine.errors import AgentError
 from factory_engine.events import EventLog, read_events
 from factory_engine.gates.plan import check_plan_text
 from factory_engine.git_ops import Git, run_branch, worktree_dir
@@ -864,6 +865,52 @@ def test_a_turn_cap_pauses_unless_the_check_after_it_fails(world_at: Maker, plan
         assert summary(world.run_folder) == stopped
         assert all(passed for _, passed in checks)
     assert world.run() == done.run
+
+
+def capped_planner() -> Act:
+    return Act(
+        "planner",
+        extra=(result("planner-1", 10, 5, is_error=True, subtype="error_max_turns"),),
+        ends=False,
+    )
+
+
+def test_resuming_a_paused_run_carries_on_the_same_attempt_and_session(world_at: Maker) -> None:
+    world = world_at("pending")
+    caps = world.settings.caps.model_copy(update={"planner_attempts": 1})
+    world.settings = world.settings.model_copy(update={"caps": caps})
+    paused = world.advance(Agents([capped_planner()]))
+    assert (paused.run.state, paused.run.attempts) == ("paused", {"planner": 1})
+    seen = len(read_events(world.run_folder))
+    agents = Agents([planner()])
+
+    done = asyncio.run(world.pipeline(agents).resume_paused(note="Keep it short."))
+
+    # The planner's only attempt (cap 1) carries on: no new attempt, no cap reached.
+    assert (done.stop, done.run.state) == ("plan_approval", "awaiting_plan_approval")
+    [spec] = agents.specs
+    assert (spec.resume, spec.attempt) == ("planner-1", 1)
+    assert spec.prompt.startswith(RESUME_PROMPT)
+    assert "Keep it short." in spec.prompt
+    assert done.run.attempts == {"planner": 1}
+    assert done.run.pause is None
+    assert summary(world.run_folder)[-5:] == [
+        "state paused>planning",
+        "start planner 1",
+        "finish planner 1 completed",
+        "gate plan pass",
+        "state planning>awaiting_plan_approval",
+    ]
+    assert len(read_events(world.run_folder)) > seen
+
+
+def test_resume_paused_refuses_a_run_that_isnt_paused(world_at: Maker) -> None:
+    world = world_at("planning")
+
+    with pytest.raises(AgentError, match="isn't paused"):
+        asyncio.run(world.pipeline(Agents([])).resume_paused())
+
+    assert world.run().state == "planning"
 
 
 def test_a_runner_error_stops_the_run_for_you_after_the_check(world_at: Maker) -> None:

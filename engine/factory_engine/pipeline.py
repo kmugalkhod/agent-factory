@@ -52,7 +52,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, cast, get_args
@@ -111,7 +111,7 @@ from factory_engine.git_ops import (
     rebase_in_progress,
 )
 from factory_engine.providers import Profile
-from factory_engine.run import Role, Run, RunState
+from factory_engine.run import Pause, Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
 from factory_engine.safety.secrets import redact
 from factory_engine.states import move
@@ -291,6 +291,8 @@ class Pipeline:
         self._watchdog = Watchdog(Limits.from_caps(settings.caps), clock=clock, sleep=sleep)
         self._note: str | None = None
         self._builder_message: str | None = None
+        self._continuing: Pause | None = None  # a paused attempt the next attempt carries on
+        self._continue_note: str | None = None  # your note for the attempt that carries on
 
     @property
     def run(self) -> Run:
@@ -365,6 +367,31 @@ class Pipeline:
                 )
         return self._result()
 
+    async def resume_paused(self, *, note: str | None = None) -> PipelineResult:
+        """Carry on a paused run: the attempt it paused in continues in the same session (told
+        to carry on, plus `note`), without counting a new attempt, and then the stage goes on as
+        usual (the post-stage check, the gate). A pause with no saved session starts a new
+        attempt instead. A usage-limit pause is refused before its reset time."""
+        pause = self._run.pause
+        self._run = unpause(
+            self._run,
+            now=self._clock(),
+            events=self.events,
+            run_folder=self.places.run_folder,
+            registry=self._registry,
+        )
+        if pause is None or pause.session_id is None:
+            return await self.advance(note=note)
+        self._continuing, self._continue_note = pause, note
+        try:
+            return await self.advance()
+        finally:
+            self._continuing = self._continue_note = None
+
+    def _continues(self, role: Role) -> bool:
+        """Whether `role`'s next attempt carries on a paused one."""
+        return self._continuing is not None and self._continuing.role == role
+
     def _handler(
         self, handlers: Mapping[RunState, Callable[[], Awaitable[None]]]
     ) -> Callable[[], Awaitable[None]] | None:
@@ -389,7 +416,7 @@ class Pipeline:
     async def _plan(self) -> None:
         reason: str | None = None
         while self._may_try("planner", reason):
-            previous = self._set_plan_aside()
+            previous = None if self._continues("planner") else self._set_plan_aside()
             if previous is False:
                 return
             prompt = _planner_prompt(self.places, reason, self._take_note(), previous)
@@ -441,7 +468,9 @@ class Pipeline:
         reason: str | None = None
         while self._may_try("builder", reason):
             done = self._attempts("builder")
-            if done and not self._archive(HANDOFF_BUILDER, f"handoff-builder-{done}.md", "builder"):
+            archive = done > 0 and not self._continues("builder")
+            kept = f"handoff-builder-{done}.md"
+            if archive and not self._archive(HANDOFF_BUILDER, kept, "builder"):
                 return
             resolving = self._rebasing()
             if resolving is None:
@@ -555,7 +584,7 @@ class Pipeline:
         reason: str | None = None
         for _ in range(REVIEWER_ATTEMPTS):
             done = self._attempts("reviewer")
-            if not self._set_review_aside(done):
+            if not self._continues("reviewer") and not self._set_review_aside(done):
                 return
             diff = self._write_review_diff()
             if diff is None:
@@ -613,10 +642,18 @@ class Pipeline:
 
     async def _attempt(self, role: Role, prompt: str, *, resume: bool) -> Baseline | None:
         """One attempt of `role`'s agent, up to and including the post-stage check. Returns the
-        baseline when the check passed; None when the run stopped (it has moved)."""
-        attempt = self._attempts(role) + 1
+        baseline when the check passed; None when the run stopped (it has moved). After
+        `resume_paused`, the first attempt carries on the paused one instead: same attempt
+        number, same session, told to carry on."""
+        paused, self._continuing = self._continuing, None
+        if paused is not None and paused.role != role:
+            paused = None
+        attempt = paused.attempt if paused is not None else self._attempts(role) + 1
         self._run = self._run.model_copy(
-            update={"stage": role, "attempts": {**self._run.attempts, role: attempt}}
+            update={
+                "stage": role,
+                "attempts": {**self._run.attempts, role: max(attempt, self._attempts(role))},
+            }
         )
         self._save(Step(role, attempt, "started").label)
         places = self.places
@@ -653,8 +690,13 @@ class Pipeline:
                 config_dir=config_dir,
                 prompts_dir=places.prompts,
                 hook=make_safety_hook(policy, self.events),
-                resume=resume,
+                resume=resume and paused is None,
             )
+            if paused is not None:
+                spec = resume_spec(spec, paused)
+                note, self._continue_note = self._continue_note, None
+                if note:
+                    spec = replace(spec, prompt=f"{spec.prompt}\n\n{note}")
             watch = Watch.for_stage(
                 repo=places.repo,
                 data=places.data,
@@ -822,7 +864,7 @@ class Pipeline:
     def _may_try(self, role: Role, reason: str | None) -> bool:
         """Whether `role` has an attempt left; if not, the run stops for you."""
         cap = self._cap(role)
-        if self._attempts(role) < cap:
+        if self._attempts(role) < cap or self._continues(role):
             return True
         last = f" The last attempt failed: {reason}" if reason else ""
         self._needs_you(role, f"the {role} reached its cap of {cap} attempts.{last}")
