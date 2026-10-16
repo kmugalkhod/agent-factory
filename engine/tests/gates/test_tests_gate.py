@@ -6,7 +6,7 @@ import os
 import shlex
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 
@@ -17,12 +17,14 @@ from factory_engine.events import EventLog, read_events
 from factory_engine.gates.tests_gate import (
     GATE,
     TESTER_FILES,
+    FileIndex,
     TesterGateOutcome,
-    belongs,
     check_tests,
     load_tester_files,
+    owned_cases,
 )
 from factory_engine.git_ops import Git
+from factory_engine.testrun import JUnitCase, JUnitReport
 
 PYTHON = shlex.quote(Path(sys.executable).as_posix())
 PYTEST = f"{PYTHON} -m pytest"
@@ -151,6 +153,16 @@ def world(tmp_path: Path, git_env: dict[str, str]) -> World:
             "other_tests_fail",
             id="an-existing-test-fails",
         ),
+        pytest.param(
+            # importlib mode collects both `test_mul.py` files; the root one isn't the tester's
+            {
+                "pytest.ini": "[pytest]\npythonpath = src\naddopts = --import-mode=importlib\n",
+                "test_mul.py": "def test_old_mul():\n    assert 1 == 2\n",
+            },
+            {"tests/test_mul.py": "def test_mul_new():\n    assert 2 * 3 == 6\n"},
+            "other_tests_fail",
+            id="a-same-named-root-test-fails",
+        ),
     ],
 )
 def test_gate_decision(
@@ -254,6 +266,20 @@ def test_a_later_tester_attempt_keeps_earlier_files_that_still_exist(world: Worl
     assert set(load_tester_files(world.run_folder)) == {"tests/test_div.py", "tests/test_mul.py"}
 
 
+def test_a_later_tester_run_counts_the_earlier_tester_tests_as_its_own(world: World) -> None:
+    # A rerun starts from a commit that already holds the first tester run's failing tests;
+    # they are still the tester's, not "existing tests" that must pass.
+    write(world.repo, {"tests/test_mul.py": FAILING_MUL})
+    assert world.check(attempt=1).passed
+    world.git.run(["add", "--all"], world.repo)
+    world.git.run(["commit", "-q", "-m", "factory(run-1): tester attempt 1"], world.repo)
+    world.base = world.git.out(["rev-parse", "HEAD"], world.repo)
+    write(world.repo, {"tests/test_div.py": "def test_div():\n    from calc import div\n"})
+    outcome = world.check(attempt=2)
+    assert outcome.kind == "passed", outcome.reason
+    assert set(outcome.failing_new) == {"tests.test_mul::test_mul", "tests.test_div::test_div"}
+
+
 def test_a_timeout_fails_with_timeout(world: World) -> None:
     write(
         world.repo,
@@ -282,19 +308,66 @@ def test_no_test_command_is_a_config_error(world: World, command: str | None) ->
 # ------------------------------------------------------------------ which file a test is in
 
 
+WORKTREE = PurePosixPath("/data/worktrees/demo/1-x")
+KNOWN = ("test_mul.py", "tests/test_mul.py", "tests/test_calc.py", "app/tests/sum.test.ts")
+
+
 @pytest.mark.parametrize(
-    ("classname", "name", "rel", "expected"),
+    ("path", "roots"),
     [
-        ("tests.test_mul", "test_mul", "tests/test_mul.py", True),
-        ("tests.test_mul.TestMul", "test_one", "tests/test_mul.py", True),
-        ("", "tests.test_mul", "tests/test_mul.py", True),  # a collection error
-        ("tests.test_mul_more", "test_x", "tests/test_mul.py", False),
-        ("tests.test_calc", "test_mul", "tests/test_mul.py", False),
-        ("tests.test_mul", "test_mul", "app/tests/test_mul.py", True),  # rootdir is app/
-        ("tests/sum.test.ts", "sum > adds", "tests/sum.test.ts", True),  # vitest
-        ("tests/sum.test.ts", "sum > adds", "app/tests/sum.test.ts", True),
-        ("tests/other.test.ts", "sum > adds", "tests/sum.test.ts", False),
+        ("tests/test_calc.py", {"": "tests/test_calc.py"}),
+        ("tests\\test_calc.py", {"": "tests/test_calc.py"}),  # pytest on Windows
+        ("test_mul.py", {"": "test_mul.py", "tests": "tests/test_mul.py"}),
+        ("tests/sum.test.ts", {"app": "app/tests/sum.test.ts"}),  # the runner's root is app/
+        ("1-x/tests/test_calc.py", {"../": "tests/test_calc.py"}),  # the root is above
+        ("demo/1-x/test_mul.py", {"../../": "test_mul.py"}),
+        ("test_calc.py", {"tests": "tests/test_calc.py"}),  # fits only a root at `tests/`
+        ("other.py", {}),
+        ("", {}),
+        ("../tests/test_calc.py", {}),
+        ("/data/worktrees/demo/1-x/tests/test_calc.py", {}),
     ],
 )
-def test_belongs(classname: str, name: str, rel: str, expected: bool) -> None:
-    assert belongs(classname, name, rel) is expected
+def test_file_index_finds_each_root_a_path_fits(path: str, roots: dict[str, str]) -> None:
+    assert FileIndex(KNOWN, WORKTREE, windows=False).roots(path) == roots
+
+
+def test_file_index_ignores_case_on_windows() -> None:
+    index = FileIndex(KNOWN, PureWindowsPath("C:/Data/1-X"), windows=True)
+    assert index.roots("Tests/Test_Calc.py") == {"": "tests/test_calc.py"}
+    assert index.roots("1-x/TESTS/test_calc.py") == {"../": "tests/test_calc.py"}
+
+
+def owned(cases: list[JUnitCase], files: set[str]) -> list[bool]:
+    report = JUnitReport(cases=tuple(cases))
+    index = FileIndex(KNOWN, WORKTREE, windows=False)
+    return owned_cases(report, "pytest", dict.fromkeys(files, "hash"), index)
+
+
+def case(file: str) -> JUnitCase:
+    return JUnitCase("x", "test_x", "failed", file=file)
+
+
+def test_a_same_named_file_elsewhere_is_not_the_testers() -> None:
+    # The runner's root is the worktree (`tests/test_calc.py` fits nowhere else), so the root
+    # `test_mul.py` is not the tester's `tests/test_mul.py`.
+    cases = [case("test_mul.py"), case("tests/test_mul.py"), case("tests/test_calc.py")]
+    assert owned(cases, {"tests/test_mul.py"}) == [False, True, False]
+
+
+def test_a_case_is_the_testers_only_under_every_root_that_fits() -> None:
+    # `test_mul.py` alone fits a root at the worktree and one at `tests/`.
+    assert owned([case("test_mul.py")], {"tests/test_mul.py"}) == [False]
+    assert owned([case("test_mul.py")], {"tests/test_mul.py", "test_mul.py"}) == [True]
+
+
+def test_a_case_whose_file_cant_be_found_is_not_the_testers() -> None:
+    cases = [case("tests/test_mul.py"), case("elsewhere/test_y.py"), case("")]
+    assert owned(cases, {"tests/test_mul.py"}) == [True, False, False]
+
+
+def test_vitest_cases_are_found_by_classname() -> None:
+    report = JUnitReport(cases=(JUnitCase("tests/sum.test.ts", "sum > adds", "failed"),))
+    index = FileIndex(KNOWN, WORKTREE, windows=False)
+    files = {"app/tests/sum.test.ts": "hash"}
+    assert owned_cases(report, "vitest", files, index) == [True]
