@@ -39,11 +39,13 @@ from factory_engine.errors import ConfigError, GateError
 from factory_engine.events import EventLog, GateResult
 from factory_engine.gates.tests_gate import (
     TESTER_FILES,
-    belongs,
+    FileIndex,
     blob_ids,
     is_bytecode,
     load_tester_files,
+    owned_cases,
     through_link,
+    worktree_index,
 )
 from factory_engine.git_ops import Git, run_command
 from factory_engine.providers import BASE_VARS
@@ -51,7 +53,6 @@ from factory_engine.safety.paths import PathPolicy, check_worktree_name
 from factory_engine.testrun import (
     DEFAULT_TIMEOUT,
     CommandResult,
-    JUnitCase,
     Runner,
     run_repo_command,
 )
@@ -142,6 +143,7 @@ def check_build(
             "the repo has no test command, so the build can't be checked. Set `commands.test` "
             "in factory.yaml (for example `uv run pytest`)."
         )
+    worktree, run_folder = worktree.resolve(), run_folder.resolve()
     try:
         locked = _locked(run_folder, tester_stage)
         changed, deleted = check_lock(git, worktree, locked)
@@ -177,11 +179,11 @@ def check_build(
         allow=allow,
         # Python reads bytecode from here (empty: none is written) and never from the
         # worktree's `__pycache__`, where code run during the stage could plant some.
-        extra={"PYTHONPYCACHEPREFIX": str(run_folder.resolve() / "cache" / "pycache")},
+        extra={"PYTHONPYCACHEPREFIX": str(run_folder / "cache" / "pycache")},
         runner=runner,
         timer=timer,
     )
-    return judge(result, locked)
+    return judge(result, locked, worktree_index(git, worktree))
 
 
 # ------------------------------------------------------------------ the test lock
@@ -294,8 +296,10 @@ def _flagged(
 # ------------------------------------------------------------------ the decision
 
 
-def judge(result: CommandResult, locked: Mapping[str, str]) -> BuildGateOutcome:
-    """The gate's decision on one test run, given the tester's files. Pure."""
+def judge(result: CommandResult, locked: Mapping[str, str], index: FileIndex) -> BuildGateOutcome:
+    """The gate's decision on one test run, given the tester's files and an index of the
+    worktree's files. A test is the tester's by the tester gate's own matching
+    (`tests_gate.owned_cases`). Pure."""
 
     def outcome(kind: Kind, reason: str) -> BuildGateOutcome:
         failed = kind != "passed"
@@ -343,7 +347,8 @@ def judge(result: CommandResult, locked: Mapping[str, str]) -> BuildGateOutcome:
             "tests_fail",
             f"tests fail: {listed}. Change the code until they pass; the tests are locked.",
         )
-    tester = [case for case in report.cases if _owned(case, locked)]
+    owned = owned_cases(report, result.runner, locked, index)
+    tester = [case for case, mine in zip(report.cases, owned, strict=True) if mine]
     if locked and not tester:
         return outcome(
             "no_tests_ran",
@@ -382,10 +387,6 @@ def _broken(result: CommandResult) -> str:
         f"broken tests: {found}. The tests are locked, so fix the code they load: an import "
         "that fails, a syntax error, a missing name."
     )
-
-
-def _owned(case: JUnitCase, files: Mapping[str, str]) -> bool:
-    return any(belongs(case.classname, case.name, rel) for rel in files)
 
 
 def tail(text: str, *, lines: int = TAIL_LINES, chars: int = TAIL_CHARS) -> str:
