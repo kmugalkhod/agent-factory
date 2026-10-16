@@ -175,7 +175,11 @@ class Git:
 
     def _env(self) -> dict[str, str]:
         env = {k: v for k, v in self.env.items() if k.upper() not in _LOCATION_VARS}
-        env.update(GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true", LC_ALL="C")
+        # Replace objects (`git replace`) only change what git shows, not what a push sends, so
+        # the engine always reads the real commits.
+        env.update(
+            GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true", LC_ALL="C", GIT_NO_REPLACE_OBJECTS="1"
+        )
         return env
 
     def out(self, args: Sequence[str], cwd: Path) -> str:
