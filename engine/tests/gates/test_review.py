@@ -257,6 +257,41 @@ MALFORMED = [
         "then its evidence",
         id="criterion without the full stop",
     ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\n- AC 2: not met. Wrong password succeeds."),
+        "isn't a criterion",
+        id="a valid criterion and a label with a space",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\n- AC-2: not met. Wrong password succeeds."),
+        "isn't a criterion",
+        id="a valid criterion and a label with a dash",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\n- ac2: not met. Wrong password succeeds."),
+        "isn't a criterion",
+        id="a valid criterion and a lower-case label",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\nAC2: not met. Wrong password succeeds."),
+        "isn't a criterion",
+        id="a valid criterion and a label without the dash",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\nAC2 is not met yet."),
+        "isn't a criterion",
+        id="a valid criterion and stray text",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: met. Tests pass.\n- AC1: not met. Wrong password succeeds."),
+        "repeats AC1",
+        id="a criterion marked twice",
+    ),
+    pytest.param(
+        doc(criteria="- AC1: Met. Tests pass."),
+        "doesn't say `met` or `not met`",
+        id="criterion status in capitals",
+    ),
 ]
 
 

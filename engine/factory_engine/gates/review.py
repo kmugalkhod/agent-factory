@@ -38,9 +38,9 @@ _FINDING = re.compile(
     r"(?P<problem>.+?)\. Fix: (?P<fix>.+)"
 )
 _VERDICT = re.compile(r"Verdict: (?P<verdict>approve|request changes)")
-_CRITERION = re.compile(r"- AC\d+\b", re.IGNORECASE)  # a line that names a criterion
+_LABEL = re.compile(r"- AC(?P<number>\d+): ")  # a line that names a criterion
 # The whole status, the template's full stop, then evidence; "met | not met. ..." is unclear.
-_JUDGED = re.compile(r"- AC\d+: (?P<status>met|not met)\.\s+(?P<evidence>\S.*)", re.IGNORECASE)
+_JUDGED = re.compile(r"- AC\d+: (?P<status>met|not met)\.\s+(?P<evidence>\S.*)")
 
 type Body = list[tuple[int, str]]  # (line number, stripped text) of non-blank lines
 
@@ -178,22 +178,32 @@ def _sections(lines: Sequence[str]) -> tuple[list[str], dict[str, Body]]:
 
 
 def _unmet_criteria(body: Body, problems: list[str]) -> int:
-    """How many `- AC<n>:` lines say `not met`. Each such line must say exactly met or not met,
-    a full stop and its evidence, and at least one must exist."""
-    named = unmet = 0
+    """How many criteria are `not met`. Every line of the section must be a criterion in
+    `CRITERION_FORMAT`, each criterion once, and at least one must exist: a line in any other
+    form could hide a criterion not met."""
+    seen: set[int] = set()
+    unmet = 0
     for number, line in body:
-        if not _CRITERION.match(line):
+        label = _LABEL.match(line)
+        if label is None:
+            problems.append(
+                f"line {number} under Acceptance criteria isn't a criterion in the form "
+                f"{CRITERION_FORMAT}: {_quote(line)}"
+            )
             continue
-        named += 1
+        criterion = int(label["number"])
+        if criterion in seen:
+            problems.append(f"line {number} repeats AC{criterion}; mark each criterion once")
+        seen.add(criterion)
         judged = _JUDGED.fullmatch(line)
         if judged is None:
             problems.append(
                 f"line {number} names a criterion but doesn't say `met` or `not met`, a full "
                 f"stop, then its evidence ({CRITERION_FORMAT}): {_quote(line)}"
             )
-        elif judged["status"].lower() == "not met":
+        elif judged["status"] == "not met":
             unmet += 1
-    if not named:
+    if not seen:
         problems.append(
             f"the Acceptance criteria section marks no criterion; write one {CRITERION_FORMAT} "
             "line for each"
