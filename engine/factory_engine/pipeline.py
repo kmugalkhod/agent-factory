@@ -26,9 +26,10 @@ can tell where the run stopped.
 Where later tasks plug in:
 
 - Plan approval (2.21): every plan waits in `awaiting_plan_approval`. `PipelineResult.stop` says
-  whether the plan asks questions or proposes a split. A decision moves the run (to `testing`,
-  or back to `planning`) and calls `advance` again; `advance(note=...)` hands notes to the next
-  agent.
+  whether the plan asks questions or proposes a split (`plan_stop`). A decision
+  (`decisions.py`) moves the run (to `testing`, or back to `planning`); the caller then builds
+  a pipeline from the saved run and calls `advance` again, and `advance(note=...)` hands the
+  decision's note to the next agent.
 - Update before review (2.22): `Hooks.update` runs in `updating`; by default it does nothing and
   the run goes on to `reviewing`. `Hooks.publish` runs once the review passes, before
   `awaiting_merge` (push and pull request). `Pipeline.tell_builder` sets what a builder that
@@ -93,9 +94,8 @@ UPDATE_STEP = "update"
 """The step label saved once the update before review (`Hooks.update`) is done."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
-Stop = Literal[
-    "plan_approval", "questions", "split", "needs_you", "paused", "awaiting_merge", "ended"
-]
+PlanStop = Literal["plan_approval", "questions", "split"]
+Stop = PlanStop | Literal["needs_you", "paused", "awaiting_merge", "ended"]
 ROLES: tuple[Role, ...] = get_args(Role)
 STEP_NAMES: tuple[StepName, ...] = get_args(StepName)
 _ATTEMPT = re.compile(r"[1-9][0-9]{0,8}")
@@ -104,6 +104,14 @@ _STOPS: Mapping[RunState, Stop] = {
     "paused": "paused",
     "awaiting_merge": "awaiting_merge",
 }
+
+
+def plan_stop(plan: PlanCheck) -> PlanStop:
+    """Which decision a plan waits for: a split first (it needs you in milestone 2), then
+    questions, else plan approval."""
+    if plan.split:
+        return "split"
+    return "questions" if plan.questions else "plan_approval"
 
 
 @dataclass(frozen=True)
@@ -261,10 +269,7 @@ class Pipeline:
         state = self._run.state
         if state == "awaiting_plan_approval":
             plan = check_plan(self.places.run_folder / PLAN_FILE)
-            stop: Stop = (
-                "split" if plan.split else "questions" if plan.questions else "plan_approval"
-            )
-            return PipelineResult(self._run, stop, plan)
+            return PipelineResult(self._run, plan_stop(plan), plan)
         return PipelineResult(self._run, _STOPS.get(state, "ended"))
 
     async def _start(self) -> None:

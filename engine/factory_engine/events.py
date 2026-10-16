@@ -17,9 +17,12 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 from factory_engine.errors import EventLogError
-from factory_engine.run import NonNegative, PauseReason, Role, RunState
+from factory_engine.run import Kind, NonNegative, PauseReason, Role, RunState
 
 EVENTS_FILE = "events.jsonl"
+
+DecisionAction = Literal["approve_plan", "edit_and_approve", "send_back", "answer_questions"]
+"""Your decisions on a waiting run (`decisions.py`). Merge approval joins them in task 2.22."""
 
 
 class _Model(BaseModel):
@@ -107,6 +110,22 @@ class Paused(_Model):
     resume_at: AwareDatetime | None
 
 
+class RunCreated(_Model):
+    """Intake created the run (`intake.py`): its kind, and the spec file it was started from."""
+
+    type: Literal["run_created"] = "run_created"
+    kind: Kind
+    spec: str | None = None
+
+
+class Decision(_Model):
+    """You decided on a waiting run: the action and its text (notes or answers), if any."""
+
+    type: Literal["decision"] = "decision"
+    action: DecisionAction
+    text: str | None = None
+
+
 Body = Annotated[
     StateChanged
     | StageStarted
@@ -118,7 +137,9 @@ Body = Annotated[
     | Tokens
     | Message
     | NeedsYou
-    | Paused,
+    | Paused
+    | RunCreated
+    | Decision,
     Field(discriminator="type"),
 ]
 

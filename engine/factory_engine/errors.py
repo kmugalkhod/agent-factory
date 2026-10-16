@@ -67,3 +67,13 @@ class GitHubError(FactoryError):
 class PipelineError(FactoryError):
     """The stage pipeline can't carry a run on, for example a stage that left the run in the
     state it started in."""
+
+
+class IntakeError(FactoryError):
+    """A run can't be started from a request: an empty description, an unreadable spec file or
+    a bad name."""
+
+
+class DecisionError(FactoryError):
+    """A decision can't be applied: the run isn't waiting for it, or what you gave is invalid.
+    The run is left as it was."""

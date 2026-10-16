@@ -511,7 +511,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Steps saved to `run.json` (and the registry): `<role> <attempt> <started | agent | checked | passed | failed | committed>`, and `update`; `Step.parse` reads them back for 2.24. Not yet resumable mid-attempt: the baseline, the builder's message and the reviewer's tries live in memory (2.24).
   - Each agent's prompt names the run folder, the worktree and what to read and write; the system prompts are unchanged. A bootstrap run (2.26) still goes through the tester; only the builder gate's `tester_stage` follows `kind`. New `PipelineError` for a stage that leaves the run in the state it started in (an engine bug).
 
-### [ ] 2.21 Intake, plan approval and planner questions
+### [x] 2.21 Intake, plan approval and planner questions
 
 - **What:** Start a run from a feature description or a spec file. A spec is copied into `intent.md` unchanged. Pause for the four decisions:
   - Questions: your answers are appended to `intent.md` and the planner reruns.
@@ -526,6 +526,13 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Send-back passes the notes to the planner.
 - **Tests:** Unit and scenario tests with the fake runner.
 - **Depends on:** 2.20
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `Intake` (`intake.py`) starts a run on one repo: `feature(description)` (kind `feature`) or `spec(path)` (kind `spec`), each with `requested_by` and an optional slug (else made from the description's first line or the spec's file name, whole words up to 40 characters). It claims the run ID, writes `intent.md`, saves `run.json`, indexes the run, logs a new `run_created` event and creates the run branch and worktree from the fetched `origin/main` (2.14). The run is left `pending` for `Pipeline.advance`. An empty request or an unreadable spec is refused before any ID is claimed. A worktree that can't be made (no remote, no network) moves the run to `failed` and raises, with the request kept in its `intent.md`.
+  - `intent.md` keeps the template's shape for a spec too, as `templates/README.md` says ("a spec is pasted here unchanged"): a header, `## Request`, the request, `## Answers` last. The spec's bytes go in unchanged (nothing is decoded, so CRLF, other encodings and NUL bytes stay); a description is written as UTF-8. The frame around the request is fixed bytes, so `request_of` cuts it back out exactly, before and after answers. The Answers section is empty until the first answers.
+  - `decisions.py` acts on a run in `awaiting_plan_approval`: `approve_plan`, `edit_and_approve(text)`, `send_back(notes)`, `answer_questions(answers)`, plus `hold_split` and `settle`. Each loads `run.json`, checks the run waits for it and that what you gave is usable, else raises the new `DecisionError` (the state it is in and what to do) and changes nothing. Then it writes its file, logs a new `decision` event (action and your notes or answers) and the state change, and saves `run.json` and the registry. It returns `Decided(run, note)`; it doesn't run agents. The caller builds a `Pipeline` from `Decided.run`, calls `advance(note=Decided.note)` and passes the result to `settle`. Merge approval (2.22) adds an action on `awaiting_merge` the same way.
+  - Which decision a plan waits for is `pipeline.plan_stop` (split first, then questions, else approval), shared by the pipeline and the decisions. Approve is refused while the plan asks questions (answer them; an empty answer keeps the planner's default) or proposes a split, and when `plan.md` no longer passes the planner gate. An edit must pass the planner gate and may not keep a Questions or Split section; the gate's `gate_result` is logged before the decision.
+  - Answers: one per question, in order, appended to `intent.md` after a blank line as `### Answers, <YYYY-MM-DD HH:MM> UTC` (the injected clock) and `- Q<n>: <question>` / `  A<n>: <answer>` items, so `## Answers` stays the last `## ` heading. An answer's later lines are indented, so no line you write can become a heading. The planner's rerun is a new session told the answers; send-back tells it your notes and to revise `plan.md`. Both count against the planner's cap (2.20).
+  - A split moves the run to needs_you ("splits arrive in milestone 3"), with a `needs_you` event. That needs a new transition, `awaiting_plan_approval → needs_you`, added to the state machine and its table test.
 
 ### [ ] 2.22 Update, push, pull request and merge
 

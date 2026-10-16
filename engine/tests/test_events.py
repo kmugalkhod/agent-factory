@@ -14,6 +14,7 @@ from factory_engine import events
 from factory_engine.errors import EventLogError
 from factory_engine.events import (
     EVENTS_FILE,
+    Decision,
     Event,
     EventLog,
     EventTail,
@@ -21,6 +22,7 @@ from factory_engine.events import (
     Message,
     NeedsYou,
     Paused,
+    RunCreated,
     SkillLoaded,
     StageFinished,
     StageStarted,
@@ -52,6 +54,10 @@ ONE_OF_EACH = [
         "builder",
     ),
     (Paused(reason="turn_cap", detail="the builder used its 200 turns", resume_at=None), None),
+    (RunCreated(kind="spec", spec="C:/specs/csv-export.md"), None),
+    (RunCreated(kind="feature"), None),
+    (Decision(action="send_back", text="Use the existing helper."), None),
+    (Decision(action="approve_plan"), None),
 ]
 
 
