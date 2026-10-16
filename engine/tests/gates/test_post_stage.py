@@ -251,6 +251,23 @@ def test_a_secret_after_a_separator_byte_in_a_commit_message_fails(
     assert GITHUB_TOKEN not in results[SECRETS].reason
 
 
+def test_a_secret_commit_hidden_behind_a_replace_object_fails(stage: Stage) -> None:
+    """`git replace` changes only what git shows: the push still sends the real commit, so the
+    check must read it too."""
+
+    def change() -> None:
+        _commit_then_remove(stage, "tests/test_leak.py", f"TOKEN = '{GITHUB_TOKEN}'\n")
+        leak = stage.run(stage.worktree, "rev-parse", "HEAD~1")
+        clean = stage.run(
+            stage.worktree, "commit-tree", "HEAD~2^{tree}", "-p", "HEAD~2", "-m", "agent commit"
+        )
+        stage.run(stage.worktree, "replace", leak, clean)
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [SECRETS]
+    assert "tests/test_leak.py" in results[SECRETS].reason
+
+
 def plumb(stage: Stage, *args: str, data: bytes = b"") -> bytes:
     """Run git in the worktree with `data` as its input, all as bytes (no newline changes)."""
     done = subprocess.run(
