@@ -441,7 +441,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Integration tests on fixture repos.
 - **Depends on:** 2.17
 
-### [ ] 2.19 Reviewer gate
+### [x] 2.19 Reviewer gate
 
 - **What:** Parse `review.md` findings and the verdict. Any Important finding → fail, and resume the builder with `review.md`. The reviewer writes `review.md` only, which serves as its handoff; its stage must leave the worktree unchanged.
 - **Touches:** `engine/factory_engine/gates/review.py`, `engine/tests/gates/`
@@ -451,6 +451,11 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - A malformed `review.md` → fail with a retry of the reviewer, not of the builder.
 - **Tests:** Fixture `review.md` files.
 - **Depends on:** 1.2
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - The gate is `check_review(text)` (and `check_review_file(path)`), logged as `gate_result` `review`. Pass: no Important finding and `Verdict: approve`. Important findings: fail, the builder resumes, and `record_findings` adds their count to the run's `metrics.important_findings` (summed over every review of the run). Malformed: fail, the reviewer retries, and no findings are counted.
+  - Malformed means: the file is missing or not UTF-8; the `## ` headings aren't exactly Acceptance criteria, Findings, Verdict in order; a non-blank Findings line is neither a finding in the README's format nor a lone "None"; the Verdict section isn't exactly one `Verdict: approve` or `Verdict: request changes` line; or the Acceptance criteria section holds no criterion, any line that isn't one in the template's form `- AC<n>: <met | not met>. <evidence>` (so `- AC 2: ...`, `ac2`, stray text, `met | not met. ...` or a bare `met` retries the reviewer, since such a line could hide a criterion not met), or the same `AC<n>` twice. Strict on purpose, so an Important finding written another way is never skipped.
+  - A review that contradicts itself is malformed too: `approve` next to an Important finding or a criterion not met, or `request changes` with no Important finding (passing would ignore the reviewer, and the builder would get nothing to fix).
+  - The 60-line page limit isn't checked here, so a long findings list never fails the gate. That the reviewer's stage leaves the worktree unchanged is the post-stage check's job (2.15), through the reviewer's write paths; this gate reads `review.md` only.
 
 ### [ ] 2.20 Stage pipeline with retries and caps
 
