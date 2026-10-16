@@ -36,6 +36,7 @@ CREDENTIALS = (
     "GITHUB_TOKEN",
 )
 LEAKS = (*CREDENTIALS, "FACTORY_UNLISTED")  # credentials, and a variable nobody allowed
+PASSING_OK = "def test_ok():\n    pass\n"
 
 
 def clock() -> datetime:
@@ -150,6 +151,11 @@ def test_report_args_for_pytest_write_junit_and_keep_the_cache_out_of_the_worktr
     assert f"cache_dir={tmp_path / 'cache'}" in args
 
 
+def test_report_args_for_pytest_ask_for_test_files_in_the_report(tmp_path: Path) -> None:
+    args = report_args("pytest", tmp_path / "junit.xml", tmp_path / "cache")
+    assert args[args.index("junit_family=xunit1") - 1] == "-o"
+
+
 def test_report_args_for_vitest_write_junit(tmp_path: Path) -> None:
     report = tmp_path / "junit.xml"
     args = report_args("vitest", report, tmp_path / "cache")
@@ -204,7 +210,8 @@ def test_command_env_keeps_python_from_writing_bytecode_into_the_worktree() -> N
 PYTEST_REPORT = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites name="pytest tests"><testsuite name="pytest" errors="1" failures="1" skipped="1"
  tests="5" time="0.1">
-<testcase classname="tests.test_calc" name="test_add" time="0.001" />
+<testcase classname="tests.test_calc" name="test_add" file="tests/test_calc.py" line="3"
+ time="0.001" />
 <testcase classname="tests.test_calc" name="test_mul" time="0.001">
 <failure message="ImportError: cannot import name 'mul'">trace</failure></testcase>
 <testcase classname="tests.test_calc.TestDiv" name="test_div[1-2]" time="0.001">
@@ -233,6 +240,7 @@ def test_read_junit_counts_a_pytest_report(tmp_path: Path) -> None:
     assert report.collection_errors == ("tests.test_broken",)
     failed = [case.id for case in report.cases if case.outcome == "failed"]
     assert failed == ["tests.test_calc::test_mul"]
+    assert report.cases[0].file == "tests/test_calc.py"
 
 
 def test_read_junit_counts_a_vitest_report(tmp_path: Path) -> None:
@@ -293,6 +301,29 @@ def test_passing_tests_exit_0_with_counts(tmp_path: Path, run_folder: Path, log:
     assert result.runner == "pytest"
     assert result.report is not None
     assert (result.report.passed, result.report.failed) == (1, 0)
+
+
+def test_the_report_names_each_test_file(tmp_path: Path, run_folder: Path, log: EventLog) -> None:
+    repo = make_repo(tmp_path / "repo", {"tests/test_ok.py": PASSING_OK})
+    result = run(repo, run_folder, log)
+    assert result.report is not None
+    files = [case.file.replace("\\", "/") for case in result.report.cases]
+    assert files == ["tests/test_ok.py"]
+
+
+def test_a_relative_worktree_and_run_folder_still_get_a_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_repo(tmp_path / "repo", {"tests/test_ok.py": PASSING_OK})
+    (tmp_path / "run").mkdir()
+    log = EventLog(tmp_path / "run", repo="demo", run_id=1, clock=clock)
+    monkeypatch.chdir(tmp_path)
+    result = run(Path("repo"), Path("run"), log)
+    assert result.report is not None, result.report_problem
+    assert result.report.passed == 1
+    assert result.output_path == (tmp_path / "run" / "test-output-tester-1.txt").resolve()
+    assert (tmp_path / "run" / "junit-tester-1.xml").is_file()
+    assert not (tmp_path / "repo" / "run").exists()
 
 
 def test_failing_tests_are_reported_by_name(

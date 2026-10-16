@@ -9,12 +9,18 @@ After the tester's stage the engine checks, in order:
 3. For pytest and vitest it reads the JUnit report:
    - any collection, syntax, fixture or setup error, or no usable report → "broken tests";
    - no tests ran → "no tests ran";
-   - none of the tests that ran is in the tester's files → "no new tests";
+   - none of the tests that ran is in the tester's files (this stage's and those recorded by
+     an earlier tester stage) → "no new tests";
    - a test outside the tester's files fails → "existing tests fail";
    - none of the tester's tests fails → "tests pass before the build".
    Otherwise the gate passes: at least one new test fails on its assertions. A new test that
    passes next to failing ones is allowed (a check that existing behaviour is unchanged).
 4. Other runners give the exit code only: 0 → "tests pass before the build", else pass.
+
+A test case's file is the one its report names (pytest's `file`, vitest's `classname`), relative
+to the runner's root. The root is found once per report: the folder (the worktree, one inside
+it, or one above it) under which every reported file exists. A file that could sit under more
+than one such root counts as the tester's only if it is the tester's under each of them.
 
 The tester's files and their git blob ids go to `<run folder>/tester-files.json` for the test
 lock (task 2.18, `gates/build.py`). The gate returns its decision; the pipeline logs `event()`
@@ -22,10 +28,11 @@ and retries the tester with `reason` on a fail.
 """
 
 import re
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
@@ -40,6 +47,7 @@ from factory_engine.testrun import (
     DEFAULT_TIMEOUT,
     CommandResult,
     JUnitCase,
+    JUnitReport,
     Runner,
     run_repo_command,
     write_atomic,
@@ -103,7 +111,7 @@ class TesterGateOutcome:
     passed: bool
     kind: Kind
     reason: str
-    files: Mapping[str, str] = field(default_factory=dict)  # this stage's files and hashes
+    files: Mapping[str, str] = field(default_factory=dict)  # every tester file, blob ids
     run: CommandResult | None = None  # None when the tests didn't run
     failing_new: tuple[str, ...] = ()  # test IDs in the tester's files that fail
     passing_new: tuple[str, ...] = ()  # and those that pass
@@ -137,8 +145,11 @@ def check_tests(
             "the repo has no test command, so the tester's tests can't be checked. Set "
             "`commands.test` in factory.yaml (for example `uv run pytest`)."
         )
+    worktree, run_folder = worktree.resolve(), run_folder.resolve()
     files = tester_files(git, worktree=worktree, run_folder=run_folder, base=base, tester=tester)
-    record_tester_files(git, run_folder, worktree, files)
+    # Judge by every file a tester stage wrote: a retry or rerun starting from a commit that
+    # already holds earlier tester files must not count their failing tests as someone else's.
+    recorded = record_tester_files(git, run_folder, worktree, files)
     if not files:
         allowed = ", ".join(tester.write_paths) or "nothing"
         return TesterGateOutcome(
@@ -163,14 +174,15 @@ def check_tests(
         runner=runner,
         timer=timer,
     )
-    return judge(result, files)
+    return judge(result, recorded, worktree_index(git, worktree))
 
 
 # ------------------------------------------------------------------ the decision
 
 
-def judge(result: CommandResult, files: Mapping[str, str]) -> TesterGateOutcome:
-    """The gate's decision on one test run, given the tester's files. Pure."""
+def judge(result: CommandResult, files: Mapping[str, str], index: "FileIndex") -> TesterGateOutcome:
+    """The gate's decision on one test run, given the tester's files and an index of the
+    worktree's files. Pure."""
 
     def outcome(kind: Kind, reason: str, **found: tuple[str, ...]) -> TesterGateOutcome:
         if kind != "passed":
@@ -209,7 +221,8 @@ def judge(result: CommandResult, files: Mapping[str, str]) -> TesterGateOutcome:
             f"no tests ran: the test command (exit {code}) collected no tests. Check that the "
             "new test files are named and placed so the test runner finds them.",
         )
-    new = [case for case in report.cases if _owned(case, files)]
+    owned = owned_cases(report, result.runner, files, index)
+    new = [case for case, mine in zip(report.cases, owned, strict=True) if mine]
     failing = tuple(case.id for case in new if case.outcome == "failed")
     passing = tuple(case.id for case in new if case.outcome == "passed")
     if not new:
@@ -218,7 +231,11 @@ def judge(result: CommandResult, files: Mapping[str, str]) -> TesterGateOutcome:
             "no new tests: none of the tests the command ran is in the tester's files "
             f"({_listed(sorted(files))}). Write the tests where the test runner collects them.",
         )
-    others = [case.id for case in report.cases if case.outcome == "failed" and case not in new]
+    others = [
+        case.id
+        for case, mine in zip(report.cases, owned, strict=True)
+        if case.outcome == "failed" and not mine
+    ]
     if others:
         return outcome(
             "other_tests_fail",
@@ -265,26 +282,76 @@ def _broken(result: CommandResult) -> str:
     )
 
 
-def belongs(classname: str, name: str, rel: str) -> bool:
-    """Whether a JUnit test case comes from the file `rel` (worktree-relative, `/`).
+class FileIndex:
+    """The worktree's files (tracked and untracked, not ignored), for finding which file a
+    test runner's path names."""
 
-    vitest names the file in `classname`. pytest gives a dotted module path (`tests.test_x`,
-    then any classes), relative to its rootdir, which may be a subfolder of the worktree; for
-    a file it couldn't collect, the module is the `name` and `classname` is empty."""
-    owner = (classname or name).replace("\\", "/")
-    rel = rel.replace("\\", "/")
-    if "/" in owner:
-        return owner == rel or rel.endswith("/" + owner) or owner.endswith("/" + rel)
-    module = rel.removesuffix(".py").split("/")
-    for start in range(len(module)):
-        dotted = ".".join(module[start:])
-        if owner == dotted or owner.startswith(dotted + "."):
-            return True
-    return False
+    def __init__(
+        self, files: Iterable[str], worktree: PurePath, *, windows: bool = sys.platform == "win32"
+    ) -> None:
+        self.windows = windows
+        self.worktree_parts = tuple(self.key(part) for part in worktree.parts)
+        self.files = {self.key(rel): rel for rel in files}
+        self.by_name: dict[str, list[str]] = {}
+        for rel in self.files.values():
+            self.by_name.setdefault(self.key(rel.rsplit("/", 1)[-1]), []).append(rel)
+
+    def key(self, text: str) -> str:
+        return text.casefold() if self.windows else text
+
+    def roots(self, path: str) -> dict[str, str]:
+        """Each place the runner's root could be such that `path` (relative to that root)
+        names a worktree file, mapped to the file (worktree-relative). A root inside the
+        worktree is its worktree-relative folder ("" for the worktree itself); one above it is
+        `../` per level."""
+        parts = [part for part in path.replace("\\", "/").split("/") if part not in ("", ".")]
+        if not parts or path.startswith(("/", "\\")) or ".." in parts or ":" in parts[0]:
+            return {}
+        joined = self.key("/".join(parts))
+        found: dict[str, str] = {}
+        for rel in self.by_name.get(self.key(parts[-1]), []):
+            key = self.key(rel)
+            if key == joined:
+                found[""] = rel
+            elif key.endswith("/" + joined):
+                found[rel[: len(rel) - len(joined) - 1]] = rel
+        for up in range(1, len(self.worktree_parts)):
+            tail = self.worktree_parts[-up:]
+            if len(parts) > up and tuple(self.key(p) for p in parts[:up]) == tail:
+                rel = self.files.get(self.key("/".join(parts[up:])))
+                if rel is not None:
+                    found["../" * up] = rel
+        return found
 
 
-def _owned(case: JUnitCase, files: Mapping[str, str]) -> bool:
-    return any(belongs(case.classname, case.name, rel) for rel in files)
+def worktree_index(git: Git, worktree: Path) -> FileIndex:
+    """The `FileIndex` of the worktree's files, tracked and untracked, not ignored."""
+    known = git.run(
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], worktree
+    ).stdout
+    return FileIndex([name for name in known.split("\0") if name], worktree)
+
+
+def case_path(case: JUnitCase, runner: str | None) -> str:
+    """The file a test case's report names, relative to the runner's root: pytest's `file`
+    (in the `xunit1` report the engine asks for), vitest's `classname`."""
+    return case.file if runner == "pytest" else case.classname
+
+
+def owned_cases(
+    report: JUnitReport, runner: str | None, files: Mapping[str, str], index: FileIndex
+) -> list[bool]:
+    """For each test case, whether it is in one of the tester's `files`. The runner's root is
+    the one under which every reported file exists; when more than one fits, a case is the
+    tester's only if it is under each of them. A case whose file can't be found isn't."""
+    candidates = [index.roots(case_path(case, runner)) for case in report.cases]
+    found = [set(roots) for roots in candidates if roots]
+    shared = set.intersection(*found) if found else set()
+    mine = {index.key(rel) for rel in files}
+    return [
+        bool(roots) and bool(shared) and all(index.key(roots[root]) in mine for root in shared)
+        for roots in candidates
+    ]
 
 
 def _listed(items: Sequence[str]) -> str:
@@ -345,7 +412,7 @@ def record_tester_files(
 
 
 def load_tester_files(run_folder: Path) -> dict[str, str]:
-    """The tester's files and hashes from `tester-files.json`; empty when there is none yet."""
+    """The tester's files and blob ids from `tester-files.json`; empty when there is none yet."""
     path = run_folder / TESTER_FILES
     try:
         text = path.read_text(encoding="utf-8")

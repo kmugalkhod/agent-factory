@@ -128,10 +128,18 @@ def detect_runner(argv: Sequence[str]) -> Framework | None:
 
 
 def report_args(runner: Framework | None, report: Path, cache: Path) -> list[str]:
-    """Arguments added to the command so the runner writes a JUnit report to `report`.
-    pytest also keeps its cache in `cache` (the run folder), out of the worktree."""
+    """Arguments added to the command so the runner writes a JUnit report to `report`. pytest
+    writes the `xunit1` form, whose test cases name their file, and keeps its cache in `cache`
+    (the run folder), out of the worktree. Both paths must be absolute: the command runs in
+    the worktree."""
     if runner == "pytest":
-        return [f"--junitxml={report}", "-o", f"cache_dir={cache}"]
+        return [
+            f"--junitxml={report}",
+            "-o",
+            "junit_family=xunit1",
+            "-o",
+            f"cache_dir={cache}",
+        ]
     if runner == "vitest":
         return ["--reporter=default", "--reporter=junit", f"--outputFile.junit={report}"]
     return []
@@ -207,6 +215,7 @@ class JUnitCase:
     name: str
     outcome: Outcome
     message: str = ""
+    file: str = ""  # the test's file relative to the runner's root, when the report gives it
 
     @property
     def id(self) -> str:
@@ -266,12 +275,14 @@ def read_junit(path: Path) -> JUnitReport:
 
 def _case(element: ET.Element) -> JUnitCase:
     classname, name = element.get("classname", ""), element.get("name", "")
+    file = element.get("file", "")
     for tag, outcome in _OUTCOME_TAGS:
         found = element.find(tag)
         if found is not None:
             message = found.get("message") or (found.text or "").strip()
-            return JUnitCase(classname, name, outcome, message.splitlines()[0] if message else "")
-    return JUnitCase(classname, name, "passed")
+            first = message.splitlines()[0] if message else ""
+            return JUnitCase(classname, name, outcome, first, file)
+    return JUnitCase(classname, name, "passed", file=file)
 
 
 def _int(text: str | None) -> int:
@@ -326,6 +337,8 @@ def run_repo_command(
     """
     if attempt < 1:
         raise ValueError(f"attempt {attempt} is invalid; attempts count from 1.")
+    # The command runs in the worktree, so every path handed to it must be absolute.
+    worktree, run_folder = worktree.resolve(), run_folder.resolve()
     argv = parse_command(command)
     env = command_env(parent_env, allow, extra)
     program = resolve_program(argv[0], worktree, env)
