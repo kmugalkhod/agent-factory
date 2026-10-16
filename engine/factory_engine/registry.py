@@ -19,7 +19,17 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 from factory_engine.errors import RegistryError
 from factory_engine.paths import repo_runs_dir, run_dir
-from factory_engine.run import CLAIMS, RUN_FILE, Metrics, Pause, Role, Run, load_run
+from factory_engine.run import (
+    CLAIMS,
+    RUN_FILE,
+    ApprovedMerge,
+    Metrics,
+    Pause,
+    PullRequestInfo,
+    Role,
+    Run,
+    load_run,
+)
 
 REGISTRY_FILE = "registry.db"
 
@@ -64,12 +74,18 @@ MIGRATIONS = [
     """
     ALTER TABLE runs ADD COLUMN pause TEXT;
     """,
+    # The run's pull request and your merge approval (task 2.22), as JSON, null until set.
+    """
+    ALTER TABLE runs ADD COLUMN pull_request TEXT;
+    ALTER TABLE runs ADD COLUMN merge_approval TEXT;
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 RUN_COLUMNS = (
     "repo, id, slug, kind, state, stage, provider, isolation, created_at, updated_at, "
-    "last_completed_step, important_findings, pr_lines_changed_by_you, pause"
+    "last_completed_step, important_findings, pr_lines_changed_by_you, pause, pull_request, "
+    "merge_approval"
 )
 ROLES: tuple[Role, ...] = ("planner", "tester", "builder", "reviewer")
 
@@ -320,6 +336,16 @@ class Registry:
             ),
             last_completed_step=row["last_completed_step"],
             pause=Pause.model_validate_json(row["pause"]) if row["pause"] is not None else None,
+            pull_request=(
+                PullRequestInfo.model_validate_json(row["pull_request"])
+                if row["pull_request"] is not None
+                else None
+            ),
+            merge_approval=(
+                ApprovedMerge.model_validate_json(row["merge_approval"])
+                if row["merge_approval"] is not None
+                else None
+            ),
         )
 
 
@@ -346,7 +372,7 @@ def _repo(row: sqlite3.Row) -> Repo:
 def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
     conn.execute("DELETE FROM runs WHERE repo = ? AND id = ?", (run.repo, run.id))  # cascades
     conn.execute(
-        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * 14)})",
+        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * 16)})",
         (
             run.repo,
             run.id,
@@ -362,6 +388,8 @@ def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
             run.metrics.important_findings,
             run.metrics.pr_lines_changed_by_you,
             run.pause.model_dump_json() if run.pause is not None else None,
+            run.pull_request.model_dump_json() if run.pull_request is not None else None,
+            run.merge_approval.model_dump_json() if run.merge_approval is not None else None,
         ),
     )
     for role in ROLES:

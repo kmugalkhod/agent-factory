@@ -19,7 +19,16 @@ from factory_engine.registry import (
     open_registry,
     registry_path,
 )
-from factory_engine.run import Metrics, Pause, Run, allocate_run, new_run, save_run
+from factory_engine.run import (
+    ApprovedMerge,
+    Metrics,
+    Pause,
+    PullRequestInfo,
+    Run,
+    allocate_run,
+    new_run,
+    save_run,
+)
 
 NOW = datetime(2026, 10, 10, 9, 30, tzinfo=UTC)
 
@@ -198,6 +207,43 @@ def test_version_1_database_gains_the_pause_column(tmp_path: Path) -> None:
             "pr_lines_changed_by_you) VALUES "
             "('app', 3, 'status-json', 'feature', 'pending', NULL, 'subscription', "
             "'worktree', ?, ?, NULL, 0, NULL)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+    conn.close()
+    with open_registry(path) as reg:
+        assert reg.get_run("app", 3) == _run("app", 3, "status-json")
+
+
+def test_a_run_keeps_its_pull_request_and_merge_approval(reg: Registry) -> None:
+    head = "0123456789abcdef0123456789abcdef01234567"
+    run = _busy_run("app", 3, "status-json").model_copy(
+        update={
+            "state": "awaiting_merge",
+            "pull_request": PullRequestInfo(
+                number=7,
+                url="https://github.com/kunal/pilot/pull/7",
+                head=head,
+                rebased_from="f" * 40,
+            ),
+            "merge_approval": ApprovedMerge(pr_number=7, head=head),
+        }
+    )
+    reg.upsert_run(run)
+    assert reg.get_run("app", 3) == run
+
+
+def test_version_2_database_gains_the_pull_request_columns(tmp_path: Path) -> None:
+    path = tmp_path / "registry.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(MIGRATIONS[0])
+        conn.executescript(MIGRATIONS[1])
+        conn.execute("PRAGMA user_version = 2")
+        conn.execute(
+            "INSERT INTO runs (repo, id, slug, kind, state, stage, provider, isolation, "
+            "created_at, updated_at, last_completed_step, important_findings, "
+            "pr_lines_changed_by_you, pause) VALUES "
+            "('app', 3, 'status-json', 'feature', 'pending', NULL, 'subscription', "
+            "'worktree', ?, ?, NULL, 0, NULL, NULL)",
             (NOW.isoformat(), NOW.isoformat()),
         )
     conn.close()

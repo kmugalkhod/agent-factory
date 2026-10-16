@@ -77,3 +77,8 @@ class IntakeError(FactoryError):
 class DecisionError(FactoryError):
     """A decision can't be applied: the run isn't waiting for it, or what you gave is invalid.
     The run is left as it was."""
+
+
+class MergeError(FactoryError):
+    """A merge was refused: no approval recorded for the pull request's current head, or the
+    run isn't waiting for its merge."""
