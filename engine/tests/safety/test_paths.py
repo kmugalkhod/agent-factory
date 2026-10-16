@@ -59,13 +59,19 @@ def _policy(roots: dict[str, Path], role: Role, bootstrap: bool = False) -> Path
     )
 
 
+def _fill(text: str, roots: dict[str, Path]) -> str:
+    """Put the real folders in for `{wt}`, `{run}` and `{out}`. Not `str.format`: inputs such as
+    the glob `*.{py,txt}` hold braces of their own."""
+    for name, folder in roots.items():
+        text = text.replace(f"{{{name}}}", str(folder))
+    return text
+
+
 def _check(
     roots: dict[str, Path], role: Role, tool: str, tool_input: dict[str, object], **kw: bool
 ) -> PathDecision:
     filled = {
-        key: value.format(**{k: str(v) for k, v in roots.items()})
-        if isinstance(value, str)
-        else value
+        key: _fill(value, roots) if isinstance(value, str) else value
         for key, value in tool_input.items()
     }
     return check_file_tool(_policy(roots, role, **kw), tool, filled)
@@ -396,7 +402,7 @@ def test_each_link_a_search_meets_is_judged_by_its_target_and_the_glob(
     """The judgement behind the link tests below, which need symlink rights to run."""
     policy = _policy(roots, "builder")
     link = roots["wt"] / "src" / "notes.txt"
-    resolved = Path(target.format(**{k: str(v) for k, v in roots.items()})).resolve()
+    resolved = Path(_fill(target, roots)).resolve()
     blocked = _link_decision(policy, link, "src/notes.txt", resolved, is_file, glob)
     _assert(blocked or PathDecision(True), allowed, reason)
 
