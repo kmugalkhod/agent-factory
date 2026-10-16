@@ -364,6 +364,10 @@ def test_split_without_questions_is_returned_alone() -> None:
     assert [part.depends_on for part in check.split] == [(), (1,)]
 
 
+DEPENDS_FORM = "Write `depends on none` or `depends on part N`"
+TITLE_AND_SCOPE = "needs a title and a scope"
+
+
 @pytest.mark.parametrize(
     ("split", "phrase"),
     [
@@ -371,15 +375,95 @@ def test_split_without_questions_is_returned_alone() -> None:
         ("1. Everything: the whole change, depends on none", "at least two parts"),
         ("1. A: first, depends on none\n3. B: second, depends on part 1", "numbered 1, 2"),
         ("1. A: first, depends on none\n2. B: second", "doesn't say what it depends on"),
-        ("1. A: first, depends on none\n2. B: second, depends on the parser", "names no part"),
+        ("1. A: first, depends on none\n2. B: second, depends on the parser", DEPENDS_FORM),
+        ("1. A: first, depends on none\n2. B: second, depends on version 1", DEPENDS_FORM),
+        ("1. A: first, depends on none\n2. B: second, depends on part 1 or so", DEPENDS_FORM),
+        ("1. A: first, depends on none\n2. B: second, depends on", DEPENDS_FORM),
+        (
+            "1. A: first, depends on none\n2. B: second, depends on part 1\n"
+            "3. C: third, depends on Python 3.12 and part 1",
+            DEPENDS_FORM,
+        ),
         ("1. A: first, depends on part 2\n2. B: second, depends on none", "isn't an earlier part"),
         ("1. A: first, depends on none\n2. B: second, depends on part 2", "isn't an earlier part"),
+        ("1. A: first, depends on none\n2. B, depends on part 1", TITLE_AND_SCOPE),
+        ("1. A: first, depends on none\n2. : second, depends on part 1", TITLE_AND_SCOPE),
+        ("1. A: first, depends on none\n2. B: , depends on part 1", TITLE_AND_SCOPE),
+        ("1. A: first, depends on none\n2. depends on part 1", TITLE_AND_SCOPE),
     ],
 )
 def test_bad_split_fails_on_split(split: str, phrase: str) -> None:
     check = check_plan_text(make({"Split": split}))
     assert kinds(check) == (ProblemKind.SPLIT,)
     assert phrase in check.reason
+
+
+@pytest.mark.parametrize(
+    ("clause", "depends_on"),
+    [
+        ("none", ()),
+        ("None.", ()),
+        ("part 1", (1,)),
+        ("Part 1.", (1,)),
+        ("part 1 and part 2", (1, 2)),
+        ("part 1, part 2", (1, 2)),
+        ("part 1, and part 2", (1, 2)),
+    ],
+)
+def test_split_dependency_forms_are_read(clause: str, depends_on: tuple[int, ...]) -> None:
+    split = (
+        "1. A: first, depends on none\n2. B: second, depends on part 1\n"
+        f"3. C: third, depends on {clause}"
+    )
+    check = check_plan_text(make({"Split": split}))
+    assert check.passed
+    assert check.split is not None
+    assert check.split[2].depends_on == depends_on
+
+
+def test_split_scope_may_hold_numbers_before_its_dependencies() -> None:
+    split = (
+        "1. A: first, depends on none\n"
+        "2. B: move to Python 3.12 and version 2 of the API, depends on part 1"
+    )
+    check = check_plan_text(make({"Split": split}))
+    assert check.passed
+    assert check.split is not None
+    assert check.split[1] == SplitPart(
+        number=2,
+        title="B",
+        scope="move to Python 3.12 and version 2 of the API",
+        depends_on=(1,),
+    )
+
+
+def test_split_parts_without_title_and_scope_each_fail() -> None:
+    check = check_plan_text(make({"Split": "1. A, depends on none\n2. B, depends on part 1"}))
+    assert kinds(check) == (ProblemKind.SPLIT, ProblemKind.SPLIT)
+    assert "Split part 1 needs a title and a scope" in check.reason
+    assert "Split part 2 needs a title and a scope" in check.reason
+
+
+# Python 3.12 refuses to convert a run of more than 4,300 digits to an int.
+HUGE = "1" * 5000
+
+
+def test_oversized_list_number_is_not_an_item() -> None:
+    check = check_plan_text(make({"Steps": f"{HUGE}. Add the option."}))
+    assert kinds(check) == (ProblemKind.NO_STEPS,)
+
+
+def test_nine_digit_list_number_is_an_item() -> None:
+    check = check_plan_text(make({"Steps": "123456789. Add the option."}))
+    assert check.passed
+    assert check.steps == ("Add the option.",)
+
+
+def test_oversized_dependency_number_fails_on_split() -> None:
+    split = f"1. A: first, depends on none\n2. B: second, depends on part {HUGE}"
+    check = check_plan_text(make({"Split": split}))
+    assert kinds(check) == (ProblemKind.SPLIT,)
+    assert DEPENDS_FORM in check.reason
 
 
 def test_questions_heading_with_no_questions_fails_on_questions() -> None:

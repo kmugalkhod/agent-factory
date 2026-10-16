@@ -10,10 +10,10 @@ Rules, checked line by line (no Markdown parser, so the result never depends on 
 - Headings: every required `## ` heading once, optional ones at most once, no others, in the
   template's order. Text before the first heading (the `# ` title) is ignored.
 - No code fences: gates read headings line by line, so a fenced `## ` line would be misread.
-- An item is a list line at column 0: `1.` or `1)` for a numbered one, `-`, `*` or `+` for a
-  bullet. A non-blank line right after it continues it, and so does an indented line after a
-  blank one; anything else ends it. An item that is only a template placeholder (`<step>`)
-  doesn't count.
+- An item is a list line at column 0: `1.` or `1)` for a numbered one (at most nine digits, as
+  in CommonMark), `-`, `*` or `+` for a bullet. A non-blank line right after it continues it,
+  and so does an indented line after a blank one; anything else ends it. An item that is only
+  a template placeholder (`<step>`) doesn't count.
 - Files: list items that start with a path in backticks (``- `src/app.py`: change, why``).
 - Steps and acceptance criteria: numbered items. Bullets don't count.
 - A criterion is measurable when its text has a code span in backticks (a command, call, file
@@ -21,7 +21,10 @@ Rules, checked line by line (no Markdown parser, so the result never depends on 
   result, such as returns, raises, exits, prints, writes or shows). This is a floor, not a
   judgement: you still check the criteria when you approve the plan.
 - Split (optional): numbered parts 1, 2, 3, ... in order, at least two, each
-  `<title>: <scope>, depends on <none | part N>`. A part may depend only on earlier parts.
+  `<title>: <scope>, depends on <none | part N>`, with a title and a scope. The dependency
+  clause is exactly `none` or `part N` items joined by `and` or commas (`part 1 and part 2`);
+  any other words fail, so no number is mistaken for a part. A part may depend only on earlier
+  parts.
 - Questions (optional): numbered; `Why it matters:` and `Default if unanswered:` are read
   when present.
 
@@ -55,7 +58,8 @@ OBSERVABLE = (
     "sends", "sent", "redirects", "redirected", "appears", "appeared",
 )  # fmt: skip
 
-_NUMBERED = re.compile(r"^(\d+)[.)]\s+(\S.*)$")
+# At most nine digits, as in CommonMark; this also keeps `int()` under Python's digit limit.
+_NUMBERED = re.compile(r"^(\d{1,9})[.)]\s+(\S.*)$")
 _BULLET = re.compile(r"^[-*+]\s+(\S.*)$")
 _PLACEHOLDER = re.compile(r"^<[^<>]*>$")
 _FILE = re.compile(r"^`([^`]+)`")
@@ -65,6 +69,8 @@ _DIGIT = re.compile(r"\d")
 _TEST = re.compile(r"\btest_\w+")
 _VERB = re.compile(r"\b(?:" + "|".join(OBSERVABLE) + r")\b", re.IGNORECASE)
 _DEPENDS = re.compile(r"^(?P<head>.*)\bdepends on\b(?P<deps>.*)$", re.IGNORECASE)
+_PART_REF = re.compile(r"part\s+(\d{1,9})", re.IGNORECASE)
+_PART_JOIN = re.compile(r"\s*,\s*(?:and\s+)?|\s+and\s+", re.IGNORECASE)
 _WHY = re.compile(r"\bwhy it matters:", re.IGNORECASE)
 _DEFAULT = re.compile(r"\bdefault if unanswered:", re.IGNORECASE)
 
@@ -428,46 +434,70 @@ def _split(lines: Sequence[str]) -> tuple[tuple[SplitPart, ...], list[Problem]]:
         )
     parts: list[SplitPart] = []
     for index, item in enumerate(items):
-        part, problem = _part(item, earlier=numbers[:index])
+        part, part_problems = _part(item, earlier=numbers[:index])
         parts.append(part)
-        if problem is not None:
-            problems.append(problem)
+        problems += part_problems
     return tuple(parts), problems
 
 
-def _part(item: _NumberedItem, earlier: Sequence[int]) -> tuple[SplitPart, Problem | None]:
-    """One split part, and the problem with its dependencies, if any."""
+def _part(item: _NumberedItem, earlier: Sequence[int]) -> tuple[SplitPart, list[Problem]]:
+    """One split part, and the problems with its title, scope or dependencies."""
     match = _DEPENDS.match(item.text)
     head = match.group("head") if match else item.text
-    title, _, scope = head.rstrip(" ,;.").partition(": ")
+    title, colon, scope = head.rstrip(" ,;.").partition(": ")
+    title, scope = title.strip(), scope.strip()
+    problems: list[Problem] = []
+    if not (colon and title and scope):
+        problems.append(
+            Problem(
+                ProblemKind.SPLIT,
+                f"Split part {item.number} needs a title and a scope. Write it as "
+                "`<part title>: <scope>, depends on <none | part N>`.",
+            )
+        )
     depends_on: tuple[int, ...] = ()
-    problem: Problem | None = None
     if match is None:
-        problem = Problem(
-            ProblemKind.SPLIT,
-            f"Split part {item.number} doesn't say what it depends on. End it with "
-            "`depends on none` or `depends on part N`.",
+        problems.append(
+            Problem(
+                ProblemKind.SPLIT,
+                f"Split part {item.number} doesn't say what it depends on. End it with "
+                "`depends on none` or `depends on part N`.",
+            )
         )
     else:
         clause = match.group("deps").strip().rstrip(".").strip()
         if clause.lower() != "none":
-            depends_on = tuple(int(n) for n in re.findall(r"\d+", clause))
-            if not depends_on:
-                problem = Problem(
-                    ProblemKind.SPLIT,
-                    f"Split part {item.number} depends on `{clause}`, which names no part "
-                    "number. Write `depends on part N` or `depends on none`.",
+            refs = _depends(clause)
+            if refs is None:
+                problems.append(
+                    Problem(
+                        ProblemKind.SPLIT,
+                        f"Split part {item.number} says `depends on {clause}`. Write "
+                        "`depends on none` or `depends on part N`, joining several parts with "
+                        "`and` (`depends on part 1 and part 2`), and nothing else.",
+                    )
                 )
-            elif bad := [n for n in depends_on if n not in earlier]:
-                problem = Problem(
-                    ProblemKind.SPLIT,
-                    f"Split part {item.number} depends on part {bad[0]}, which isn't an earlier "
-                    "part. A part may depend only on parts listed before it.",
-                )
-    part = SplitPart(
-        number=item.number, title=title.strip(), scope=scope.strip(), depends_on=depends_on
-    )
-    return part, problem
+            else:
+                depends_on = refs
+                if bad := [n for n in depends_on if n not in earlier]:
+                    problems.append(
+                        Problem(
+                            ProblemKind.SPLIT,
+                            f"Split part {item.number} depends on part {bad[0]}, which isn't "
+                            "an earlier part. A part may depend only on parts listed before it.",
+                        )
+                    )
+    part = SplitPart(number=item.number, title=title, scope=scope, depends_on=depends_on)
+    return part, problems
+
+
+def _depends(clause: str) -> tuple[int, ...] | None:
+    """The part numbers in a `part N and part M` clause, or None when the clause has anything
+    else in it."""
+    refs = [_PART_REF.fullmatch(piece) for piece in _PART_JOIN.split(clause)]
+    if not all(refs):
+        return None
+    return tuple(int(ref.group(1)) for ref in refs if ref is not None)
 
 
 def _question(item: _NumberedItem) -> Question:
