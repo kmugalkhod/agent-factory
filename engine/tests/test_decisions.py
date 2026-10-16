@@ -362,6 +362,30 @@ def test_send_back_passes_the_notes_to_the_planner(world: Maker) -> None:
     assert again.run.attempts == {"planner": 2}
 
 
+def test_a_planner_that_writes_no_plan_after_a_send_back_fails_its_gate(world: Maker) -> None:
+    w = world()
+    w.waiting()
+    decided = send_back(w.ctx, "Name it `multiply`.")
+    seq = w.last_seq()
+
+    agents = Agents([Act(), planner(EDITED)])  # the rerun writes nothing; the next one a plan
+    again = w.advance(agents, note=decided.note)
+
+    plan_gates = [
+        body.passed
+        for body in w.bodies(seq)
+        if isinstance(body, ev.GateResult) and body.gate == "plan"
+    ]
+    assert plan_gates == [False, True]
+    archived = w.run_folder / "attempts" / "plan-1.md"
+    assert archived.read_bytes().decode("utf-8") == PLAN
+    first, second = agents.specs
+    assert str(archived) in first.prompt
+    assert "doesn't exist" in second.prompt
+    assert w.plan() == EDITED
+    assert (again.stop, again.run.attempts) == ("plan_approval", {"planner": 3})
+
+
 @pytest.mark.parametrize("notes", ["", "  \n "])
 def test_send_back_needs_notes(world: Maker, notes: str) -> None:
     w = world()
