@@ -51,6 +51,7 @@ FILE_TOOLS: dict[str, tuple[str, bool, str | None]] = {
 OPTIONAL_PATH = frozenset({"Glob", "Grep"})  # these search the worktree when no path is given
 SEARCHES_CONTENT = frozenset({"Grep"})  # reads every file it searches, so each one is checked
 UNSURE_GLOB = re.compile(r"[{}\[\]]|^!")  # braces, classes and negation: assume it matches
+_SHORT_NAME = re.compile(r"~\d")  # `PROGRA~1`: Windows may open the long name it stands for
 
 
 @dataclass(frozen=True)
@@ -244,6 +245,29 @@ def _write(policy: PathPolicy, raw: str, path: Path) -> PathDecision:
         return _outside(policy, raw)
     if not rel:
         return _block(f"{raw} is the worktree itself; write a file inside it.")
+    return _worktree_write(policy, rel)
+
+
+def check_worktree_name(policy: PathPolicy, rel: str) -> PathDecision:
+    """Judge a name git records for the worktree (`a/b.py`) by the same write rules, as the name
+    itself: nothing is resolved, so a link is judged as the link, never as where it leads. A
+    name that isn't a plain path, or that Windows would open as another file, is refused."""
+    parts = rel.split("/")
+    if "\\" in rel or any(part in ("", ".", "..") for part in parts):
+        return _block(f"{rel!r} isn't a plain path inside the worktree.")
+    if policy.windows:
+        if any(":" in part for part in parts):
+            return _block(f"{rel} names a data stream (`:`).")
+        if any(part.endswith((".", " ")) for part in parts):
+            return _block(f"{rel} has a name with a trailing dot or space; Windows drops them.")
+        if any(_SHORT_NAME.search(part) for part in parts):
+            return _block(f"{rel} looks like an 8.3 short name, which Windows may open as another.")
+    return _worktree_write(policy, rel)
+
+
+def _worktree_write(policy: PathPolicy, rel: str) -> PathDecision:
+    """The write rules for `rel`, a non-empty path relative to the worktree."""
+    role = policy.role
     if _matches(rel, PROTECTED, policy.windows):
         return _block(f"{rel} is a protected file; agents never change it.")
     if role != "tester" and _key(rel, policy.windows) in policy.locked:

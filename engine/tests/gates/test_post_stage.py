@@ -22,6 +22,7 @@ from factory_engine.gates.post_stage import (
     post_stage_check,
     take_baseline,
     z_names,
+    z_raw,
 )
 from factory_engine.git_ops import Git, create_worktree
 from factory_engine.run import Role, Run, RunState, load_run, new_run, save_run
@@ -300,6 +301,80 @@ def test_a_newline_in_a_committed_file_name_is_kept(stage: Stage) -> None:
 
     results = results_by_gate(check(stage, "tester", change))
     assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
+
+
+LINK = "120000"  # git's mode for a symbolic link
+
+
+def _commit_entry(stage: Stage, folder: str, name: str, mode: str, data: bytes) -> None:
+    """Commit `folder/name` as a `mode` entry holding `data` with git's plumbing only (no file on
+    disk, so a link works on Windows too), and move the run branch to it."""
+    blob = plumb(stage, "hash-object", "-w", "--stdin", data=data).decode().strip()
+
+    def others(listing: bytes, skip: str) -> list[bytes]:
+        return [e for e in listing.split(b"\0") if e and not e.endswith(b"\t" + skip.encode())]
+
+    inner = others(plumb(stage, "ls-tree", "-z", f"HEAD:{folder}"), name)
+    inner.append(f"{mode} blob {blob}\t{name}".encode())
+    sub = plumb(stage, "mktree", "-z", data=b"".join(e + b"\0" for e in inner)).decode().strip()
+    top = others(plumb(stage, "ls-tree", "-z", "HEAD"), folder)
+    top.append(f"040000 tree {sub}\t{folder}".encode())
+    tree = plumb(stage, "mktree", "-z", data=b"".join(e + b"\0" for e in top)).decode().strip()
+    commit = stage.run(stage.worktree, "commit-tree", tree, "-p", "HEAD", "-m", "agent commit")
+    stage.run(stage.worktree, "update-ref", "HEAD", commit)
+
+
+def test_a_file_turned_into_a_link_to_an_allowed_path_fails(stage: Stage) -> None:
+    """`src/app.py` made a link to `tests/test_app.py` is still a change to `src/app.py`."""
+
+    def change() -> None:
+        _commit_entry(stage, "src", "app.py", LINK, b"../tests/test_app.py")
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
+    assert "src/app.py" in results[ALLOWED_PATHS].reason
+
+
+def test_a_link_inside_the_roles_own_paths_fails(stage: Stage) -> None:
+    def change() -> None:
+        _commit_entry(stage, "tests", "test_link.py", LINK, b"test_app.py")
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
+    reason = results[ALLOWED_PATHS].reason
+    assert "tests/test_link.py" in reason
+    assert "link" in reason
+
+
+def test_a_plain_file_committed_in_the_roles_own_paths_passes(stage: Stage) -> None:
+    def change() -> None:
+        _commit_entry(stage, "tests", "test_more.py", "100644", b"x = 1\n")
+
+    assert failed_gates(check(stage, "tester", change)) == []
+
+
+@pytest.mark.parametrize(
+    ("output", "entries"),
+    [
+        (
+            ":100644 120000 aaa bbb T\0src/app.py\0:000000 100644 000 ccc A\0\ntests/x.py\0",
+            [("src/app.py", LINK), ("\ntests/x.py", "100644")],
+        ),
+        (":100644 000000 aaa 000 D\0:odd name.py\0", [(":odd name.py", "000000")]),
+        ("", []),
+    ],
+    ids=["link-and-newline", "name-like-a-record", "empty"],
+)
+def test_z_raw_reads_each_record_exactly(output: str, entries: list[tuple[str, str]]) -> None:
+    assert z_raw(output) == entries
+
+
+@pytest.mark.parametrize(
+    "output", [":100644 100644 aaa bbb M\0", "src/app.py\0src/b.py\0"], ids=["no-name", "no-meta"]
+)
+def test_z_raw_refuses_output_it_cant_read(output: str) -> None:
+    with pytest.raises(GateError):
+        z_raw(output)
 
 
 @pytest.mark.parametrize(

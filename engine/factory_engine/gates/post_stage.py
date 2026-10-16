@@ -13,7 +13,8 @@ write outside the worktree. Before a stage the engine takes a `Baseline`; after 
    may change during a stage. In the run folder only the role's own run docs and the engine's
    `run.json` and `events.jsonl` may change.
 3. `post_stage.allowed_paths`: every path the stage's diff touches (added, changed or deleted,
-   committed or not) is one the role may write, judged by the same rules as the path hook.
+   committed or not) is one the role may write, judged by the path hook's write rules on the
+   name git records, never on where a link leads. A link (git mode 120000) fails for every role.
 4. `post_stage.secrets`: the secret scan of the diff's added lines is clean.
 
 The diff is the worktree against the commit it started the stage on, untracked files included
@@ -40,7 +41,7 @@ from factory_engine.events import EVENTS_FILE, EventLog, GateResult, NeedsYou
 from factory_engine.git_ops import Git
 from factory_engine.registry import REGISTRY_FILE
 from factory_engine.run import RUN_FILE, Role, Run
-from factory_engine.safety.paths import PathPolicy, check_file_tool
+from factory_engine.safety.paths import PathPolicy, check_worktree_name
 from factory_engine.safety.secrets import SecretFinding, scan_diff, scan_text
 from factory_engine.states import move
 
@@ -56,6 +57,7 @@ GIT_WATCHED = ("config", "config.worktree", "hooks", "info")
 SQLITE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 MAX_LISTED = 10
 BINARY_PROBE = 8000  # bytes git looks at to decide a file is binary
+LINK_MODE = "120000"  # git's mode for a symbolic link
 # The diff the secret scan reads: added lines only, and no helpers from the repo's config.
 DIFF_OPTIONS = (
     "--no-color",
@@ -265,9 +267,9 @@ def check_stage(
         )
     except Exception as err:
         policy = err
-    changed: list[str] | Exception
+    changed: dict[str, bool] | Exception
     try:
-        changed = _changed_paths(git, watch.worktree, baseline.base)
+        changed = _changed_entries(git, watch.worktree, baseline.base)
     except Exception as err:
         changed = err
 
@@ -342,10 +344,15 @@ def _check_outside(watch: Watch, baseline: Baseline, role: Role, policy: PathPol
     )
 
 
-def _check_paths(role: Role, policy: PathPolicy, changed: Sequence[str]) -> GateResult:
+def _check_paths(role: Role, policy: PathPolicy, changed: Mapping[str, bool]) -> GateResult:
+    """Each changed name judged as itself (`changed` says whether it is a link). A link fails
+    wherever it is: what it changes is where it leads, which its name doesn't show."""
     refused: list[str] = []
-    for rel in changed:
-        decision = check_file_tool(policy, "Write", {"file_path": str(policy.worktree / rel)})
+    for rel in sorted(changed):
+        if changed[rel]:
+            refused.append(f"{rel} (a link; stages never add links, which can lead anywhere)")
+            continue
+        decision = check_worktree_name(policy, rel)
         if not decision.allowed:
             refused.append(f"{rel} ({decision.reason.removeprefix('Blocked: ')})")
     if not refused:
@@ -400,26 +407,67 @@ def _scan_file(path: Path, rel: str) -> list[SecretFinding]:
 # ------------------------------------------------------------------ the diff
 
 
-def _changed_paths(git: Git, worktree: Path, base: str) -> list[str]:
-    """Every worktree-relative path the stage added, changed or deleted since `base`, in the
-    final files or in any commit made during the stage (even if a later commit put it back)."""
-    tracked = git.run(["diff", "--name-only", "--no-renames", "-z", base, "--"], worktree).stdout
-    names = set(z_names(tracked))
-    names.update(_untracked(git, worktree))
+def _changed_entries(git: Git, worktree: Path, base: str) -> dict[str, bool]:
+    """Every worktree-relative name the stage added, changed or deleted since `base`, in the
+    final files or in any commit made during the stage (even if a later commit put it back),
+    and whether any of those versions is a link."""
+    changed: dict[str, bool] = {}
+
+    def add(entries: Iterable[tuple[str, str]]) -> None:
+        for name, mode in entries:
+            changed[name] = changed.get(name, False) or mode == LINK_MODE
+
+    add(
+        z_raw(
+            git.run(
+                ["diff", "--raw", "-z", "--no-color", "--no-renames", base, "--"], worktree
+            ).stdout
+        )
+    )
+    for rel in _untracked(git, worktree):
+        path = worktree / rel
+        add([(rel, LINK_MODE if path.is_symlink() or path.is_junction() else "")])
     for commit, parent in _stage_commits(git, worktree, base):
         against = [parent, commit] if parent else ["--root", commit]
         out = git.run(
-            ["diff-tree", "-r", "-z", "--name-only", "--no-renames", "--no-commit-id", *against],
+            [
+                "diff-tree",
+                "-r",
+                "-z",
+                "--raw",
+                "--no-color",
+                "--no-renames",
+                "--no-commit-id",
+                *against,
+            ],
             worktree,
         ).stdout
-        names.update(z_names(out))
-    return sorted(names)
+        add(z_raw(out))
+    return changed
 
 
 def z_names(out: str) -> list[str]:
     """The names in git's `-z` output, exactly as git wrote them. A name may hold any byte but
     NUL (a newline, spaces, control bytes), so split on NUL only and strip nothing."""
     return [name for name in out.split("\0") if name]
+
+
+def z_raw(out: str) -> list[tuple[str, str]]:
+    """(name, new mode) for each record of `git diff --raw -z --no-renames` output: a field
+    `:old_mode new_mode old_id new_id status`, then the name, each ended by NUL. Fields are
+    taken in pairs, never by what they look like, so any name is read exactly."""
+    fields = out.split("\0")
+    if fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2:
+        raise GateError("git's raw diff output has a record without a name; can't judge it.")
+    entries: list[tuple[str, str]] = []
+    for meta, name in zip(fields[::2], fields[1::2], strict=True):
+        parts = meta.split(" ")
+        if not meta.startswith(":") or len(parts) != 5 or not name:
+            raise GateError(f"can't read git's raw diff record {meta!r}; can't judge it.")
+        entries.append((name, parts[1]))
+    return entries
 
 
 def _new_commits(base: str) -> list[str]:
