@@ -60,6 +60,41 @@ _OPERATOR_CHARS = frozenset("();<>|&")
 _SUBSTITUTIONS = ("`", "$(", "\n", "\r")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _PROGRAM_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+_PYTHON = re.compile(r"python[0-9.]*|py|pypy[0-9.]*")
+_PYTHON_VALUE_OPTIONS = frozenset({"-W", "-X", "--check-hash-based-pycs"})
+_VITEST_COMMANDS = frozenset({"run", "watch", "dev"})
+_RUN_LAUNCHERS = frozenset({"uv", "poetry", "pipenv"})  # `<launcher> run [options] <program>`
+_NODE_LAUNCHERS = frozenset({"npx", "npm", "pnpm", "yarn", "bunx"})
+# Launcher options followed by a separate value, so the value isn't taken for the program.
+_UV_VALUE_OPTIONS = frozenset(
+    {
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--project",
+        "--directory",
+        "--extra",
+        "--group",
+        "--only-group",
+        "--no-group",
+        "--env-file",
+        "--package",
+        "--index",
+        "--default-index",
+        "--index-url",
+        "-i",
+        "--extra-index-url",
+        "--find-links",
+        "-f",
+        "--config-file",
+        "--cache-dir",
+    }
+)
+_NODE_VALUE_OPTIONS = frozenset(
+    {"-p", "--package", "-c", "--call", "--filter", "-F", "--dir", "-C", "--workspace", "-w"}
+)
 _COLLECTION_FAILURE = "collection failure"  # pytest's message for a file it couldn't collect
 _DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 # A test case's child element and the outcome it means, most serious first.
@@ -115,16 +150,74 @@ def _needs_shell(command: str, what: str) -> str:
 
 
 def detect_runner(argv: Sequence[str]) -> Framework | None:
-    """`pytest` or `vitest` when the command runs one of them by name, else None."""
-    for arg in argv:
-        name = PurePosixPath(arg.replace("\\", "/")).name.lower()
-        for suffix in _PROGRAM_SUFFIXES:
-            name = name.removesuffix(suffix)
+    """`pytest` or `vitest` when the command runs one of them, else None."""
+    return locate_runner(argv)[0]
+
+
+def locate_runner(argv: Sequence[str]) -> tuple[Framework | None, int]:
+    """The test runner the command starts, and the index in `argv` right after the runner's
+    own name (`pytest`, `-m pytest`, `vitest` or `vitest run`): where the engine's options go,
+    ahead of the runner's arguments and any `--`. Only the command position is looked at:
+    the program itself, `<python> -m pytest`, or the program a known launcher starts (`uv
+    run`, `poetry run`, `pipenv run`, `npx`, `npm exec`, `pnpm [exec|dlx]`, `yarn [exec|dlx]`).
+    Arguments never pick the runner. Returns (None, 0) for anything else."""
+    i = 0
+    while i < len(argv):
+        name = _program_name(argv[i])
         if name in ("pytest", "py.test"):
-            return "pytest"
+            return "pytest", i + 1
         if name == "vitest":
-            return "vitest"
-    return None
+            after = i + 2 if i + 1 < len(argv) and argv[i + 1] in _VITEST_COMMANDS else i + 1
+            return "vitest", after
+        if _PYTHON.fullmatch(name):
+            return _python_module(argv, i + 1)
+        if name in _RUN_LAUNCHERS:
+            if i + 1 >= len(argv) or argv[i + 1] != "run":
+                return None, 0
+            i = _skip_options(argv, i + 2, _UV_VALUE_OPTIONS if name == "uv" else frozenset())
+        elif name in _NODE_LAUNCHERS:
+            i = _skip_options(argv, i + 1, _NODE_VALUE_OPTIONS)
+            if i < len(argv) and argv[i] in ("exec", "dlx", "x"):
+                i = _skip_options(argv, i + 1, _NODE_VALUE_OPTIONS)
+            elif name == "npm":
+                return None, 0  # `npm test` and other npm commands run a package script
+        else:
+            return None, 0
+    return None, 0
+
+
+def _program_name(arg: str) -> str:
+    """A program's name without its folder or Windows extension, in lower case."""
+    name = PurePosixPath(arg.replace("\\", "/")).name.lower()
+    for suffix in _PROGRAM_SUFFIXES:
+        name = name.removesuffix(suffix)
+    return name
+
+
+def _python_module(argv: Sequence[str], start: int) -> tuple[Framework | None, int]:
+    """`python [options] -m pytest`: pytest, with options going after `pytest`."""
+    i = start
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-m":
+            module = argv[i + 1] if i + 1 < len(argv) else ""
+            return ("pytest", i + 2) if module in ("pytest", "py.test") else (None, 0)
+        if arg.startswith("-m"):  # `-mpytest`
+            return ("pytest", i + 1) if arg[2:] in ("pytest", "py.test") else (None, 0)
+        if not arg.startswith("-") or arg in ("-", "-c"):
+            return None, 0  # a script, stdin or `-c code`: not pytest
+        i += 2 if arg in _PYTHON_VALUE_OPTIONS else 1
+    return None, 0
+
+
+def _skip_options(argv: Sequence[str], start: int, takes_value: frozenset[str]) -> int:
+    """The index of the first argument from `start` that isn't a launcher option (or `--`)."""
+    i = start
+    while i < len(argv) and argv[i].startswith("-"):
+        if argv[i] == "--":
+            return i + 1
+        i += 2 if argv[i] in takes_value else 1
+    return i
 
 
 def report_args(runner: Framework | None, report: Path, cache: Path) -> list[str]:
@@ -143,6 +236,18 @@ def report_args(runner: Framework | None, report: Path, cache: Path) -> list[str
     if runner == "vitest":
         return ["--reporter=default", "--reporter=junit", f"--outputFile.junit={report}"]
     return []
+
+
+def with_report_args(
+    argv: Sequence[str], report: Path, cache: Path
+) -> tuple[list[str], Framework | None]:
+    """`argv` with `report_args` placed right after the runner's name, ahead of the runner's
+    own arguments and any `--` (after which they would be taken as file names), and the
+    runner. Unchanged for other runners."""
+    runner, at = locate_runner(argv)
+    full = list(argv)
+    full[at:at] = report_args(runner, report, cache)
+    return full, runner
 
 
 # ------------------------------------------------------------------ the environment
@@ -342,14 +447,13 @@ def run_repo_command(
     argv = parse_command(command)
     env = command_env(parent_env, allow, extra)
     program = resolve_program(argv[0], worktree, env)
-    framework = detect_runner(argv)
     report_path = run_folder / f"junit-{stage}-{attempt}.xml"
     output_path = run_folder / f"test-output-{stage}-{attempt}.txt"
     try:  # a report left from an earlier run must never stand in for this one
         report_path.unlink(missing_ok=True)
     except OSError as err:
         raise GateError(f"{report_path}: can't remove the old report ({err}).") from err
-    full = [str(program), *argv[1:], *report_args(framework, report_path, run_folder / "cache")]
+    full, framework = with_report_args([str(program), *argv[1:]], report_path, run_folder / "cache")
 
     started = timer()
     try:

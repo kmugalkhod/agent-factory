@@ -23,6 +23,7 @@ from factory_engine.testrun import (
     read_junit,
     report_args,
     run_repo_command,
+    with_report_args,
 )
 
 PYTEST = f"{shlex.quote(Path(sys.executable).as_posix())} -m pytest"
@@ -136,10 +137,61 @@ def test_parse_command_refuses_unusable_commands(command: str) -> None:
         (["npm", "test"], None),
         (["python", "tests/test_pytest.py"], None),
         (["cargo", "test"], None),
+        # Only the command position picks the runner, never an argument.
+        (["python", "-m", "unittest", "discover", "-s", "tests/pytest"], None),
+        (["python", "scripts/run.py", "pytest"], None),
+        (["node", "scripts/vitest.js"], None),
+        (["make", "pytest"], None),
+        (["uv", "run", "python", "-m", "unittest", "tests/test_vitest.py"], None),
+        (["uv", "sync", "pytest"], None),
+        # Launchers and their options.
+        (["python3.12", "-X", "utf8", "-m", "pytest"], "pytest"),
+        (["python", "-mpytest"], "pytest"),
+        (["C:/Python312/python.exe", "-m", "pytest"], "pytest"),
+        (["uv", "run", "--frozen", "--with", "pytest-xdist", "pytest"], "pytest"),
+        (["uv", "run", "--", "pytest"], "pytest"),
+        (["uv", "run", "python", "-m", "pytest"], "pytest"),
+        (["poetry", "run", "pytest"], "pytest"),
+        (["npx", "--yes", "vitest"], "vitest"),
+        (["npm", "exec", "--", "vitest"], "vitest"),
+        (["pnpm", "vitest", "run"], "vitest"),
+        (["pnpm", "--filter", "web", "exec", "vitest"], "vitest"),
+        (["yarn", "vitest"], "vitest"),
     ],
 )
 def test_detect_runner(argv: list[str], runner: str | None) -> None:
     assert detect_runner(argv) == runner
+
+
+R = "REPORT"  # stands for the engine's options in the expected commands below
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["pytest"], ["pytest", R]),
+        (["pytest", "-x", "tests"], ["pytest", R, "-x", "tests"]),
+        (["pytest", "--", "tests"], ["pytest", R, "--", "tests"]),
+        (["python", "-m", "pytest", "--", "tests"], ["python", "-m", "pytest", R, "--", "tests"]),
+        (
+            ["uv", "run", "pytest", "-x", "--", "tests"],
+            ["uv", "run", "pytest", R, "-x", "--", "tests"],
+        ),
+        (["uv", "run", "--", "pytest", "--", "t"], ["uv", "run", "--", "pytest", R, "--", "t"]),
+        (["npx", "vitest", "run", "--", "src"], ["npx", "vitest", "run", R, "--", "src"]),
+        (["pnpm", "vitest", "--", "src"], ["pnpm", "vitest", R, "--", "src"]),
+        (["python", "check.py", "--", "x"], ["python", "check.py", "--", "x"]),
+    ],
+)
+def test_report_options_go_right_after_the_runner(
+    tmp_path: Path, argv: list[str], expected: list[str]
+) -> None:
+    report, cache = tmp_path / "junit.xml", tmp_path / "cache"
+    full, runner = with_report_args(argv, report, cache)
+    added = report_args(runner, report, cache)
+    at = expected.index(R) if R in expected else len(expected)
+    assert full == [*expected[:at], *added, *expected[at + 1 :]]
+    assert bool(added) == (R in expected)
 
 
 def test_report_args_for_pytest_write_junit_and_keep_the_cache_out_of_the_worktree(
