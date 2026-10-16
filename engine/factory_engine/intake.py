@@ -56,7 +56,7 @@ class Started:
 class Intake:
     """Starts runs on one repo. Everything it uses is passed in: the data folder, the repo's
     name and main checkout, the run's effective settings (provider and isolation), git, the
-    registry and a clock."""
+    registry and a clock, and optionally what to do once a run's folder is claimed."""
 
     data: Path
     repo: str
@@ -67,6 +67,9 @@ class Intake:
     clock: Callable[[], datetime]
     remote: str = "origin"
     base: str = "main"
+    on_claim: Callable[[Path], None] | None = None
+    """Called with the run folder as soon as it is claimed, before anything is written into it
+    or indexed (the CLI takes the run's lock there). If it raises, the run isn't published."""
 
     def feature(self, description: str, *, requested_by: str, slug: str | None = None) -> Started:
         """Start a feature run from your description, written into `intent.md` as given. The
@@ -112,6 +115,8 @@ class Intake:
         check_slug(slug)
         now = self.clock()
         run_id, folder = allocate_run(self.data, self.repo, slug)
+        if self.on_claim is not None:
+            self.on_claim(folder)
         intent = folder / INTENT_FILE
         header = (
             f"# Intent: run-{run_id}-{slug}\n\nKind: {kind}\nRepo: {self.repo}\n"

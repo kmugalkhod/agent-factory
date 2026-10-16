@@ -4,7 +4,7 @@ spec file, against a temporary repo with a bare "remote"."""
 import subprocess
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -275,3 +275,26 @@ def test_a_worktree_that_cant_be_made_fails_the_run(place: Place, tmp_path: Path
 def test_request_of_refuses_a_file_without_the_headings() -> None:
     with pytest.raises(IntakeError):
         request_of(b"# Intent\n\nNo headings here.\n")
+
+
+def test_on_claim_runs_once_the_folder_is_claimed_before_the_run_is_written(place: Place) -> None:
+    seen: list[tuple[Path, list[str]]] = []
+
+    def claim(folder: Path) -> None:
+        seen.append((folder, sorted(path.name for path in folder.iterdir())))
+
+    started = replace(place.intake(), on_claim=claim).feature("Add mul", requested_by="Kunal")
+
+    assert seen == [(started.run_folder, [])]
+
+
+def test_a_refusing_on_claim_publishes_nothing(place: Place) -> None:
+    def refuse(folder: Path) -> None:
+        raise IntakeError("someone else holds the run")
+
+    with pytest.raises(IntakeError, match="someone else"):
+        replace(place.intake(), on_claim=refuse).feature("Add mul", requested_by="Kunal")
+
+    folder = run_dir(place.data, REPO, 0, "add-mul")
+    assert sorted(path.name for path in folder.iterdir()) == []
+    assert place.registry.get_run(REPO, 0) is None
