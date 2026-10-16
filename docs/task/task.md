@@ -395,7 +395,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Integration tests with temporary repos.
 - **Depends on:** 2.8, 2.10, 2.14
 
-### [ ] 2.16 Planner gate
+### [x] 2.16 Planner gate
 
 - **What:** Parse `plan.md` using the headings fixed in 1.2. Pass only when it has:
   - files and steps
@@ -409,6 +409,12 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Split and Questions sections are returned when present.
 - **Tests:** Fixture `plan.md` files, good and bad.
 - **Depends on:** 1.2
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `check_plan(path)` returns the verdict, the reason (one line per problem, all reported at once, for the planner retry) and what it read: files, steps, criteria (each marked measurable or not), Split and Questions. `event()` gives the `gate_result` event, gate `plan`. A missing or unreadable `plan.md` fails; the gate never raises.
+  - The headings are the contract: each required heading once, optional ones at most once, no others, in the template's order. Code fences fail, since gates read headings line by line. The 60-line limit isn't checked: it doesn't change what the gate reads.
+  - Files are list items starting with a path in backticks; steps and criteria are numbered items (bullets don't count). An item that is only a template placeholder (`<step>`) doesn't count, so the unfilled template fails.
+  - A criterion is measurable when it has a code span in backticks, a digit, a test name (`test_...`) or an observable result from a fixed word list (returns, raises, exits, prints, writes, shows, ...; the list is in `gates/plan.py`). The plan passes with at least one measurable criterion; the passing reason names any that aren't, for plan approval.
+  - Split parts are numbered 1, 2, 3 in order, at least two, and each is `<title>: <scope>, depends on ...` with a non-blank title and scope. The clause is exactly `none` or `part N` items joined by `and` or commas, on earlier parts only; any other words fail (so `depends on version 1` isn't read as part 1), since milestone 3 schedules parts from this data. List numbers have at most nine digits, as in CommonMark, so a huge number is not an item and never raises. Questions only need numbering; `Why it matters:` and `Default if unanswered:` are read when present. A Split or Questions heading with no items fails. A plan with questions still needs files, steps and criteria (built on its defaults).
 
 ### [x] 2.17 Tester gate
 
@@ -445,7 +451,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Integration tests on fixture repos.
 - **Depends on:** 2.17
 
-### [ ] 2.19 Reviewer gate
+### [x] 2.19 Reviewer gate
 
 - **What:** Parse `review.md` findings and the verdict. Any Important finding → fail, and resume the builder with `review.md`. The reviewer writes `review.md` only, which serves as its handoff; its stage must leave the worktree unchanged.
 - **Touches:** `engine/factory_engine/gates/review.py`, `engine/tests/gates/`
@@ -455,6 +461,11 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - A malformed `review.md` → fail with a retry of the reviewer, not of the builder.
 - **Tests:** Fixture `review.md` files.
 - **Depends on:** 1.2
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - The gate is `check_review(text)` (and `check_review_file(path)`), logged as `gate_result` `review`. Pass: no Important finding and `Verdict: approve`. Important findings: fail, the builder resumes, and `record_findings` adds their count to the run's `metrics.important_findings` (summed over every review of the run). Malformed: fail, the reviewer retries, and no findings are counted.
+  - Malformed means: the file is missing or not UTF-8; the `## ` headings aren't exactly Acceptance criteria, Findings, Verdict in order; a non-blank Findings line is neither a finding in the README's format nor a lone "None"; the Verdict section isn't exactly one `Verdict: approve` or `Verdict: request changes` line; or the Acceptance criteria section holds no criterion, any line that isn't one in the template's form `- AC<n>: <met | not met>. <evidence>` (so `- AC 2: ...`, `ac2`, stray text, `met | not met. ...` or a bare `met` retries the reviewer, since such a line could hide a criterion not met), or the same `AC<n>` twice. Strict on purpose, so an Important finding written another way is never skipped.
+  - A review that contradicts itself is malformed too: `approve` next to an Important finding or a criterion not met, or `request changes` with no Important finding (passing would ignore the reviewer, and the builder would get nothing to fix).
+  - The 60-line page limit isn't checked here, so a long findings list never fails the gate. That the reviewer's stage leaves the worktree unchanged is the post-stage check's job (2.15), through the reviewer's write paths; this gate reads `review.md` only.
 
 ### [ ] 2.20 Stage pipeline with retries and caps
 
