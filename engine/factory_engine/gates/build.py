@@ -6,8 +6,9 @@ After the builder's stage the engine checks, in order:
 1. The test lock. Every file in `<run folder>/tester-files.json` (written by the tester gate)
    must still be a regular file with the blob id the tester left (`tests_gate.blob_ids`, the
    same method). A changed, deleted or linked file fails, even when the path hook missed how
-   it happened. When the run had a tester stage, a missing, unreadable or invalid record fails
-   too: without it nothing can be checked.
+   it happened. When the run had a tester stage, a missing, unreadable or invalid record (this
+   one or `tester-cases.json`, the tester's tests that ran) fails too: without it nothing can
+   be checked.
 2. The builder's diff (since the commit its stage started on: added, changed and deleted files,
    untracked included, ignored ones and Python bytecode left out) touches only paths the
    builder may write, each judged by its own name with the path hook's rules. A changed entry
@@ -17,16 +18,20 @@ After the builder's stage the engine checks, in order:
 3. The engine runs the repo's test command (`testrun`), with a clean environment and a timeout,
    and saves the output to the run folder. Python reads no bytecode from the worktree, so a
    planted `.pyc` can't stand in for a locked test.
-4. For pytest and vitest it reads the JUnit report: a timeout → "timeout"; any collection,
+4. Checks 1 and 2 again: code the tests ran could have rewritten a locked test or written
+   outside the builder's paths. Any change is flagged.
+5. For pytest and vitest it reads the JUnit report: a timeout → "timeout"; any collection,
    syntax or setup error, or no usable report → "broken tests"; no tests → "no tests ran";
-   a failing test → "tests fail"; none of the tester's tests ran → "no tests ran"; one of them
-   skipped → "tests skipped" (the builder never skips a test). Other runners give the exit
-   code only. Otherwise the gate passes.
+   a test the tester gate saw run (`tester-cases.json`) missing → "tester tests didn't run",
+   flagged (an ignore, a deselect or a collection change dropped it); a failing test → "tests
+   fail"; one of the tester's tests skipped → "tests skipped" (the builder never skips a
+   test). Other runners give the exit code only. Otherwise the gate passes.
 
 The gate returns its decision; the pipeline logs `event()` and, on a fail that isn't flagged,
 resumes the builder with `resume_message()`: the reason and the end of the test output.
 """
 
+import dataclasses
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -38,10 +43,12 @@ from factory_engine.config import RoleSettings
 from factory_engine.errors import ConfigError, GateError
 from factory_engine.events import EventLog, GateResult
 from factory_engine.gates.tests_gate import (
+    TESTER_CASES,
     TESTER_FILES,
     FileIndex,
     blob_ids,
     is_bytecode,
+    load_tester_cases,
     load_tester_files,
     owned_cases,
     through_link,
@@ -75,8 +82,9 @@ Kind = Literal[
     "no_tests_ran",
     "tests_fail",
     "tests_skipped",
+    "tester_tests_missing",
 ]
-FLAGGED: frozenset[Kind] = frozenset({"test_lock", "outside_paths"})
+FLAGGED: frozenset[Kind] = frozenset({"test_lock", "outside_paths", "tester_tests_missing"})
 _STOPS = (
     " The hooks should have stopped this, so the run stops for you: check how it happened "
     "before deciding the run."
@@ -146,26 +154,28 @@ def check_build(
     worktree, run_folder = worktree.resolve(), run_folder.resolve()
     try:
         locked = _locked(run_folder, tester_stage)
-        changed, deleted = check_lock(git, worktree, locked)
+        cases = _cases(run_folder, tester_stage)
     except Exception as err:  # fail closed
         return BuildGateOutcome(
             passed=False,
             kind="test_lock",
-            reason=f"test lock: the tester's files can't be checked ({err})." + _STOPS,
+            reason=f"test lock: the tester's records can't be read ({err})." + _STOPS,
         )
-    try:
-        outside = outside_paths(
-            git, worktree=worktree, run_folder=run_folder, base=base, builder=builder, skip=locked
-        )
-    except Exception as err:  # fail closed
-        return BuildGateOutcome(
-            passed=False,
-            kind="outside_paths",
-            reason=f"outside allowed paths: the builder's diff can't be checked ({err})." + _STOPS,
+
+    def guard(when: str) -> BuildGateOutcome | None:
+        return _guard(
+            git,
+            worktree=worktree,
+            run_folder=run_folder,
+            base=base,
+            builder=builder,
             locked=locked,
+            when=when,
         )
-    if changed or deleted or outside:
-        return _flagged(locked, changed, deleted, outside, builder)
+
+    before = guard("after the builder's stage")
+    if before is not None:
+        return before
 
     result = run_repo_command(
         command,
@@ -183,10 +193,65 @@ def check_build(
         runner=runner,
         timer=timer,
     )
-    return judge(result, locked, worktree_index(git, worktree))
+    # Code the tests ran may have rewritten a locked test or written outside the builder's
+    # paths, so both checks run again.
+    after = guard("during the test run")
+    if after is not None:
+        return dataclasses.replace(after, run=result, output_tail=tail(result.output))
+    return judge(result, locked, worktree_index(git, worktree), cases)
+
+
+def _guard(
+    git: Git,
+    *,
+    worktree: Path,
+    run_folder: Path,
+    base: str,
+    builder: RoleSettings,
+    locked: Mapping[str, str],
+    when: str,
+) -> BuildGateOutcome | None:
+    """The test lock and the path check; a flagged fail, or None when both hold. `when` says
+    when they ran, for the reason. A check that can't run fails (fail closed)."""
+    try:
+        changed, deleted = check_lock(git, worktree, locked)
+    except Exception as err:
+        return BuildGateOutcome(
+            passed=False,
+            kind="test_lock",
+            reason=f"test lock: the tester's files can't be checked {when} ({err})." + _STOPS,
+            locked=locked,
+        )
+    try:
+        outside = outside_paths(
+            git, worktree=worktree, run_folder=run_folder, base=base, builder=builder, skip=locked
+        )
+    except Exception as err:
+        return BuildGateOutcome(
+            passed=False,
+            kind="outside_paths",
+            reason=f"outside allowed paths: the builder's diff can't be checked {when} ({err})."
+            + _STOPS,
+            locked=locked,
+        )
+    if changed or deleted or outside:
+        return _flagged(locked, changed, deleted, outside, builder, when)
+    return None
 
 
 # ------------------------------------------------------------------ the test lock
+
+
+def _cases(run_folder: Path, tester_stage: bool) -> tuple[str, ...]:
+    """The tester's tests that ran in its gate; required when the run had a tester stage."""
+    cases = load_tester_cases(run_folder)
+    if cases is None:
+        if tester_stage:
+            raise GateError(
+                f"{run_folder / TESTER_CASES} is missing; the tester gate writes it when it passes"
+            )
+        return ()
+    return cases
 
 
 def _locked(run_folder: Path, tester_stage: bool) -> dict[str, str]:
@@ -267,20 +332,21 @@ def _flagged(
     deleted: Sequence[str],
     outside: Sequence[str],
     builder: RoleSettings,
+    when: str,
 ) -> BuildGateOutcome:
     found: list[str] = []
     if changed or deleted:
         what = [f"changed {_listed(changed)}"] if changed else []
         what += [f"deleted {_listed(deleted)}"] if deleted else []
         found.append(
-            f"test lock: the builder's stage {' and '.join(what)}, written by the tester and "
-            "locked from the builder. Tests are never weakened, skipped or deleted to pass."
+            f"test lock: {when}, {' and '.join(what)}, written by the tester and locked from "
+            "the builder. Tests are never weakened, skipped or deleted to pass."
         )
     if outside:
         allowed = ", ".join(builder.write_paths) or "nothing"
         found.append(
-            f"outside allowed paths: the builder's diff touches paths it may not change: "
-            f"{_listed(outside)}. The builder may write only {allowed}."
+            f"outside allowed paths: {when}, the builder's diff touches paths it may not "
+            f"change: {_listed(outside)}. The builder may write only {allowed}."
         )
     return BuildGateOutcome(
         passed=False,
@@ -296,10 +362,16 @@ def _flagged(
 # ------------------------------------------------------------------ the decision
 
 
-def judge(result: CommandResult, locked: Mapping[str, str], index: FileIndex) -> BuildGateOutcome:
-    """The gate's decision on one test run, given the tester's files and an index of the
-    worktree's files. A test is the tester's by the tester gate's own matching
-    (`tests_gate.owned_cases`). Pure."""
+def judge(
+    result: CommandResult,
+    locked: Mapping[str, str],
+    index: FileIndex,
+    cases: Sequence[str] = (),
+) -> BuildGateOutcome:
+    """The gate's decision on one test run, given the tester's files, an index of the
+    worktree's files and the IDs of the tester's tests that ran in its gate (`cases`), each of
+    which must run and pass. Without them, a test is the tester's by the tester gate's own
+    matching (`tests_gate.owned_cases`). Pure."""
 
     def outcome(kind: Kind, reason: str) -> BuildGateOutcome:
         failed = kind != "passed"
@@ -340,6 +412,15 @@ def judge(result: CommandResult, locked: Mapping[str, str], index: FileIndex) ->
             f"no tests ran: the test command (exit {code}) collected no tests. The tests are "
             "locked; check that the code doesn't stop them from being found.",
         )
+    ran = {case.id: case for case in report.cases}
+    missing = [case for case in cases if case not in ran]
+    if missing:
+        return outcome(
+            "tester_tests_missing",
+            f"tester tests didn't run: {_listed(missing)}. The tester gate saw them run; every "
+            "one must run and pass, so something keeps them from being collected (an ignore, a "
+            "deselect, a changed test path)." + _STOPS,
+        )
     failing = [case.id for case in report.cases if case.outcome == "failed"]
     if failing or code != 0:
         listed = _listed(failing) if failing else f"the test command exits {code}"
@@ -347,14 +428,19 @@ def judge(result: CommandResult, locked: Mapping[str, str], index: FileIndex) ->
             "tests_fail",
             f"tests fail: {listed}. Change the code until they pass; the tests are locked.",
         )
-    owned = owned_cases(report, result.runner, locked, index)
-    tester = [case for case, mine in zip(report.cases, owned, strict=True) if mine]
+    if cases:
+        tester = [ran[case] for case in cases]
+    else:
+        owned = owned_cases(report, result.runner, locked, index)
+        tester = [case for case, mine in zip(report.cases, owned, strict=True) if mine]
     if locked and not tester:
         return outcome(
             "no_tests_ran",
             f"no tests ran from the tester's files ({_listed(sorted(locked))}). They must run "
             "and pass; check that the code doesn't stop them from being collected.",
         )
+    # The tester's own skips (tests that its gate didn't see run) stay allowed when `cases`
+    # are known; a skip of one that ran there is the build's doing.
     skipped = [case.id for case in tester if case.outcome == "skipped"]
     if skipped:
         return outcome(
