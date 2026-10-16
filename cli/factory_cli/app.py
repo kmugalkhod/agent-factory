@@ -352,7 +352,8 @@ def next_steps(
         return [f"It is paused: {reason or run.state}", f"Carry on with `factory resume {n}`."]
     if stop == "awaiting_merge":
         return [
-            "The review passed; it waits for your merge approval, which arrives with task 2.22."
+            "The review passed and its pull request is open; it waits for your merge approval.",
+            f"Review the pull request, then merge it with `factory approve {n}`.",
         ]
     if stop == "interrupted":
         return [

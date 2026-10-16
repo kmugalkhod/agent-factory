@@ -41,7 +41,9 @@ from factory_engine.errors import DataFolderError
 from factory_engine.events import EventLog, NeedsYou, read_events
 from factory_engine.gates.plan import PLAN_FILE, Question, check_plan
 from factory_engine.git_ops import Git, worktree_dir
+from factory_engine.github import GitHub
 from factory_engine.intake import Intake, Started
+from factory_engine.merge import GitFlow
 from factory_engine.paths import WINDOWS_DEVICE, data_dir, run_dir
 from factory_engine.pipeline import ROLES, Pipeline, PipelineResult, Places
 from factory_engine.providers import Profile, preflight
@@ -59,10 +61,6 @@ CLEARED_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL
 """Variables an attached session must not see: each would switch its provider."""
 RESUMABLE: tuple[RunState, ...] = ("pending", *WORKING)
 ENDED: tuple[RunState, ...] = ("merged", "failed", "stopped", "closed")
-MERGE_LATER = (
-    "Merge approval arrives with task 2.22. The pull request isn't opened by the engine yet; "
-    "the run's work is on its run branch."
-)
 _SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,200}")
 _NOT_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -158,10 +156,9 @@ class Engine:
     def approve(self, run_id: int) -> Outcome:
         def act(ctx: DecisionContext, run: Run) -> Decided:
             if run.state == "awaiting_merge":
-                # Task 2.22 wires merge approval here: `return decisions.approve_merge(ctx)`.
                 # The run stays in awaiting_merge; `_drive` then advances a pipeline built by
-                # `_pipeline` (with 2.22's GitFlow hooks), which merges or needs you.
-                raise CliError(MERGE_LATER)
+                # `_pipeline` (with the GitFlow hooks), which merges or needs you.
+                return decisions.approve_merge(ctx)
             return decisions.approve_plan(ctx)
 
         return self._decide(run_id, act)
@@ -388,9 +385,9 @@ class Engine:
             registry=registry,
             clock=self._deps.clock,
             sleep=self._deps.sleep,
-            # Task 2.22: pass `GitFlow(GitHub(...))` here (`factory_engine.merge`), or nothing
-            # is pushed and no pull request is opened.
-            hooks=None,
+            # The git flow (2.22): rebase before review, push and open the pull request, and
+            # merge only after `approve` records your approval. `gh` runs with your login.
+            hooks=GitFlow(GitHub(env=self._deps.env)),
         )
 
     # ------------------------------------------------------------------ places and settings
@@ -522,7 +519,10 @@ def _not_resumable(run: Run, folder: Path) -> str:
             f"`factory approve {run.id}` (or --edit, --send-back, --answer)."
         )
     if run.state == "awaiting_merge":
-        return f"{label} waits for your merge approval, not a resume. {MERGE_LATER}"
+        return (
+            f"{label} waits for your merge approval, not a resume. Review its pull request, "
+            f"then merge it with `factory approve {run.id}`."
+        )
     if run.state == "needs_you":
         why = _reason(run, folder) or "see its events.jsonl"
         return (

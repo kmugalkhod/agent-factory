@@ -277,12 +277,17 @@ def test_a_refused_decision_changes_nothing(world: World) -> None:
     assert load_run(world.folder()).state == "awaiting_plan_approval"
 
 
-def test_merge_approval_is_left_for_task_2_22(world: World) -> None:
+def test_approve_on_a_run_awaiting_merge_is_a_merge_approval(world: World) -> None:
+    # Here the run has no pull request, so the merge approval refuses and nothing changes.
     world.engine().start_feature("Add mul to calc", slug=None)
     set_state(world, "awaiting_merge")
 
-    with pytest.raises(CliError, match="2.22"):
+    with pytest.raises(DecisionError, match="pull request"):
         world.engine().approve(0)
+
+    after = load_run(world.folder())
+    assert after.state == "awaiting_merge"
+    assert after.merge_approval is None
 
 
 def test_an_unknown_run_is_an_error(world: World) -> None:
