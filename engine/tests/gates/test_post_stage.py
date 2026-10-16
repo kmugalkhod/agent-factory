@@ -21,6 +21,7 @@ from factory_engine.gates.post_stage import (
     check_stage,
     post_stage_check,
     take_baseline,
+    z_names,
 )
 from factory_engine.git_ops import Git, create_worktree
 from factory_engine.run import Role, Run, RunState, load_run, new_run, save_run
@@ -229,6 +230,73 @@ def test_a_path_touched_by_a_commit_and_put_back_fails(stage: Stage) -> None:
     results = results_by_gate(check(stage, "tester", change))
     assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
     assert "src/sneaky.py" in results[ALLOWED_PATHS].reason
+
+
+@pytest.mark.parametrize("separator", ["\x1e", "\x1f", "\x1f\x1e"], ids=["rs", "us", "us-rs"])
+def test_a_secret_after_a_separator_byte_in_a_commit_message_fails(
+    stage: Stage, tmp_path: Path, separator: str
+) -> None:
+    """A message may hold any byte but NUL, so no byte in it can split one commit from another."""
+    message = tmp_path / "message.txt"  # outside the repo and the watched folders
+    message.write_bytes(f"tidy tests{separator}{GITHUB_TOKEN}\n".encode())
+
+    def change() -> None:
+        stage.write(stage.worktree, "tests/test_new.py", "x = 1\n")
+        stage.run(stage.worktree, "add", "-A")
+        stage.run(stage.worktree, "commit", "--cleanup=verbatim", "-F", str(message))
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [SECRETS]
+    assert "GitHub token" in results[SECRETS].reason
+    assert GITHUB_TOKEN not in results[SECRETS].reason
+
+
+def plumb(stage: Stage, *args: str, data: bytes = b"") -> bytes:
+    """Run git in the worktree with `data` as its input, all as bytes (no newline changes)."""
+    done = subprocess.run(
+        ["git", *args],
+        cwd=stage.worktree,
+        env=stage.env,
+        input=data,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    return done.stdout
+
+
+def test_a_newline_in_a_committed_file_name_is_kept(stage: Stage) -> None:
+    """`\\ntests/hidden.py` is a folder named "\\ntests", not `tests/`. git's plumbing commits it
+    without a file on disk (Windows can't hold the name), then a second commit takes it out."""
+
+    def change() -> None:
+        blob = plumb(stage, "hash-object", "-w", "--stdin", data=b"X = 1\n").decode().strip()
+        entry = f"100644 blob {blob}\thidden.py\0".encode()
+        folder = plumb(stage, "mktree", "-z", data=entry).decode().strip()
+        entries = (
+            plumb(stage, "ls-tree", "-z", "HEAD") + f"040000 tree {folder}\t\ntests\0".encode()
+        )
+        tree = plumb(stage, "mktree", "-z", data=entries).decode().strip()
+        sneaky = stage.run(stage.worktree, "commit-tree", tree, "-p", "HEAD", "-m", "sneak")
+        back = stage.run(stage.worktree, "commit-tree", "HEAD^{tree}", "-p", sneaky, "-m", "back")
+        stage.run(stage.worktree, "update-ref", "HEAD", back)
+
+    results = results_by_gate(check(stage, "tester", change))
+    assert failed_gates(list(results.values())) == [ALLOWED_PATHS]
+
+
+@pytest.mark.parametrize(
+    ("output", "names"),
+    [
+        ("\ntests/hidden.py\0src/app.py\0", ["\ntests/hidden.py", "src/app.py"]),
+        ("tests/a.py\n\0 b .py\0", ["tests/a.py\n", " b .py"]),
+        ("a\x1eb\x1fc.py\0", ["a\x1eb\x1fc.py"]),
+        ("", []),
+    ],
+    ids=["leading-newline", "trailing-newline-and-spaces", "separator-bytes", "empty"],
+)
+def test_z_names_keep_each_name_exactly(output: str, names: list[str]) -> None:
+    assert z_names(output) == names
 
 
 # --- 1. the main checkout ---

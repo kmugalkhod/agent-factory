@@ -19,7 +19,9 @@ write outside the worktree. Before a stage the engine takes a `Baseline`; after 
 The diff is the worktree against the commit it started the stage on, untracked files included
 and ignored ones left out, which is what the stage commit will hold. The push sends every commit
 made during the stage, so checks 3 and 4 also read each of those commits (and their messages):
-a path touched or a secret added and then taken back out still fails. Files outside git are
+a path touched or a secret added and then taken back out still fails. Each commit is read on its
+own and file names exactly as git wrote them, so no byte in a name or a message can hide one
+path or secret from the checks. Files outside git are
 compared by type, size, mode and modification time. A check that can't run fails (fail closed);
 any failure moves the run to needs_you (`post_stage_check`).
 """
@@ -366,11 +368,11 @@ def _check_secrets(git: Git, worktree: Path, base: str, role: Role) -> GateResul
         worktree,
     )
     findings += scan_diff(commits.stdout)
-    messages = git.run(["log", "--format=%h%x1f%B%x1e", *_new_commits(base)], worktree).stdout
-    for record in messages.split("\x1e"):
-        sha, _, body = record.strip("\n").partition("\x1f")
-        if record.strip():
-            findings += scan_text(body, path=f"commit message {sha}")
+    # Each commit read whole and on its own: its message and author are text the author chose,
+    # so no byte in them can be trusted to separate one commit from the next.
+    for commit, _ in _stage_commits(git, worktree, base):
+        raw = git.run(["cat-file", "commit", commit], worktree).stdout
+        findings += scan_text(raw, path=f"commit {commit[:12]}")
     if not findings:
         return _pass(SECRETS, "the secret scan of the diff is clean.")
     listed = _listed([finding.describe() for finding in findings])
@@ -402,15 +404,22 @@ def _changed_paths(git: Git, worktree: Path, base: str) -> list[str]:
     """Every worktree-relative path the stage added, changed or deleted since `base`, in the
     final files or in any commit made during the stage (even if a later commit put it back)."""
     tracked = git.run(["diff", "--name-only", "--no-renames", "-z", base, "--"], worktree).stdout
-    names = {name for name in tracked.split("\0") if name}
+    names = set(z_names(tracked))
     names.update(_untracked(git, worktree))
-    committed = git.run(
-        ["log", "--format=", "--name-only", "--no-renames", "--diff-merges=first-parent", "-z"]
-        + _new_commits(base),
-        worktree,
-    ).stdout
-    names.update(name.strip("\n") for name in committed.split("\0") if name.strip("\n"))
+    for commit, parent in _stage_commits(git, worktree, base):
+        against = [parent, commit] if parent else ["--root", commit]
+        out = git.run(
+            ["diff-tree", "-r", "-z", "--name-only", "--no-renames", "--no-commit-id", *against],
+            worktree,
+        ).stdout
+        names.update(z_names(out))
     return sorted(names)
+
+
+def z_names(out: str) -> list[str]:
+    """The names in git's `-z` output, exactly as git wrote them. A name may hold any byte but
+    NUL (a newline, spaces, control bytes), so split on NUL only and strip nothing."""
+    return [name for name in out.split("\0") if name]
 
 
 def _new_commits(base: str) -> list[str]:
@@ -418,9 +427,22 @@ def _new_commits(base: str) -> list[str]:
     return [f"{base}..HEAD", "--"]
 
 
+def _stage_commits(git: Git, worktree: Path, base: str) -> list[tuple[str, str | None]]:
+    """(commit, its first parent or None for a root commit) for each commit made during the
+    stage. Each line `git rev-list --parents` prints is ids only, so splitting it is exact; a
+    merge is judged against its first parent, as the push's diff is."""
+    out = git.run(["rev-list", "--parents", *_new_commits(base)], worktree).stdout
+    commits: list[tuple[str, str | None]] = []
+    for line in out.splitlines():
+        ids = line.split()
+        if ids:
+            commits.append((ids[0], ids[1] if len(ids) > 1 else None))
+    return commits
+
+
 def _untracked(git: Git, worktree: Path) -> list[str]:
     out = git.run(["ls-files", "--others", "--exclude-standard", "-z"], worktree).stdout
-    return [name for name in out.split("\0") if name]
+    return z_names(out)
 
 
 # ------------------------------------------------------------------ helpers
