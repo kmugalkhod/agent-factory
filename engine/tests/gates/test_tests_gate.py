@@ -1,6 +1,5 @@
 """Tests for the tester gate: real pytest runs on small fixture repos made in `tmp_path`."""
 
-import hashlib
 import json
 import os
 import shlex
@@ -16,13 +15,18 @@ from factory_engine.errors import ConfigError
 from factory_engine.events import EventLog, read_events
 from factory_engine.gates.tests_gate import (
     GATE,
+    TESTER_CASES,
     TESTER_FILES,
     FileIndex,
-    TesterGateOutcome,
     check_tests,
+    load_tester_cases,
     load_tester_files,
     owned_cases,
 )
+
+# Imported under other names: pytest collects module-level names starting with `test`/`Test`.
+from factory_engine.gates.tests_gate import TesterGateOutcome as GateOutcome
+from factory_engine.gates.tests_gate import tester_files as find_tester_files
 from factory_engine.git_ops import Git
 from factory_engine.testrun import JUnitCase, JUnitReport
 
@@ -74,7 +78,7 @@ class World:
 
     def check(
         self, command: str | None = PYTEST, *, attempt: int = 1, timeout: float = 120.0
-    ) -> TesterGateOutcome:
+    ) -> GateOutcome:
         return check_tests(
             self.git,
             worktree=self.repo,
@@ -232,11 +236,11 @@ def test_a_test_run_event_is_logged_and_the_gate_result_is_returned(world: World
     assert (result.gate, result.passed, result.reason) == (GATE, True, outcome.reason)
 
 
-def test_the_tester_files_are_recorded_with_their_hashes(world: World) -> None:
+def test_the_tester_files_are_recorded_with_their_blob_ids(world: World) -> None:
     write(world.repo, {"tests/test_mul.py": FAILING_MUL, "tests/helpers/data.txt": "1 2 3\n"})
     outcome = world.check()
     expected = {
-        rel: hashlib.sha256((world.repo / rel).read_bytes()).hexdigest()
+        rel: world.git.out(["hash-object", "--", rel], world.repo)
         for rel in ("tests/helpers/data.txt", "tests/test_mul.py")
     }
     assert dict(outcome.files) == expected
@@ -254,6 +258,22 @@ def test_files_outside_the_tester_paths_and_bytecode_are_not_recorded(world: Wor
     assert set(outcome.files) == {"tests/test_mul.py"}
 
 
+def test_a_link_is_not_recorded_as_a_tester_file(world: World) -> None:
+    write(world.repo, {"tests/test_mul.py": FAILING_MUL})
+    try:
+        (world.repo / "tests" / "test_alias.py").symlink_to(world.repo / "tests" / "test_mul.py")
+    except OSError as err:
+        pytest.skip(f"this machine can't create symlinks ({err})")
+    found = find_tester_files(
+        world.git,
+        worktree=world.repo,
+        run_folder=world.run_folder,
+        base=world.base,
+        tester=world.tester,
+    )
+    assert set(found) == {"tests/test_mul.py"}
+
+
 def test_a_later_tester_attempt_keeps_earlier_files_that_still_exist(world: World) -> None:
     write(world.repo, {"tests/test_mul.py": FAILING_MUL, "tests/test_gone.py": FAILING_MUL})
     world.check(attempt=1)
@@ -264,6 +284,22 @@ def test_a_later_tester_attempt_keeps_earlier_files_that_still_exist(world: Worl
     write(world.repo, {"tests/test_div.py": "def test_div():\n    from calc import div\n"})
     world.check(attempt=2)
     assert set(load_tester_files(world.run_folder)) == {"tests/test_div.py", "tests/test_mul.py"}
+
+
+def test_a_passing_gate_records_the_tester_tests_that_ran(world: World) -> None:
+    write(world.repo, {"tests/test_mul.py": FAILING_MUL + "\n\n" + PASSING_ADD})
+    assert world.check().passed
+    assert load_tester_cases(world.run_folder) == (
+        "tests.test_mul::test_add_zero",
+        "tests.test_mul::test_mul",
+    )
+
+
+def test_a_failing_gate_leaves_no_record_of_tester_tests(world: World) -> None:
+    (world.run_folder / TESTER_CASES).write_text('{"cases": ["old::test"]}', encoding="utf-8")
+    write(world.repo, {"tests/test_more.py": PASSING_ADD})  # passes before the build
+    assert not world.check().passed
+    assert load_tester_cases(world.run_folder) is None
 
 
 def test_a_later_tester_run_counts_the_earlier_tester_tests_as_its_own(world: World) -> None:

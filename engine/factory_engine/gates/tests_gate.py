@@ -22,27 +22,29 @@ to the runner's root. The root is found once per report: the folder (the worktre
 it, or one above it) under which every reported file exists. A file that could sit under more
 than one such root counts as the tester's only if it is the tester's under each of them.
 
-The tester's files and their sha256 hashes go to `<run folder>/tester-files.json` for the test
-lock (task 2.18). The gate returns its decision; the pipeline logs `event()` and retries the
-tester with `reason` on a fail.
+The tester's files and their git blob ids go to `<run folder>/tester-files.json` for the test
+lock (task 2.18, `gates/build.py`); a passing run also records the IDs of the tester's tests
+that ran in `tester-cases.json`, which the builder gate requires to run and pass. The gate
+returns its decision; the pipeline logs `event()` and retries the tester with `reason` on a
+fail.
 """
 
-import hashlib
+import re
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 from factory_engine.config import RoleSettings
-from factory_engine.errors import ConfigError, GateError
+from factory_engine.errors import ConfigError, GateError, GitError
 from factory_engine.events import EventLog, GateResult
 from factory_engine.git_ops import Git, run_command
 from factory_engine.providers import BASE_VARS
-from factory_engine.safety.paths import PathPolicy, check_file_tool
+from factory_engine.safety.paths import PathPolicy, check_worktree_name
 from factory_engine.testrun import (
     DEFAULT_TIMEOUT,
     CommandResult,
@@ -55,11 +57,14 @@ from factory_engine.testrun import (
 
 GATE = "tests"
 TESTER_FILES = "tester-files.json"
+TESTER_CASES = "tester-cases.json"
 MAX_LISTED = 10
 # pytest's exit codes for an interrupted run, an internal error and a usage error, and for a
 # run that collected no tests.
 PYTEST_BROKEN = frozenset({2, 3, 4})
 PYTEST_NO_TESTS = 5
+BLOB_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")  # SHA-1 or SHA-256 repos
+HASH_CHUNK = 100  # paths per `git hash-object` call, well inside Windows' command-line limit
 
 Kind = Literal[
     "passed",
@@ -74,11 +79,55 @@ Kind = Literal[
 
 class TesterFiles(BaseModel):
     """`tester-files.json`: each file the tester wrote (worktree-relative, `/`-separated) and
-    the sha256 of its bytes."""
+    its git blob id (see `blob_ids`)."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     files: dict[str, str]
+
+    @field_validator("files")
+    @classmethod
+    def _check_entries(cls, files: dict[str, str]) -> dict[str, str]:
+        for rel, blob in files.items():
+            if not _safe_rel(rel):
+                raise ValueError(f"{rel!r} is not a path relative to the worktree")
+            if not BLOB_ID.fullmatch(blob):
+                raise ValueError(f"{blob!r} (for {rel}) is not a git blob id")
+        return files
+
+
+class TesterCases(BaseModel):
+    """`tester-cases.json`: the IDs (`classname::name`) of the tests in the tester's files that
+    ran in the tester gate's passing run, failing or passing. The builder gate requires each of
+    them to run and pass, so a test can't be dropped by ignoring, deselecting or not collecting
+    its file. Empty when the runner writes no report."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    cases: list[str]
+
+    @field_validator("cases")
+    @classmethod
+    def _check_cases(cls, cases: list[str]) -> list[str]:
+        for case in cases:
+            if not case.strip() or any(c in case for c in "\r\n\0"):
+                raise ValueError(f"{case!r} is not a test ID")
+        if len(set(cases)) != len(cases):
+            raise ValueError("a test ID is listed twice")
+        return cases
+
+
+def _safe_rel(rel: str) -> bool:
+    """A plain worktree-relative path: `/`-separated, no drive, root, `.` or `..`."""
+    windows = PureWindowsPath(rel)
+    return not (
+        not rel
+        or "\\" in rel
+        or rel.startswith("/")
+        or windows.drive
+        or windows.root
+        or any(part in ("", ".", "..") for part in rel.split("/"))
+    )
 
 
 @dataclass(frozen=True)
@@ -86,7 +135,7 @@ class TesterGateOutcome:
     passed: bool
     kind: Kind
     reason: str
-    files: Mapping[str, str] = field(default_factory=dict)  # this stage's files and hashes
+    files: Mapping[str, str] = field(default_factory=dict)  # every tester file, blob ids
     run: CommandResult | None = None  # None when the tests didn't run
     failing_new: tuple[str, ...] = ()  # test IDs in the tester's files that fail
     passing_new: tuple[str, ...] = ()  # and those that pass
@@ -121,10 +170,11 @@ def check_tests(
             "`commands.test` in factory.yaml (for example `uv run pytest`)."
         )
     worktree, run_folder = worktree.resolve(), run_folder.resolve()
+    clear_tester_cases(run_folder)  # only a passing run records them
     files = tester_files(git, worktree=worktree, run_folder=run_folder, base=base, tester=tester)
     # Judge by every file a tester stage wrote: a retry or rerun starting from a commit that
     # already holds earlier tester files must not count their failing tests as someone else's.
-    recorded = record_tester_files(run_folder, worktree, files)
+    recorded = record_tester_files(git, run_folder, worktree, files)
     if not files:
         allowed = ", ".join(tester.write_paths) or "nothing"
         return TesterGateOutcome(
@@ -149,11 +199,10 @@ def check_tests(
         runner=runner,
         timer=timer,
     )
-    known = git.run(
-        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], worktree
-    ).stdout
-    index = FileIndex([name for name in known.split("\0") if name], worktree)
-    return judge(result, recorded, index)
+    outcome = judge(result, recorded, worktree_index(git, worktree))
+    if outcome.passed:
+        record_tester_cases(run_folder, (*outcome.failing_new, *outcome.passing_new))
+    return outcome
 
 
 # ------------------------------------------------------------------ the decision
@@ -303,6 +352,14 @@ class FileIndex:
         return found
 
 
+def worktree_index(git: Git, worktree: Path) -> FileIndex:
+    """The `FileIndex` of the worktree's files, tracked and untracked, not ignored."""
+    known = git.run(
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], worktree
+    ).stdout
+    return FileIndex([name for name in known.split("\0") if name], worktree)
+
+
 def case_path(case: JUnitCase, runner: str | None) -> str:
     """The file a test case's report names, relative to the runner's root: pytest's `file`
     (in the `xunit1` report the engine asks for), vitest's `classname`."""
@@ -339,7 +396,8 @@ def tester_files(
 ) -> dict[str, str]:
     """The files the tester's stage added or changed since `base` (committed or not,
     untracked included, ignored ones left out) that its settings let it write, with the
-    sha256 of each. Deleted files and Python bytecode are left out."""
+    git blob id of each. Deleted files, links (and files reached through one) and Python
+    bytecode are left out: the lock covers regular files only."""
     status = git.run(["diff", "--name-status", "--no-renames", "-z", base, "--"], worktree).stdout
     fields = status.split("\0")
     changed = {
@@ -348,34 +406,41 @@ def tester_files(
     untracked = git.run(["ls-files", "--others", "--exclude-standard", "-z"], worktree).stdout
     changed.update(name for name in untracked.split("\0") if name)
     policy = PathPolicy.build("tester", tester, worktree=worktree, run_folder=run_folder)
-    found: dict[str, str] = {}
+    found: list[str] = []
     for rel in sorted(changed):
-        path = worktree / rel
-        if _bytecode(rel) or not path.is_file():
+        if is_bytecode(rel) or not regular_file(worktree, rel):
             continue
-        if check_file_tool(policy, "Write", {"file_path": str(policy.worktree / rel)}).allowed:
-            found[rel] = _sha256(path)
-    return found
+        if check_worktree_name(policy, rel).allowed:
+            found.append(rel)
+    return blob_ids(git, worktree, found)
 
 
 def record_tester_files(
-    run_folder: Path, worktree: Path, files: Mapping[str, str]
+    git: Git, run_folder: Path, worktree: Path, files: Mapping[str, str]
 ) -> dict[str, str]:
     """Add `files` to `tester-files.json`. Files from an earlier tester stage that still exist
-    stay, with their current hash; those that are gone are dropped. Returns what was saved."""
-    merged = {
-        rel: _sha256(worktree / rel)
+    stay, with their current blob id; those that are gone are dropped. Returns what was saved."""
+    kept = [
+        rel
         for rel in load_tester_files(run_folder)
-        if rel not in files and (worktree / rel).is_file()
-    }
+        if rel not in files and regular_file(worktree, rel)
+    ]
+    merged = blob_ids(git, worktree, kept)
     merged.update(files)
-    saved = TesterFiles(files=dict(sorted(merged.items())))
-    write_atomic(run_folder / TESTER_FILES, saved.model_dump_json(indent=2) + "\n")
+    path = run_folder / TESTER_FILES
+    try:
+        saved = TesterFiles(files=dict(sorted(merged.items())))
+    except ValidationError as err:
+        raise GateError(
+            f"{path}: can't record the tester's files ({err.error_count()} problems, for "
+            f"example {err.errors()[0]['msg']}). Rename the file so its path is plain."
+        ) from err
+    write_atomic(path, saved.model_dump_json(indent=2) + "\n")
     return saved.files
 
 
 def load_tester_files(run_folder: Path) -> dict[str, str]:
-    """The tester's files and hashes from `tester-files.json`; empty when there is none yet."""
+    """The tester's files and blob ids from `tester-files.json`; empty when there is none yet."""
     path = run_folder / TESTER_FILES
     try:
         text = path.read_text(encoding="utf-8")
@@ -392,13 +457,88 @@ def load_tester_files(run_folder: Path) -> dict[str, str]:
         ) from err
 
 
-def _bytecode(rel: str) -> bool:
+def record_tester_cases(run_folder: Path, cases: Iterable[str]) -> tuple[str, ...]:
+    """Save the IDs of the tester's tests that ran (`tester-cases.json`). Returns them."""
+    path = run_folder / TESTER_CASES
+    try:
+        saved = TesterCases(cases=sorted(set(cases)))
+    except ValidationError as err:
+        raise GateError(f"{path}: can't record the tester's tests ({err}).") from err
+    write_atomic(path, saved.model_dump_json(indent=2) + "\n")
+    return tuple(saved.cases)
+
+
+def clear_tester_cases(run_folder: Path) -> None:
+    path = run_folder / TESTER_CASES
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as err:
+        raise GateError(f"{path}: can't remove the old record ({err}).") from err
+
+
+def load_tester_cases(run_folder: Path) -> tuple[str, ...] | None:
+    """The IDs from `tester-cases.json`; None when there is no record."""
+    path = run_folder / TESTER_CASES
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as err:
+        raise GateError(f"{path}: can't read the tester's tests ({err}).") from err
+    try:
+        return tuple(TesterCases.model_validate_json(text).cases)
+    except ValidationError as err:
+        raise GateError(
+            f"{path}: invalid ({err.error_count()} problems). It records the tester's tests "
+            "for the builder gate; rerun the tester stage to rebuild it."
+        ) from err
+
+
+def blob_ids(git: Git, worktree: Path, rels: Sequence[str]) -> dict[str, str]:
+    """The git blob id of each file (worktree-relative, `/`): its content as git would store
+    it, from `git hash-object` with the filters each path's attributes and the repo's config
+    choose, `core.autocrlf` among them. The tester gate records these and the builder gate
+    compares them, always this one way.
+
+    Why not the raw bytes: a checkout (a rebase, a worktree made again) may rewrite a file's
+    line endings, which changes its bytes but never its blob id, so raw hashes would break the
+    lock with no change made. Any change git would commit changes the blob id. A change of line
+    endings alone, which git normalizes away, is not seen, and isn't committed either."""
+    found: dict[str, str] = {}
+    for start in range(0, len(rels), HASH_CHUNK):
+        chunk = list(rels[start : start + HASH_CHUNK])
+        try:
+            out = git.run(["hash-object", "--", *chunk], worktree).stdout.split()
+        except GitError as err:
+            raise GateError(f"can't hash the tester's files in {worktree} ({err}).") from err
+        if len(out) != len(chunk) or not all(BLOB_ID.fullmatch(blob) for blob in out):
+            raise GateError(
+                f"`git hash-object` in {worktree} gave {len(out)} ids for {len(chunk)} files."
+            )
+        found.update(zip(chunk, out, strict=True))
+    return found
+
+
+def through_link(worktree: Path, rel: str) -> bool:
+    """Whether the entry `rel` (worktree-relative, `/`) is a link (a symlink or a junction) or
+    lies in a folder reached through one. Judged by its own name: no link is followed. Parts
+    that don't exist aren't links; one that can't be examined counts as a link."""
+    path = worktree
+    for part in rel.split("/"):
+        path = path / part
+        try:
+            if path.is_symlink() or path.is_junction():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def regular_file(worktree: Path, rel: str) -> bool:
+    """Whether `rel` is a regular file reached without any link."""
+    return not through_link(worktree, rel) and (worktree / rel).is_file()
+
+
+def is_bytecode(rel: str) -> bool:
     path = PurePosixPath(rel)
     return "__pycache__" in path.parts or path.suffix in (".pyc", ".pyo")
-
-
-def _sha256(path: Path) -> str:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError as err:
-        raise GateError(f"{path}: can't read the tester's file to hash it ({err}).") from err
