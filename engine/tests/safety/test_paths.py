@@ -10,7 +10,13 @@ import pytest
 from factory_engine.config import RoleSettings, default_settings
 from factory_engine.errors import SafetyError
 from factory_engine.run import Role
-from factory_engine.safety.paths import PathDecision, PathPolicy, _link_decision, check_file_tool
+from factory_engine.safety.paths import (
+    PathDecision,
+    PathPolicy,
+    _link_decision,
+    check_file_tool,
+    check_worktree_name,
+)
 
 WINDOWS = pytest.mark.skipif(sys.platform != "win32", reason="Windows path rules")
 LOCKED = ("tests/test_lock.py",)
@@ -272,6 +278,56 @@ def test_a_symlink_out_of_the_worktree_is_blocked(roots: dict[str, Path]) -> Non
         pytest.skip(f"can't create symlinks here: {err}")
     decision = _check(roots, "builder", "Write", {"file_path": "src/link/x.py"})
     _assert(decision, False, "outside")
+
+
+# ------------------------------------------------- names git records (post-stage check)
+
+
+@pytest.mark.parametrize(
+    ("role", "rel", "windows", "allowed"),
+    [
+        ("tester", "tests/test_new.py", False, True),
+        ("tester", "src/app.py", False, False),
+        ("tester", "\ntests/test_new.py", False, False),
+        ("tester", "tests/../src/app.py", False, False),
+        ("tester", "./tests/test_new.py", False, False),
+        ("tester", "tests//test_new.py", False, False),
+        ("tester", "tests\\..\\src\\app.py", False, False),
+        ("tester", "", False, False),
+        ("builder", "src/new.py", False, True),
+        ("builder", "tests/test_lock.py", False, False),
+        ("builder", "factory.yaml", False, False),
+        ("builder", ".git/config", False, False),
+        ("builder", "src/app.py:stream", True, False),
+        ("builder", "src/app.py.", True, False),
+        ("builder", "src/app.py ", True, False),
+        ("builder", "SRC~1/app.py", True, False),
+        ("builder", "SRC/new.py", True, True),
+        ("builder", "SRC/new.py", False, False),
+    ],
+)
+def test_git_names_are_judged_by_the_write_rules(
+    roots: dict[str, Path], role: Role, rel: str, windows: bool, allowed: bool
+) -> None:
+    policy = PathPolicy.build(
+        role,
+        _role_settings(role),
+        worktree=roots["wt"],
+        run_folder=roots["run"],
+        locked=LOCKED,
+        windows=windows,
+    )
+    _assert(check_worktree_name(policy, rel), allowed, "")
+
+
+def test_a_git_name_is_judged_as_itself_not_where_its_link_leads(roots: dict[str, Path]) -> None:
+    """`src/app.py` on disk is a link into `tests/`; the tester still may not change it."""
+    app = roots["wt"] / "src" / "app.py"
+    app.unlink()
+    _file_link(app, roots["wt"] / "tests" / "test_lock.py")
+    decision = check_worktree_name(_policy(roots, "tester"), "src/app.py")
+    _assert(decision, False, "")
+    assert "src/app.py" in decision.reason
 
 
 # ------------------------------------------------------------ 8.3 names
