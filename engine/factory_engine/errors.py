@@ -62,3 +62,8 @@ class GateError(FactoryError):
 
 class GitHubError(FactoryError):
     """A `gh` command failed, timed out or was refused, for example a merge with no approval."""
+
+
+class PipelineError(FactoryError):
+    """The stage pipeline can't carry a run on, for example a stage that left the run in the
+    state it started in."""
