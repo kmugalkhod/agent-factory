@@ -42,6 +42,7 @@ LEGAL: set[tuple[RunState, RunState]] = {
     ("merged", "closed"),
     # Loops back from gates and decisions.
     ("awaiting_plan_approval", "planning"),  # plan sent back with notes
+    ("awaiting_plan_approval", "needs_you"),  # a split, until milestone 3
     ("updating", "building"),  # rebase conflict: the builder resolves it
     ("reviewing", "building"),  # Important finding: resume the builder
     # Feedback reruns from the earliest stage it affects.

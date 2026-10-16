@@ -5,7 +5,8 @@ until it waits for you or stops. One attempt of a stage is:
 
 1. Before a retry, archive what the next attempt overwrites: `handoff-builder.md` is copied to
    `attempts/handoff-builder-<n>.md`, and `review.md` is moved to `attempts/review-<n>.md` (moved,
-   so a reviewer that writes nothing can never pass on the old review).
+   so a reviewer that writes nothing can never pass on the old review). Likewise an earlier
+   `plan.md` (failed, sent back or answered) is moved to `attempts/plan-<n>.md`.
 2. Count the attempt, write the agent's config folder and take the post-stage baseline.
 3. Run the agent through the `AgentRunner` under the watchdog. A usage limit pauses the run and,
    after the reset, resumes the same session in the same attempt. A stall (needs_you) or a turn
@@ -28,9 +29,10 @@ can tell where the run stopped.
 Where later tasks plug in:
 
 - Plan approval (2.21): every plan waits in `awaiting_plan_approval`. `PipelineResult.stop` says
-  whether the plan asks questions or proposes a split. A decision moves the run (to `testing`,
-  or back to `planning`) and calls `advance` again; `advance(note=...)` hands notes to the next
-  agent.
+  whether the plan asks questions or proposes a split (`plan_stop`). A decision
+  (`decisions.py`) moves the run (to `testing`, or back to `planning`); the caller then builds
+  a pipeline from the saved run and calls `advance` again, and `advance(note=...)` hands the
+  decision's note to the next agent.
 - Update before review (2.22): `Hooks.update` runs in `updating`; by default it does nothing and
   the run goes on to `reviewing`. `Hooks.publish` runs once the review passes, before
   `awaiting_merge` (push and pull request). `Pipeline.tell_builder` sets what a builder that
@@ -116,9 +118,8 @@ UPDATE_STEP = "update"
 """The step label saved once the update before review (`Hooks.update`) is done."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
-Stop = Literal[
-    "plan_approval", "questions", "split", "needs_you", "paused", "awaiting_merge", "ended"
-]
+PlanStop = Literal["plan_approval", "questions", "split"]
+Stop = PlanStop | Literal["needs_you", "paused", "awaiting_merge", "ended"]
 ROLES: tuple[Role, ...] = get_args(Role)
 STEP_NAMES: tuple[StepName, ...] = get_args(StepName)
 _ATTEMPT = re.compile(r"[1-9][0-9]{0,8}")
@@ -127,6 +128,14 @@ _STOPS: Mapping[RunState, Stop] = {
     "paused": "paused",
     "awaiting_merge": "awaiting_merge",
 }
+
+
+def plan_stop(plan: PlanCheck) -> PlanStop:
+    """Which decision a plan waits for: a split first (it needs you in milestone 2), then
+    questions, else plan approval."""
+    if plan.split:
+        return "split"
+    return "questions" if plan.questions else "plan_approval"
 
 
 @dataclass(frozen=True)
@@ -293,10 +302,7 @@ class Pipeline:
         state = self._run.state
         if state == "awaiting_plan_approval":
             plan = check_plan(self.places.run_folder / PLAN_FILE)
-            stop: Stop = (
-                "split" if plan.split else "questions" if plan.questions else "plan_approval"
-            )
-            return PipelineResult(self._run, stop, plan)
+            return PipelineResult(self._run, plan_stop(plan), plan)
         return PipelineResult(self._run, _STOPS.get(state, "ended"))
 
     async def _start(self) -> None:
@@ -307,7 +313,10 @@ class Pipeline:
     async def _plan(self) -> None:
         reason: str | None = None
         while self._may_try("planner", reason):
-            prompt = _planner_prompt(self.places, reason, self._take_note())
+            previous = self._set_plan_aside()
+            if previous is False:
+                return
+            prompt = _planner_prompt(self.places, reason, self._take_note(), previous)
             if await self._attempt("planner", prompt, resume=False) is None:
                 return
             check = check_plan(self.places.run_folder / PLAN_FILE)
@@ -703,6 +712,22 @@ class Pipeline:
             return False
         return True
 
+    def _set_plan_aside(self) -> Path | None | Literal[False]:
+        """Before a planner runs: move an earlier `plan.md` (a failed one, or one you sent back
+        or answered) to `attempts/plan-<n>.md`, so only a plan written by this attempt is
+        judged. Returns where it went (None when there was none); False when the run stopped."""
+        path = self.places.run_folder / PLAN_FILE
+        archived = self.places.run_folder / ATTEMPTS_DIR / f"plan-{self._attempts('planner')}.md"
+        try:
+            if not path.is_file():
+                return None
+            _copy(path, archived)
+            path.unlink()
+        except OSError as err:
+            self._needs_you("planner", f"can't set the old {path} aside ({err}).")
+            return False
+        return archived
+
     def _set_review_aside(self, done: int) -> bool:
         """Before a reviewer runs: archive the last `review.md` as `attempts/review-<done>.md`
         and remove it, so only a review written by this attempt is judged."""
@@ -757,11 +782,18 @@ def _with_note(text: str, note: str | None) -> str:
     return f"{text}\n\nA note from the person running the factory:\n\n{note}" if note else text
 
 
-def _planner_prompt(places: Places, reason: str | None, note: str | None) -> str:
+def _planner_prompt(
+    places: Places, reason: str | None, note: str | None, previous: Path | None
+) -> str:
     text = (
         f"Plan this run. The run folder is {places.run_folder}: read intent.md there, then "
         f"write plan.md and handoff-planner.md there. The repo is the worktree, {places.worktree}."
     )
+    if previous is not None:
+        text += (
+            f"\n\nThe previous plan was moved to {previous}; read it if it helps, but write a "
+            "new plan.md: only the plan.md you write now is checked."
+        )
     if reason:
         text += (
             "\n\nYour last plan.md failed the planner gate. Fix every problem and write "

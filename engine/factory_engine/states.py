@@ -29,8 +29,8 @@ TRANSITIONS: MappingProxyType[RunState, frozenset[RunState]] = MappingProxyType(
     {
         "pending": frozenset({"planning", "needs_you", *_STOP}),
         "planning": frozenset({"awaiting_plan_approval", "needs_you", "paused", *_STOP}),
-        # Approve, or send the plan back with notes.
-        "awaiting_plan_approval": frozenset({"testing", "planning", *_STOP}),
+        # Approve, or send the plan back with notes; a split needs you until milestone 3.
+        "awaiting_plan_approval": frozenset({"testing", "planning", "needs_you", *_STOP}),
         # Feedback reruns from the earliest stage it affects (design: talking to an agent).
         "testing": frozenset({"building", "planning", "needs_you", "paused", *_STOP}),
         "building": frozenset({"updating", "planning", "testing", "needs_you", "paused", *_STOP}),
