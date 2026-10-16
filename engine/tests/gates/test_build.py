@@ -13,13 +13,24 @@ from factory_engine import events as ev
 from factory_engine.config import RoleSettings, default_settings
 from factory_engine.errors import ConfigError
 from factory_engine.events import EventLog, read_events
-from factory_engine.gates.build import GATE, BuildGateOutcome, check_build, tail
-from factory_engine.gates.tests_gate import TESTER_FILES, record_tester_files, tester_files
+from factory_engine.gates.build import GATE, BuildGateOutcome, check_build, judge, tail
+from factory_engine.gates.tests_gate import (
+    TESTER_CASES,
+    TESTER_FILES,
+    FileIndex,
+    record_tester_cases,
+    record_tester_files,
+)
+from factory_engine.gates.tests_gate import tester_files as find_tester_files
 from factory_engine.git_ops import Git
+from factory_engine.testrun import CommandResult, JUnitCase, JUnitReport, Outcome
 
+# `tester_files` is imported under another name: pytest collects any module-level function
+# whose name starts with `test`.
 PYTHON = shlex.quote(Path(sys.executable).as_posix())
 PYTEST = f"{PYTHON} -m pytest"
 LOCKED = "tests/test_mul.py"
+LOCKED_CASE = "tests.test_mul::test_mul"  # the tester's test, as its gate saw it run
 
 BASE_FILES = {
     "pytest.ini": "[pytest]\npythonpath = src\n",
@@ -37,6 +48,14 @@ SLOW_BUILD = "import time\n\n" + ADD + "\n\ndef mul(a, b):\n    time.sleep(60)\n
 BROKEN_BUILD = "def add(a, b):\n    return a +\n"
 # Skips every test that imports the code: a way to weaken tests without touching them.
 SKIPPING_BUILD = "import pytest\n\npytest.skip('not today', allow_module_level=True)\n"
+# Code that, once a test imports it, weakens the locked test or writes outside `src/`.
+_ROOT = "from pathlib import Path\n\nROOT = Path(__file__).resolve().parents[1]\n"
+REWRITING_BUILD = (
+    _ROOT
+    + "(ROOT / 'tests' / 'test_mul.py').write_bytes(b'def test_mul():\\n    assert True\\n')\n"
+    + GOOD_BUILD
+)
+LITTERING_BUILD = _ROOT + "(ROOT / 'notes.txt').write_bytes(b'hi\\n')\n" + GOOD_BUILD
 
 
 def clock() -> datetime:
@@ -78,13 +97,15 @@ class World:
         self.git.run(["add", "--all"], self.repo)
         self.git.run(["commit", "-q", "-m", message], self.repo)
 
-    def tester_stage(self, files: dict[str, str]) -> None:
+    def tester_stage(self, files: dict[str, str], cases: tuple[str, ...] = (LOCKED_CASE,)) -> None:
+        """What a passing tester gate leaves: its files and the tests it saw run."""
         start = self.head()
         write(self.repo, files)
-        found = tester_files(
+        found = find_tester_files(
             self.git, worktree=self.repo, run_folder=self.run_folder, base=start, tester=self.tester
         )
         record_tester_files(self.git, self.run_folder, self.repo, found)
+        record_tester_cases(self.run_folder, cases)
         self.commit("tester")
         self.base = self.head()  # the builder's stage starts here
 
@@ -248,22 +269,31 @@ def test_the_lock_holds_when_a_checkout_rewrites_line_endings(
 
 
 @pytest.mark.parametrize(
-    "content",
+    ("name", "content"),
     [
-        pytest.param(None, id="missing"),
-        pytest.param("not json", id="not-json"),
-        pytest.param('{"files": []}', id="wrong-shape"),
-        pytest.param('{"files": {}}', id="no-files"),
-        pytest.param('{"files": {"tests/test_mul.py": "abc"}}', id="not-a-blob-id"),
-        pytest.param('{"files": {"../outside.py": "' + "0" * 40 + '"}}', id="outside-path"),
-        pytest.param('{"files": {"/abs/test.py": "' + "0" * 40 + '"}}', id="absolute-path"),
+        pytest.param(TESTER_FILES, None, id="files-missing"),
+        pytest.param(TESTER_FILES, "not json", id="files-not-json"),
+        pytest.param(TESTER_FILES, '{"files": []}', id="files-wrong-shape"),
+        pytest.param(TESTER_FILES, '{"files": {}}', id="no-files"),
+        pytest.param(TESTER_FILES, '{"files": {"tests/test_mul.py": "abc"}}', id="not-a-blob-id"),
+        pytest.param(
+            TESTER_FILES, '{"files": {"../outside.py": "' + "0" * 40 + '"}}', id="outside-path"
+        ),
+        pytest.param(
+            TESTER_FILES, '{"files": {"/abs/test.py": "' + "0" * 40 + '"}}', id="absolute-path"
+        ),
+        pytest.param(TESTER_CASES, None, id="cases-missing"),
+        pytest.param(TESTER_CASES, "not json", id="cases-not-json"),
+        pytest.param(TESTER_CASES, '{"cases": {"a": "b"}}', id="cases-wrong-shape"),
+        pytest.param(TESTER_CASES, '{"cases": [""]}', id="cases-blank-id"),
+        pytest.param(TESTER_CASES, '{"cases": ["a::b", "a::b"]}', id="cases-twice"),
     ],
 )
-def test_a_missing_or_malformed_tester_files_record_fails_closed(
-    world: World, content: str | None
+def test_a_missing_or_malformed_tester_record_fails_closed(
+    world: World, name: str, content: str | None
 ) -> None:
     write(world.repo, {"src/calc.py": GOOD_BUILD})
-    record = world.run_folder / TESTER_FILES
+    record = world.run_folder / name
     if content is None:
         record.unlink()
     else:
@@ -272,6 +302,75 @@ def test_a_missing_or_malformed_tester_files_record_fails_closed(
     assert (outcome.passed, outcome.kind, outcome.flagged) == (False, "test_lock", True)
     assert outcome.reason.startswith("test lock")
     assert outcome.run is None
+
+
+@pytest.mark.parametrize(
+    ("build", "kind", "name"),
+    [
+        pytest.param(REWRITING_BUILD, "test_lock", LOCKED, id="rewrites-a-locked-test"),
+        pytest.param(LITTERING_BUILD, "outside_paths", "notes.txt", id="writes-outside"),
+    ],
+)
+def test_changes_made_during_the_test_run_fail_and_are_flagged(
+    world: World, build: str, kind: str, name: str
+) -> None:
+    write(world.repo, {"src/calc.py": build})
+    outcome = world.check()
+    assert (outcome.passed, outcome.kind, outcome.flagged) == (False, kind, True)
+    assert "during the test run" in outcome.reason
+    assert name in outcome.reason
+    assert outcome.run is not None  # the tests ran; the change came from them
+    assert outcome.output_tail
+
+
+def test_a_tester_test_that_does_not_run_fails_and_is_flagged(world: World) -> None:
+    # As if the builder had added `--deselect` (or an ignore) to the test configuration.
+    write(world.repo, {"src/calc.py": GOOD_BUILD})
+    outcome = world.check(f"{PYTEST} --deselect {LOCKED}::test_mul")
+    assert (outcome.passed, outcome.kind, outcome.flagged) == (False, "tester_tests_missing", True)
+    assert outcome.reason.startswith("tester tests didn't run")
+    assert LOCKED_CASE in outcome.reason
+
+
+def run_of(cases: list[JUnitCase], tmp_path: Path) -> CommandResult:
+    return CommandResult(
+        command="pytest",
+        argv=("pytest",),
+        runner="pytest",
+        exit_code=0,
+        timed_out=False,
+        timeout=60.0,
+        seconds=1.0,
+        output="done\n",
+        output_path=tmp_path / "out.txt",
+        report=JUnitReport(cases=tuple(cases)),
+        report_problem=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "kind"),
+    [
+        pytest.param({"tests.test_mul::test_mul": "passed"}, "passed", id="all-ran-and-passed"),
+        pytest.param({}, "tester_tests_missing", id="one-missing"),
+        pytest.param({"tests.test_mul::test_mul": "skipped"}, "tests_skipped", id="one-skipped"),
+        pytest.param(
+            {"tests.test_mul::test_mul": "passed", "tests.test_mul::test_extra": "skipped"},
+            "passed",
+            id="the-testers-own-skip",  # its gate didn't see it run, so it isn't required
+        ),
+    ],
+)
+def test_every_tester_test_that_ran_before_must_run_and_pass(
+    tmp_path: Path, outcomes: dict[str, Outcome], kind: str
+) -> None:
+    cases = [JUnitCase("tests.test_calc", "test_add", "passed", file="tests/test_calc.py")]
+    for case_id, result in outcomes.items():
+        classname, name = case_id.split("::")
+        cases.append(JUnitCase(classname, name, result, file=LOCKED))
+    index = FileIndex([LOCKED, "tests/test_calc.py"], tmp_path)
+    outcome = judge(run_of(cases, tmp_path), {LOCKED: "0" * 40}, index, (LOCKED_CASE,))
+    assert outcome.kind == kind, outcome.reason
 
 
 def test_without_a_tester_stage_there_is_nothing_to_lock(
