@@ -56,5 +56,9 @@ class PushRejectedError(GitError):
     """The safe force-push was refused because the remote run branch changed unexpectedly."""
 
 
+class GateError(FactoryError):
+    """A gate can't take what it needs, for example the post-stage check's baseline."""
+
+
 class GitHubError(FactoryError):
     """A `gh` command failed, timed out or was refused, for example a merge with no approval."""

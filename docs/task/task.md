@@ -410,7 +410,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Fixture `plan.md` files, good and bad.
 - **Depends on:** 1.2
 
-### [ ] 2.17 Tester gate
+### [x] 2.17 Tester gate
 
 - **What:** Check that the tester's diff adds test files under its allowed paths. The engine runs the repo's test command itself and requires it to fail. For pytest and vitest it reads the JUnit XML report and requires that the new tests fail and that there are no collection or syntax errors. On fail, retry the tester with the reason.
 - **Touches:** `engine/factory_engine/gates/tests_gate.py`, `engine/factory_engine/testrun.py`, `engine/tests/gates/`
@@ -422,6 +422,16 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Test output is saved to the run folder.
 - **Tests:** Integration tests running pytest on small fixture repos.
 - **Depends on:** 2.14, 2.15
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - The shared runner is `testrun.py` (2.18 reuses it). The command is split like a POSIX shell (`shlex`; a `\` escapes, so write paths with `/`) and run without a shell; `&&`, `||`, `|`, `;`, `&`, redirects, brackets, `$(...)`, backticks, line breaks and a leading `VAR=value` are refused with "put it in a script" (`ConfigError`). A bare program name is looked up on absolute `PATH` entries only. A missing or unstartable program, or no `commands.test`, raises `ConfigError` before anything runs; retrying the tester can't fix those.
+  - The command's environment is built from an allowlist (`providers.BASE_VARS` by default) plus `PYTHONDONTWRITEBYTECODE=1` and `PYTHONIOENCODING=utf-8`. Variables starting `CLAUDE_`, `ANTHROPIC_`, `GH_`, `GITHUB_`, `LITELLM_` or `AWS_` never reach it, even when the allowlist names them; an `extra` variable with such a name raises. Agent-written tests run under it.
+  - The timeout is 10 minutes by default (`factory.yaml` has no setting for it yet) and stops the whole process tree; the output of a stopped command is lost, so the saved output says it timed out. Output goes to `test-output-<stage>-<attempt>.txt` and the JUnit report to `junit-<stage>-<attempt>.xml` in the run folder (an old report is removed first). pytest also gets `-o cache_dir=<run folder>/cache`, so the engine's runs leave no `.pytest_cache` in the worktree. The `test_run` event's `failed` counts failures plus errors; a timeout records exit code -1.
+  - pytest and vitest are recognised by name anywhere in the command (`uv run pytest`, `python -m pytest`, `npx vitest`). vitest gets `--reporter=default --reporter=junit --outputFile.junit=<file>`; it is untested here (no Node in CI). `pnpm test` and other runners are judged by the exit code only: non-zero passes, 0 fails, and "the new tests fail" can't be checked.
+  - The tester's tests are the files its diff adds or changes since the stage's base commit (untracked included, ignored, deleted and `__pycache__`/`.pyc` files left out) that its write paths allow. A test case belongs to one of them by the JUnit `classname` (pytest's dotted module path, which may be relative to a rootdir in a subfolder; vitest's file path).
+  - Order of checks: no tester files → "no new tests" (tests not run); timeout; any error in the report (collection, syntax, missing fixture, setup), no usable report, or pytest exit 2–4 → "broken tests"; nothing collected → "no tests ran"; no test case from the tester's files → "no new tests"; a failing test outside them → "existing tests fail"; none of theirs failing (xfail counts as not failing) → "tests pass before the build". At least one new test must fail; a new test that passes next to it is allowed, as the tester prompt allows a check that existing behaviour is unchanged.
+  - A missing feature imported at the top of a test file is a collection error, so it counts as broken tests: a wrong import path looks the same. The reason tells the tester to import the code under test inside the test function. Worth a line in `prompts/tester.md` later.
+  - The tester's files go to `tester-files.json` in the run folder (path → sha256 of the bytes) for 2.18's test lock, on every gate run. Entries from an earlier tester run that still exist are kept with their current hash; gone ones are dropped. The hash is of the worktree bytes, so 2.18 must compare before anything rewrites line endings (`core.autocrlf`).
+  - The gate returns `TesterGateOutcome` (passed, kind, reason, files, the run, failing and passing new test IDs) and logs only the `test_run` event; the pipeline logs `outcome.event()` (`gate_result`, gate `tests`) like the other gates. `GateError` is added with the same text as in 2.15.
 
 ### [ ] 2.18 Builder gate and test lock
 
