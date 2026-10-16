@@ -483,7 +483,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - A review that contradicts itself is malformed too: `approve` next to an Important finding or a criterion not met, or `request changes` with no Important finding (passing would ignore the reviewer, and the builder would get nothing to fix).
   - The 60-line page limit isn't checked here, so a long findings list never fails the gate. That the reviewer's stage leaves the worktree unchanged is the post-stage check's job (2.15), through the reviewer's write paths; this gate reads `review.md` only.
 
-### [ ] 2.20 Stage pipeline with retries and caps
+### [x] 2.20 Stage pipeline with retries and caps
 
 - **What:** Add the orchestration loop that runs each stage, its gate, the post-stage check and the transition. Retry rules:
   - planner retry with the reason
@@ -501,6 +501,15 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - review with an Important finding → builder → pass
 - **Tests:** Scenario tests with the fake runner and fixture repos.
 - **Depends on:** 2.5, 2.13, 2.15, 2.16, 2.17, 2.18, 2.19
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `Pipeline.advance` (async, as the runner is) carries the run from its current state until it waits or stops. Every plan waits in `awaiting_plan_approval`; the result's `stop` says `plan_approval`, `questions` or `split`, for 2.21 to decide. A call in a working state starts a new attempt of that stage, so a decision (2.21) or feedback (2.23) moves the run and calls `advance` again, with `note=` for the next agent. Hook points: `Hooks.update` (in `updating`; does nothing yet, 2.22 rebases there), `Hooks.publish` (after the review passed, before `awaiting_merge`; push and pull request in 2.22) and `Pipeline.tell_builder` (what a resumed builder is told, for a rebase conflict).
+  - One attempt: count it, write the agent's config folder, take the post-stage baseline, run the agent under the watchdog, log `stage_finished`, run the post-stage check, then the gate. A passing gate is followed by the stage commit and the transition. The planner, the tester and a reviewer with a malformed `review.md` get a new session told the gate's reason (the design's "retry"); the builder resumes its session (the design's "resume") with the gate's `resume_message()` or the text of `review.md`.
+  - Caps count every attempt of the role in the run (`run.attempts`), so they hold across a restart; reruns that 2.21 or 2.23 start count too. `factory.yaml` has no reviewer cap: a review round gets at most 3 reviewer sessions (`REVIEWER_ATTEMPTS`), counted in memory. Important findings with the builder at its cap → needs_you.
+  - Straight to needs_you, no retry: a post-stage failure, a flagged builder fail, a gate or attempt that can't run (`ConfigError`, `GateError`, `GitError`, a missing credential, a failed commit) and an agent that ends without finishing (an error result). A usage limit waits for the reset and resumes the same session in the same attempt, so the post-stage baseline still covers it; a stall (needs_you) or a turn or time cap (paused) stops the pipeline.
+  - `handoff-builder.md` is copied to `attempts/handoff-builder-<n>.md` before each builder retry. `review.md` is copied to `attempts/review-<n>.md` and then removed before every reviewer run, so a reviewer that writes nothing can't pass on the old review.
+  - The reviewer's diff: before the reviewer starts, the engine writes `review-diff.patch` to the run folder, from where the run branch meets `origin/main` to its head; the reviewer's prompt names it.
+  - Steps saved to `run.json` (and the registry): `<role> <attempt> <started | agent | checked | passed | failed | committed>`, and `update`; `Step.parse` reads them back for 2.24. Not yet resumable mid-attempt: the baseline, the builder's message and the reviewer's tries live in memory (2.24).
+  - Each agent's prompt names the run folder, the worktree and what to read and write; the system prompts are unchanged. A bootstrap run (2.26) still goes through the tester; only the builder gate's `tester_stage` follows `kind`. New `PipelineError` for a stage that leaves the run in the state it started in (an engine bug).
 
 ### [ ] 2.21 Intake, plan approval and planner questions
 
