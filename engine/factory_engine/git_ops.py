@@ -328,15 +328,38 @@ def _has_markers(path: Path) -> bool:
         return True  # can't tell: treat as unresolved
 
 
-def _require_rebasing(git: Git, worktree: Path, branch: str) -> None:
+def rebase_in_progress(git: Git, worktree: Path, *, run_id: int, slug: str) -> bool:
+    """Whether a rebase of the run branch waits in the worktree (on conflicts)."""
+    return _rebasing(git, worktree) == f"refs/heads/{run_branch(run_id, slug)}"
+
+
+def main_moved(git: Git, worktree: Path, *, remote: str = "origin", base: str = "main") -> bool:
+    """Fetch `base`; whether it now has commits the worktree's HEAD doesn't contain."""
+    _fetch(git, worktree, remote, base)
+    done = git.run(
+        ["merge-base", "--is-ancestor", _tracking(remote, base), "HEAD"], worktree, check=False
+    )
+    if done.returncode in (0, 1):
+        return done.returncode == 1
+    detail = (done.stderr.strip() or done.stdout.strip())[-2000:]
+    raise GitError(
+        f"can't tell whether {base} moved in {worktree} (exit {done.returncode}): {detail}"
+    )
+
+
+def _rebasing(git: Git, worktree: Path) -> str:
+    """The branch a rebase in the worktree is rebasing (`refs/heads/...`), or ""."""
     head_name = Path(git.out(["rev-parse", "--git-path", "rebase-merge/head-name"], worktree))
     if not head_name.is_absolute():
         head_name = worktree / head_name
     try:
-        rebasing = head_name.read_text(encoding="utf-8").strip()
+        return head_name.read_text(encoding="utf-8").strip()
     except OSError:
-        rebasing = ""
-    if rebasing != f"refs/heads/{branch}":
+        return ""
+
+
+def _require_rebasing(git: Git, worktree: Path, branch: str) -> None:
+    if _rebasing(git, worktree) != f"refs/heads/{branch}":
         raise GitError(
             f"{worktree} has no rebase of {branch} in progress. Start one with the update step."
         )

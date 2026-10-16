@@ -21,8 +21,10 @@ from factory_engine.run import Kind, NonNegative, PauseReason, Role, RunState
 
 EVENTS_FILE = "events.jsonl"
 
-DecisionAction = Literal["approve_plan", "edit_and_approve", "send_back", "answer_questions"]
-"""Your decisions on a waiting run (`decisions.py`). Merge approval joins them in task 2.22."""
+DecisionAction = Literal[
+    "approve_plan", "edit_and_approve", "send_back", "answer_questions", "approve_merge"
+]
+"""Your decisions on a waiting run (`decisions.py`)."""
 
 
 class _Model(BaseModel):

@@ -69,6 +69,25 @@ class Pause(_Model):
     resume_at: AwareDatetime | None
 
 
+class PullRequestInfo(_Model):
+    """The run's pull request (git flow step 5). `head` is the commit last pushed, whose tests
+    passed. `rebased_from` is the head you approved, when the engine rebased it onto a newer
+    main at merge time (step 6); None otherwise."""
+
+    number: Annotated[int, Field(ge=1)]
+    url: str
+    head: str
+    rebased_from: str | None = None
+
+
+class ApprovedMerge(_Model):
+    """Your approve action: merge pull request `pr_number` as it was at `head`. Only
+    `decisions.approve_merge` records one, and a merge uses it once."""
+
+    pr_number: Annotated[int, Field(ge=1)]
+    head: str
+
+
 class Run(_Model):
     id: NonNegative
     slug: str
@@ -85,6 +104,8 @@ class Run(_Model):
     metrics: Metrics = Metrics()
     last_completed_step: str | None = None
     pause: Pause | None = None  # set while the run is paused
+    pull_request: PullRequestInfo | None = None  # once the pull request is open
+    merge_approval: ApprovedMerge | None = None  # your approval, until the merge uses it
 
 
 def new_run(

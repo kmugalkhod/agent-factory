@@ -534,7 +534,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Answers: one per question, in order, appended to `intent.md` after a blank line as `### Answers, <YYYY-MM-DD HH:MM> UTC` (the injected clock) and `- Q<n>: <question>` / `  A<n>: <answer>` items, so `## Answers` stays the last `## ` heading. An answer's later lines are indented, so no line you write can become a heading. The planner's rerun is a new session told the answers; send-back tells it your notes and to revise `plan.md`. Both count against the planner's cap (2.20).
   - A split moves the run to needs_you ("splits arrive in milestone 3"), with a `needs_you` event. That needs a new transition, `awaiting_plan_approval → needs_you`, added to the state machine and its table test.
 
-### [ ] 2.22 Update, push, pull request and merge
+### [x] 2.22 Update, push, pull request and merge
 
 - **What:** Implement git flow steps 3–7:
   - Rebase onto `main` before review. No conflicts → tests rerun. Conflicts → the builder resolves them, tests rerun, and if they still fail the run asks you.
@@ -549,6 +549,15 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - The worktree is removed after merge.
 - **Tests:** Integration tests with temporary repos, a bare remote and a fake `gh`.
 - **Depends on:** 2.14, 2.20, 2.21
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `merge.GitFlow` is the pipeline's hooks for a repo on GitHub. `Hooks.merge` is a third hook point, run in `awaiting_merge` only once your approval is recorded; the default merges nothing (needs you). `Pipeline` gains `move_to`, `stop_for_you`, `record`, `attempts_left` and `build_gate` for the hooks.
+  - No new state. `decisions.approve_merge` (only in `awaiting_merge`, only with a pull request) logs a `decision` event (`approve_merge`, "merge pull request #n at <head>") and records `merge_approval` (number and head) in `run.json`; the run stays in `awaiting_merge`, since the 2.5 state machine reaches `merged` only from there. The caller then builds a `Pipeline` from `Decided.run` and calls `advance()`, which merges.
+  - No merge without your approval, structurally: `merge.merge_approved` is the only caller of `github.merge_pr` (a test reads the package source to hold this). It refuses unless the run is in `awaiting_merge`, the recorded approval names the pull request and its current head (or the head the engine rebased at merge time, `rebased_from`), and the run's last decision event is that approval. An approval is used once: it is cleared after the merge step whatever happens, and when publish moves the pull request to a new head.
+  - `run.json` gains `pull_request` (number, URL, tested head, `rebased_from`) and `merge_approval`; registry migration 3 adds both as JSON columns, as for `pause`.
+  - Update before review: a rebase left waiting is given up and started again. No conflicts: the builder gate (test lock, paths, tests) runs on the rebased head, on every update, even when main hadn't moved; a fail needs you (the design sends only conflicts to the builder). The output goes to the builder's latest `test-output-builder-<n>.txt`, so the pull request body shows the last run.
+  - Conflicts: with a builder attempt left, the builder resumes, told the conflicted files (an `update` gate fail, → building); otherwise the rebase is given up and the run needs you. While a rebase waits, each builder attempt is followed by `rebase_continue`: markers left or new conflicts resume the builder again (an `update` fail, counted against its cap); once the rebase is done, the builder gate runs on the result and a fail needs you ("if it still fails the run asks you"). A run that stops for you mid-rebase gives the rebase up, so the branch is as it was before the update.
+  - Publish: the safe force-push, then `gh pr create` titled `factory(run-<id>): <slug in words>`, with `plan.md`, the latest test output and `review.md` in the body. A pull request already recorded isn't opened again: the push moves it, and its head is updated. A refused push or a failed `gh pr create` needs you.
+  - Merge: the worktree's head must be the pull request's head. If the fetched main has commits the head lacks, the engine rebases, reruns the builder gate (`merge.update`), pushes and records the new head with `rebased_from`. Then `gh pr merge <url> --merge --match-head-commit <head>`, the run moves to `merged` and the worktree is removed (`merge.cleanup`); a failed removal is logged and left to the 7-day clean-up, since the merge stands. A conflict (the rebase is given up), failing tests, a refused push or a failed merge needs you, with nothing merged.
 
 ### [ ] 2.23 Feedback, interrupt and resume
 

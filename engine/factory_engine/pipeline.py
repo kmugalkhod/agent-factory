@@ -30,10 +30,15 @@ Where later tasks plug in:
   (`decisions.py`) moves the run (to `testing`, or back to `planning`); the caller then builds
   a pipeline from the saved run and calls `advance` again, and `advance(note=...)` hands the
   decision's note to the next agent.
-- Update before review (2.22): `Hooks.update` runs in `updating`; by default it does nothing and
-  the run goes on to `reviewing`. `Hooks.publish` runs once the review passes, before
-  `awaiting_merge` (push and pull request). `Pipeline.tell_builder` sets what a builder that
-  resumes is told (for example a rebase conflict).
+- Update before review, pull request and merge (2.22, `merge.GitFlow`): `Hooks.update` runs in
+  `updating`; by default it does nothing and the run goes on to `reviewing`. A rebase conflict
+  sends the run back to the builder (`Pipeline.tell_builder`): while a rebase waits in the
+  worktree, each builder attempt resolves conflicts, then the engine carries the rebase on
+  (`git_ops.rebase_continue`) and the builder gate reruns the tests on the result. Tests that
+  still fail after a resolution, or a stop for you mid-rebase (which gives the rebase up), need
+  you. `Hooks.publish` runs once the review passes, before `awaiting_merge` (push and pull
+  request). `Hooks.merge` runs in `awaiting_merge` only once your approval is recorded
+  (`decisions.approve_merge`); the approval is used once, whatever the merge's outcome.
 - Feedback and crash recovery (2.23, 2.24): `advance` starts from whatever working state the run
   is in, with a new attempt of that stage.
 """
@@ -43,7 +48,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -70,12 +75,18 @@ from factory_engine.agents.watchdog import (
 from factory_engine.config import RoleSettings, Settings
 from factory_engine.errors import ConfigError, FactoryError, GateError, GitError, PipelineError
 from factory_engine.events import EventLog, GateResult, NeedsYou, StageFinished, StageStarted
-from factory_engine.gates.build import check_build
+from factory_engine.gates.build import BuildGateOutcome, check_build
 from factory_engine.gates.plan import PLAN_FILE, PlanCheck, check_plan
 from factory_engine.gates.post_stage import Baseline, Watch, post_stage_check, take_baseline
 from factory_engine.gates.review import check_review_file, record_findings
 from factory_engine.gates.tests_gate import check_tests, load_tester_files
-from factory_engine.git_ops import Git, commit_stage
+from factory_engine.git_ops import (
+    Git,
+    commit_stage,
+    rebase_abort,
+    rebase_continue,
+    rebase_in_progress,
+)
 from factory_engine.providers import Profile
 from factory_engine.run import Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
@@ -92,6 +103,8 @@ REVIEWER_ATTEMPTS = 3
 """Reviewer sessions per review round: a malformed `review.md` gets two more tries."""
 UPDATE_STEP = "update"
 """The step label saved once the update before review (`Hooks.update`) is done."""
+UPDATE_GATE = "update"
+"""The `gate_result` of the update before review: the rebase and the tests rerun after it."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
 PlanStop = Literal["plan_approval", "questions", "split"]
@@ -163,8 +176,9 @@ class PipelineResult:
 
 
 class Hooks:
-    """Hook points for later tasks (2.22). Each returns the run as it leaves it; the defaults
-    change nothing."""
+    """Hook points for the git flow (2.22, `merge.GitFlow`). Each returns the run as it leaves
+    it, saved (use `Pipeline.move_to`, `stop_for_you` and `record`); the defaults push, open
+    and merge nothing."""
 
     async def update(self, pipeline: "Pipeline", run: Run) -> Run:
         """In `updating`, before the review: rebase onto main and rerun the tests. Leave the run
@@ -176,6 +190,13 @@ class Hooks:
         """After the review passed, still in `reviewing`: push and open the pull request. Leave
         the run in `reviewing` to go on to `awaiting_merge`, or move it."""
         return run
+
+    async def merge(self, pipeline: "Pipeline", run: Run) -> Run:
+        """In `awaiting_merge`, with your approval recorded: merge, and move the run to
+        `merged` or needs_you. The default can't merge, so the run needs you."""
+        return pipeline.stop_for_you(
+            None, "this engine has no merge step, so nothing was merged. Merge it yourself."
+        )
 
 
 @dataclass(frozen=True)
@@ -241,6 +262,46 @@ class Pipeline:
         """What the builder is told when it next resumes (a hook's reason to send it back)."""
         self._builder_message = message
 
+    # ------------------------------------------------------------------ for the hooks
+
+    def move_to(self, target: RunState) -> Run:
+        """Move the run (logged and saved); returns it."""
+        self._move(target)
+        return self._run
+
+    def stop_for_you(self, role: Role | None, reason: str) -> Run:
+        """Move the run to needs_you with `reason` (logged and saved); returns it."""
+        self._needs_you(role, reason)
+        return self._run
+
+    def record(self, run: Run) -> Run:
+        """Save `run` (`run.json` and the registry) as the pipeline's run; returns it."""
+        self._persist(run)
+        return run
+
+    def attempts_left(self, role: Role) -> int:
+        """How many attempts `role` has left under its cap in this run."""
+        return max(0, self._cap(role) - self._attempts(role))
+
+    def build_gate(self, base: str) -> BuildGateOutcome:
+        """The builder gate on the worktree as it is: the test lock, the paths changed since
+        `base` and the repo's tests, run by the engine. The test output is saved as the
+        builder's latest attempt's (`test-output-builder-<n>.txt`). Raises ConfigError,
+        GateError or GitError when it can't run."""
+        return check_build(
+            self.git,
+            worktree=self.places.worktree,
+            run_folder=self.places.run_folder,
+            base=base,
+            builder=self.settings.roles.builder,
+            command=self.settings.commands.test,
+            attempt=max(1, self._attempts("builder")),
+            events=self.events,
+            parent_env=self._parent_env,
+            tester_stage=self._run.kind != "bootstrap",
+            timeout=self._test_timeout,
+        )
+
     # ------------------------------------------------------------------ the loop
 
     async def advance(self, *, note: str | None = None) -> PipelineResult:
@@ -255,7 +316,7 @@ class Pipeline:
             "updating": self._update,
             "reviewing": self._review,
         }
-        while (handler := handlers.get(self._run.state)) is not None:
+        while (handler := self._handler(handlers)) is not None:
             state = self._run.state
             await handler()
             if self._run.state == state:
@@ -264,6 +325,15 @@ class Pipeline:
                     f"still {state}. This is an engine bug; mark the run Needs you by hand."
                 )
         return self._result()
+
+    def _handler(
+        self, handlers: Mapping[RunState, Callable[[], Awaitable[None]]]
+    ) -> Callable[[], Awaitable[None]] | None:
+        """The step for the run's state. A run in `awaiting_merge` waits, unless your approval
+        is recorded: then it merges."""
+        if self._run.state == "awaiting_merge" and self._run.merge_approval is not None:
+            return self._merge
+        return handlers.get(self._run.state)
 
     def _result(self) -> PipelineResult:
         state = self._run.state
@@ -320,31 +390,38 @@ class Pipeline:
             reason = outcome.reason
 
     async def _build(self) -> None:
+        await self._build_attempts()
+        if self._run.state == "needs_you":
+            self._give_up_rebase()
+
+    async def _build_attempts(self) -> None:
         message, self._builder_message = self._builder_message, None
         reason: str | None = None
         while self._may_try("builder", reason):
             done = self._attempts("builder")
             if done and not self._archive(HANDOFF_BUILDER, f"handoff-builder-{done}.md", "builder"):
                 return
+            resolving = self._rebasing()
+            if resolving is None:
+                return
             resume = done > 0 and "builder" in self._run.session_ids
             prompt = _builder_prompt(self.places, message, self._take_note(), resume=resume)
             baseline = await self._attempt("builder", prompt, resume=resume)
             if baseline is None:
                 return
+            base = baseline.base
+            if resolving:
+                carried = self._carry_rebase_on()
+                if carried is None:
+                    return
+                if isinstance(carried, tuple):
+                    reason = f"the rebase onto main still has conflicts, in {', '.join(carried)}."
+                    self._gate("builder", GateResult(gate=UPDATE_GATE, passed=False, reason=reason))
+                    message = conflict_message(self.places, carried)
+                    continue
+                base = carried
             try:
-                outcome = check_build(
-                    self.git,
-                    worktree=self.places.worktree,
-                    run_folder=self.places.run_folder,
-                    base=baseline.base,
-                    builder=self.settings.roles.builder,
-                    command=self.settings.commands.test,
-                    attempt=self._attempts("builder"),
-                    events=self.events,
-                    parent_env=self._parent_env,
-                    tester_stage=self._run.kind != "bootstrap",
-                    timeout=self._test_timeout,
-                )
+                outcome = self.build_gate(base)
             except (ConfigError, GateError, GitError) as err:
                 self._needs_you("builder", f"the builder gate couldn't run: {err}")
                 return
@@ -355,13 +432,74 @@ class Pipeline:
             if outcome.flagged:
                 self._needs_you("builder", outcome.reason)
                 return
+            if resolving:
+                self._needs_you(
+                    "builder",
+                    "the tests still fail after the builder resolved the conflicts of the rebase "
+                    f"onto main: {outcome.reason}",
+                )
+                return
             reason, message = outcome.reason, outcome.resume_message()
+
+    def _rebasing(self) -> bool | None:
+        """Whether a rebase onto main waits in the worktree for the builder to resolve its
+        conflicts; None when that can't be told (the run stopped for you)."""
+        run = self._run
+        try:
+            return rebase_in_progress(self.git, self.places.worktree, run_id=run.id, slug=run.slug)
+        except GitError as err:
+            self._needs_you("builder", f"can't tell whether a rebase waits in the worktree: {err}")
+            return None
+
+    def _carry_rebase_on(self) -> str | tuple[str, ...] | None:
+        """After the builder edited the conflicted files: carry the rebase on. Returns the new
+        head once the rebase is done, the files still (or newly) in conflict, or None when it
+        failed (the run stopped for you)."""
+        run = self._run
+        try:
+            step = rebase_continue(self.git, self.places.worktree, run_id=run.id, slug=run.slug)
+            if step.conflicts:
+                return step.conflicts
+            return self.git.out(["rev-parse", "HEAD"], self.places.worktree)
+        except GitError as err:
+            self._needs_you("builder", f"the rebase onto main couldn't carry on: {err}")
+            return None
+
+    def _give_up_rebase(self) -> None:
+        """A run that stops for you mid-rebase gives the rebase up, so the run branch is back
+        where it was before the update and the worktree isn't left half rebased."""
+        run = self._run
+        worktree = self.places.worktree
+        try:
+            if not rebase_in_progress(self.git, worktree, run_id=run.id, slug=run.slug):
+                return
+            rebase_abort(self.git, worktree, run_id=run.id, slug=run.slug)
+            result = GateResult(
+                gate=UPDATE_GATE,
+                passed=False,
+                reason="the rebase onto main was given up; the run branch is back where it was "
+                "before the update.",
+            )
+        except GitError as err:
+            result = GateResult(
+                gate=UPDATE_GATE,
+                passed=False,
+                reason=f"the rebase onto main waits in {worktree} and couldn't be given up "
+                f"({err}). Run `git rebase --abort` there before resuming the run.",
+            )
+        self.events.append(result, role="builder")
 
     async def _update(self) -> None:
         self._run = await self._hooks.update(self, self._run)
         if self._run.state == "updating":
             self._save(UPDATE_STEP)
             self._move("reviewing")
+
+    async def _merge(self) -> None:
+        """Your approval is used once: whatever the merge does, it is cleared after."""
+        self._run = await self._hooks.merge(self, self._run)
+        if self._run.merge_approval is not None:
+            self._persist(self._run.model_copy(update={"merge_approval": None}))
 
     async def _review(self) -> None:
         reason: str | None = None
@@ -578,7 +716,7 @@ class Pipeline:
         self._needs_you(role, f"the {role} reached its cap of {cap} attempts.{last}")
         return False
 
-    def _needs_you(self, role: Role, reason: str) -> None:
+    def _needs_you(self, role: Role | None, reason: str) -> None:
         moved = move(self._run, "needs_you", log=self.events)
         self.events.append(NeedsYou(reason=reason), role=role)
         self._persist(moved)
@@ -711,6 +849,18 @@ def _builder_prompt(places: Places, message: str | None, note: str | None, *, re
     if message:
         text += f"\n\nAn earlier attempt failed:\n\n{message}"
     return _with_note(text, note)
+
+
+def conflict_message(places: Places, files: Sequence[str]) -> str:
+    """What the builder is told when a rebase onto main stops on conflicts in `files`."""
+    listed = "\n".join(f"- {name}" for name in files)
+    return (
+        "The engine is rebasing the run branch onto the latest main, and the rebase stopped on "
+        f"conflicts in these files of the worktree, {places.worktree}:\n\n{listed}\n\n"
+        "Resolve each one: keep what main changed and what this run needs, and remove every "
+        "conflict marker line (<<<<<<<, |||||||, =======, >>>>>>>). Edit the files only; don't "
+        "run git. The engine carries the rebase on when you finish, then runs the tests."
+    )
 
 
 def _review_message(path: Path, review: str) -> str:
