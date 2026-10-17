@@ -1,6 +1,7 @@
 """Tests for the `factory` command (task 2.28): each command calls the matching engine action on
 a stub, exit codes (0 done, 2 needs you, 1 error) and the status listing."""
 
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +12,9 @@ from typer.testing import CliRunner
 
 from factory_cli.actions import Ending, Outcome, RunDetail, RunRow
 from factory_cli.app import exit_code, make_app, parse_answers, run_command
+from factory_engine import events as ev
 from factory_engine.errors import DecisionError, FactoryError
+from factory_engine.events import Body, Event, EventObserver
 from factory_engine.run import Pause, Role, Run, RunState, new_run
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
@@ -51,21 +54,29 @@ class Stub:
         *,
         rows: Sequence[RunRow] = (),
         error: FactoryError | None = None,
+        events: Sequence[tuple[Body, Role | None]] = (),
     ) -> None:
         self.result = result or outcome()
         self.rows = list(rows)
         self.error = error
+        self.events = list(events)
         self.calls: list[tuple[str, tuple[object, ...]]] = []
         self.repos: list[Path | None] = []
+        self.observers: list[EventObserver | None] = []
 
-    def factory(self, repo: Path | None) -> "Stub":
+    def factory(self, repo: Path | None, progress: EventObserver | None) -> "Stub":
         self.repos.append(repo)
+        self.observers.append(progress)
         return self
 
     def _call(self, name: str, *args: object) -> None:
         self.calls.append((name, args))
         if self.error is not None:
             raise self.error
+        observer = self.observers[-1] if self.observers else None
+        if observer is not None:  # the run "works": its events reach the observer
+            for seq, (body, role) in enumerate(self.events, 1):
+                observer(Event(seq=seq, at=NOW, repo="pilot", run_id=3, role=role, body=body))
 
     def start_feature(self, description: str, *, slug: str | None) -> Outcome:
         self._call("start_feature", description, slug)
@@ -462,3 +473,57 @@ def test_status_of_one_run_shows_its_details() -> None:
     assert "paused" in done.output
     assert str(WORKTREE) in done.output
     assert "the builder ran for 120 minutes" in done.output
+
+
+# ------------------------------------------------------------------ progress output
+
+WORK: list[tuple[Body, Role | None]] = [
+    (ev.StageStarted(stage="planner", attempt=1), "planner"),
+    (ev.ToolCall(tool="Write", target="plan.md", decision="allowed", reason=None), "planner"),
+    (ev.Message(sender="agent", text="Plan written."), "planner"),
+    (ev.StageFinished(stage="planner", attempt=1, outcome="completed"), "planner"),
+    (ev.GateResult(gate="plan", passed=True, reason="ok"), "planner"),
+]
+_TIME = r"\d\d:\d\d:\d\d"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["start", "--feature", "Add mul"],
+        ["approve", "3"],
+        ["approve", "3", "--send-back", "notes"],
+        ["resume", "3"],
+    ],
+)
+def test_run_driving_commands_print_progress_before_the_summary(args: list[str]) -> None:
+    stub = Stub(events=WORK)
+
+    done = invoke(stub, *args)
+
+    lines = done.output.splitlines()
+    assert re.fullmatch(_TIME + r" \[planner\] started attempt 1", lines[0])
+    assert re.fullmatch(_TIME + r" \[planner\] attempt 1 completed", lines[1])
+    assert re.fullmatch(_TIME + r" \[planner\] gate plan passed", lines[2])
+    assert lines[3] == "run pilot/3 (add-mul): awaiting_plan_approval"
+    assert "Write plan.md" not in done.output
+    assert "Plan written." not in done.output
+
+
+@pytest.mark.parametrize("flag", ["--verbose", "-v"])
+def test_verbose_adds_tool_calls_and_agent_messages(flag: str) -> None:
+    stub = Stub(events=WORK)
+
+    done = invoke(stub, "start", "--feature", "Add mul", flag)
+
+    assert re.search(_TIME + r" \[planner\] Write plan.md", done.output)
+    assert re.search(_TIME + r" \[planner\] agent: Plan written.", done.output)
+
+
+@pytest.mark.parametrize("args", [["status"], ["status", "3"], ["stop", "3"], ["attach", "3"]])
+def test_other_commands_watch_no_events(args: list[str]) -> None:
+    stub = Stub(events=WORK)
+
+    invoke(stub, *args)
+
+    assert stub.observers == [None]

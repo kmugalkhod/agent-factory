@@ -19,9 +19,12 @@ from factory_engine.agent_config import agent_config_dir
 from factory_engine.agents.fake import FakeAgentRunner, result, system_init
 from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder, not_running
 from factory_engine.agents.watchdog import RESUME_PROMPT
-from factory_engine.errors import DecisionError, FactoryError, ProviderError
+from factory_engine.config import Settings
+from factory_engine.errors import DecisionError, FactoryError, NotReadyError, ProviderError
+from factory_engine.events import Event, EventObserver, read_events
 from factory_engine.git_ops import worktree_dir
 from factory_engine.paths import repo_runs_dir, run_dir
+from factory_engine.readiness import Problem, Readiness
 from factory_engine.registry import Registry, registry_path
 from factory_engine.run import Pause, RunState, load_run, save_run
 
@@ -98,6 +101,19 @@ async def _no_sleep(seconds: float) -> None:
     await asyncio.sleep(0)
 
 
+class Readied:
+    """A stand-in for the readiness check: records what it was asked and answers `result`
+    (ready by default), so the start tests don't need a GitHub remote or the repo's commands."""
+
+    def __init__(self) -> None:
+        self.result = Readiness()
+        self.calls: list[tuple[Path, Settings, dict[str, object]]] = []
+
+    def __call__(self, repo: Path, settings: Settings, **kw: object) -> Readiness:
+        self.calls.append((repo, settings, kw))
+        return self.result
+
+
 def sh(cwd: Path, *args: str, env: dict[str, str]) -> str:
     done = subprocess.run(
         ["git", *args],
@@ -118,6 +134,7 @@ class World:
     data: Path
     env: dict[str, str]
     planner: Planner
+    readiness: Readied
 
     def engine(
         self,
@@ -126,6 +143,7 @@ class World:
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
         platform: str = "win32",
+        progress: EventObserver | None = None,
     ) -> Engine:
         deps = Deps(
             env=self.env if env is None else env,
@@ -135,6 +153,8 @@ class World:
             platform=platform,
             home=FACTORY,
             runner=self.planner.factory,
+            progress=progress,
+            readiness=self.readiness,
         )
         return Engine(deps, repo)
 
@@ -161,7 +181,7 @@ def world(tmp_path: Path, git_env: dict[str, str]) -> Iterator[World]:
     data.mkdir()
     (data / GLOBAL_SETTINGS).write_text("token_expires: 2027-12-31\n", encoding="utf-8")
     env = {**git_env, "AGENT_FACTORY_DATA": str(data), "CLAUDE_CODE_OAUTH_TOKEN": TOKEN}
-    yield World(repo=repo, data=data, env=env, planner=Planner([PLAN]))
+    yield World(repo=repo, data=data, env=env, planner=Planner([PLAN]), readiness=Readied())
 
 
 def set_state(world: World, state: RunState, pause: Pause | None = None) -> None:
@@ -246,14 +266,53 @@ def test_a_folder_outside_any_repo_is_refused(world: World, tmp_path: Path) -> N
         world.engine(cwd=elsewhere).start_feature("Add mul to calc", slug=None)
 
 
-def test_start_without_factory_yaml_is_refused_before_a_run_is_made(
+def test_start_checks_readiness_on_the_main_checkout_before_a_run_is_made(
+    world: World,
+) -> None:
+    done = world.engine().start_feature("Add mul to calc", slug=None)
+
+    [(repo, settings, kw)] = world.readiness.calls
+    assert repo == world.repo.resolve()
+    assert settings.commands.test == "python -m pytest"  # the repo's factory.yaml
+    assert kw["platform"] == "win32"
+    assert kw["parent_env"] == world.env
+    assert kw["scratch"] == world.data / "readiness"
+    assert done.run.state == "awaiting_plan_approval"
+
+
+def test_a_repo_that_isnt_ready_gets_no_run_and_hears_every_problem(world: World) -> None:
+    world.readiness.result = Readiness(
+        (
+            Problem("claude_md", "`CLAUDE.md` isn't on origin/main. Add a `CLAUDE.md`."),
+            Problem("build", "factory.yaml sets no `commands.build`."),
+        )
+    )
+
+    with pytest.raises(NotReadyError) as caught:
+        world.engine().start_feature("Add mul to calc", slug=None)
+
+    assert "1. `CLAUDE.md` isn't on origin/main" in str(caught.value)
+    assert "2. factory.yaml sets no `commands.build`" in str(caught.value)
+    assert not repo_runs_dir(world.data, "pilot").exists()
+    assert world.planner.specs == []
+    registry = Registry(registry_path(world.data))
+    try:
+        assert registry.list_repos() == []  # a refused start registers nothing
+    finally:
+        registry.close()
+
+
+def test_start_without_factory_yaml_goes_to_the_readiness_check(
     world: World, git_env: dict[str, str]
 ) -> None:
     sh(world.repo, "rm", "-q", "factory.yaml", env=git_env)
+    world.readiness.result = Readiness((Problem("factory_yaml", "`factory.yaml` is missing."),))
 
-    with pytest.raises(CliError, match=r"factory\.yaml"):
+    with pytest.raises(NotReadyError, match=r"factory\.yaml"):
         world.engine().start_feature("Add mul to calc", slug=None)
 
+    [(_repo, settings, _kw)] = world.readiness.calls
+    assert settings.commands.test is None  # the built-in defaults: nothing to read
     assert not repo_runs_dir(world.data, "pilot").exists()
 
 
@@ -478,3 +537,37 @@ def test_commands_find_the_run_from_inside_its_worktree(world: World) -> None:
     assert (row.run.repo, row.run.id) == ("pilot", 0)
     assert detail.run_folder == world.folder()
     assert stopped.state == "stopped"
+
+
+# ------------------------------------------------------------------ progress output
+
+
+def test_start_tells_the_progress_observer_every_event_as_it_is_written(world: World) -> None:
+    seen: list[Event] = []
+
+    world.engine(progress=seen.append).start_feature("Add mul to calc", slug=None)
+
+    assert seen == read_events(world.folder())
+    assert {type(e.body).__name__ for e in seen} >= {"RunCreated", "StageStarted", "GateResult"}
+
+
+def test_a_decision_and_the_rerun_reach_the_progress_observer(world: World) -> None:
+    world.planner.plans.append(PLAN)
+    world.engine().start_feature("Add mul to calc", slug=None)
+    before = len(read_events(world.folder()))
+    seen: list[Event] = []
+
+    world.engine(progress=seen.append).send_back(0, "Keep it small.")
+
+    assert seen == read_events(world.folder(), after=before)
+    assert type(seen[0].body).__name__ == "Decision"
+
+
+def test_a_broken_progress_observer_doesnt_stop_the_run(world: World) -> None:
+    def broken(event: Event) -> None:
+        raise RuntimeError("the terminal went away")
+
+    done = world.engine(progress=broken).start_feature("Add mul to calc", slug=None)
+
+    assert done.stop == "plan_approval"
+    assert done.run.state == "awaiting_plan_approval"

@@ -3,7 +3,9 @@ attach.
 
 Every command takes the repo from the current folder unless `--repo` names it, and calls one
 engine action (`actions.EngineActions`). Commands that drive a run (`start`, `approve`,
-`resume`) run the pipeline in the foreground until the run needs you or finishes.
+`resume`) run the pipeline in the foreground until the run needs you or finishes, printing a
+progress line per meaningful event as it happens (`progress.py`; `--verbose` adds tool calls
+and agent messages), then where the run stopped.
 
 Exit codes: 0 done, 2 the run needs you (it waits for a decision, needs you, is paused or was
 interrupted), 1 an error. An engine error prints its message, never a traceback; a usage error
@@ -12,6 +14,7 @@ exits 1 too, so 2 always means a run waits for you.
 
 import sys
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn, cast
@@ -19,13 +22,16 @@ from typing import Annotated, NoReturn, cast
 import typer
 
 from factory_cli.actions import Ending, EngineActions, Outcome, RunDetail, RunRow
+from factory_cli.progress import Progress
 from factory_engine.errors import FactoryError
+from factory_engine.events import EventObserver
 from factory_engine.pipeline import ROLES, Stop
 from factory_engine.run import Role, Run
 from factory_engine.states import WORKING
 
-type EngineFactory = Callable[[Path | None], EngineActions]
-"""Makes the engine actions for a repo: the `--repo` folder, or None for the current folder."""
+type EngineFactory = Callable[[Path | None, EventObserver | None], EngineActions]
+"""Makes the engine actions for a repo (the `--repo` folder, or None for the current folder)
+with who is told about the events a driven run writes (None: nobody)."""
 
 NEW_PROJECT_LATER = (
     "Starting a new project (--new-project, the bootstrap run) arrives with task 2.26. For now, "
@@ -64,6 +70,15 @@ RepoOption = Annotated[
     ),
 ]
 RunArgument = Annotated[int, typer.Argument(help="The run's ID, as `factory status` lists it.")]
+VerboseOption = Annotated[
+    bool,
+    typer.Option("--verbose", "-v", help="Also show each tool call and agent message."),
+]
+
+
+def progress(verbose: bool) -> Progress:
+    """The progress lines a run-driving command prints while the run works."""
+    return Progress(typer.echo, verbose=verbose)
 
 
 def make_app(engine: EngineFactory) -> typer.Typer:
@@ -92,13 +107,14 @@ def make_app(engine: EngineFactory) -> typer.Typer:
             str | None, typer.Option(help="The run's short name. Default: from the request.")
         ] = None,
         repo: RepoOption = None,
+        verbose: VerboseOption = False,
     ) -> None:
         """Start a run from a feature description or a spec, and run it until it needs you."""
         if new_project:
             fail(NEW_PROJECT_LATER)
         if (feature is None) == (spec is None) or (feature is not None and not feature.strip()):
             fail('Give the request with one of --feature "<what to build>" or --spec <file>.')
-        actions = engine(repo)
+        actions = engine(repo, progress(verbose))
         if feature is not None:
             description = feature
             finish(lambda: actions.start_feature(description, slug=slug))
@@ -115,7 +131,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
         repo: RepoOption = None,
     ) -> None:
         """List the repo's runs with state, stage, attempts and tokens, or show one run."""
-        actions = engine(repo)
+        actions = engine(repo, None)
         if run is not None:
             run_id = run
             detail = call(lambda: actions.describe(run_id))
@@ -155,6 +171,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
             ),
         ] = None,
         repo: RepoOption = None,
+        verbose: VerboseOption = False,
     ) -> None:
         """Approve a waiting plan, edit and approve it, send it back, or answer its questions."""
         given = {
@@ -169,7 +186,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
         replies = list(answer or [])
         if answers is not None:
             replies = parse_answers(read_text(answers, "answers"))
-        actions = engine(repo)
+        actions = engine(repo, progress(verbose))
         if edit is not None:
             plan_file = edit
             finish(lambda: actions.edit_and_approve(run, plan_file))
@@ -193,7 +210,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
     @app.command()
     def stop(run: RunArgument, repo: RepoOption = None) -> None:
         """Stop a run. Its worktree, branch and run folder are kept."""
-        actions = engine(repo)
+        actions = engine(repo, None)
         stopped = call(lambda: actions.stop(run))
         echo([f"{label(stopped)}: {stopped.state}. Its worktree and run folder are kept."])
 
@@ -204,9 +221,10 @@ def make_app(engine: EngineFactory) -> typer.Typer:
             str | None, typer.Option(help="A note for the agent that carries on.")
         ] = None,
         repo: RepoOption = None,
+        verbose: VerboseOption = False,
     ) -> None:
         """Carry on a paused or interrupted run from where it stopped, until it needs you."""
-        actions = engine(repo)
+        actions = engine(repo, progress(verbose))
         finish(lambda: actions.resume(run, note=note))
 
     @app.command()
@@ -219,7 +237,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
         repo: RepoOption = None,
     ) -> None:
         """Print the command that opens an agent's session in a terminal."""
-        actions = engine(repo)
+        actions = engine(repo, None)
         chosen = cast(Role, role.value) if role is not None else None
         echo([call(lambda: actions.attach(run, role=chosen))])
 
@@ -253,7 +271,11 @@ def main() -> None:
     from factory_cli.engine import Engine, default_deps
 
     deps = default_deps()
-    sys.exit(run_command(make_app(lambda repo: Engine(deps, repo)), sys.argv[1:]))
+
+    def engine(repo: Path | None, watch: EventObserver | None) -> Engine:
+        return Engine(replace(deps, progress=watch), repo)
+
+    sys.exit(run_command(make_app(engine), sys.argv[1:]))
 
 
 def fail(message: str) -> NoReturn:

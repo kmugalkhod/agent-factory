@@ -2,10 +2,13 @@
 
 Each action works on one repo: the git repo around the current folder, or the one `--repo`
 names. It reads the settings (the built-in defaults, `<data>/settings.yaml` if present, then the
-repo's `factory.yaml`), checks the provider (token present, expiry recorded and not near) and
-builds the engine's objects: the registry, the run's event log, intake, the decisions and a
-`Pipeline` with the real agent runner (the watchdog lives inside the pipeline). It runs the
-pipeline in the foreground until the run waits for you or stops.
+repo's `factory.yaml`), checks the provider (token present, expiry recorded and not near),
+checks the readiness bar before a new run (`factory_engine.readiness`; a repo that fails it
+gets no run, and every failing condition is listed) and builds the engine's objects: the
+registry, the run's event log, intake, the decisions and a `Pipeline` with the real agent
+runner (the watchdog lives inside the pipeline). It runs the pipeline in the foreground until
+the run waits for you or stops; the run's event log tells `Deps.progress` about each event as
+it is written, so the command can print progress lines.
 
 A process holds the run's lock (`lock.py`) while it decides on a run or drives it, so two
 factory processes never write the same run. Ctrl-C or a crash stops the pipeline; the run stays
@@ -40,7 +43,7 @@ from factory_engine.config import (
 )
 from factory_engine.decisions import Decided, DecisionContext
 from factory_engine.errors import DataFolderError
-from factory_engine.events import EventLog, NeedsYou, read_events
+from factory_engine.events import EventLog, EventObserver, NeedsYou, read_events
 from factory_engine.gates.plan import PLAN_FILE, Question, check_plan
 from factory_engine.git_ops import Git, worktree_dir
 from factory_engine.github import GitHub
@@ -49,6 +52,7 @@ from factory_engine.merge import GitFlow
 from factory_engine.paths import WINDOWS_DEVICE, data_dir, run_dir
 from factory_engine.pipeline import ROLES, Pipeline, PipelineResult, Places
 from factory_engine.providers import Profile, preflight
+from factory_engine.readiness import ReadinessCheck, check_readiness
 from factory_engine.registry import Registry, open_registry, registry_path
 from factory_engine.run import Kind, Role, Run, RunState, load_run
 from factory_engine.states import WORKING, move
@@ -57,6 +61,8 @@ GLOBAL_SETTINGS = "settings.yaml"
 """The global settings file in the data folder (optional; `token_expires` lives there)."""
 REPO_CONFIG = "factory.yaml"
 LOCK_FILE = "engine.lock"
+READINESS = "readiness"
+"""The data folder's subfolder for the readiness check's temporary checkouts."""
 HOME_ENV = "AGENT_FACTORY_HOME"
 """Overrides the factory's own folder (with `prompts/` and `plugin/skills/`)."""
 CLEARED_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
@@ -74,7 +80,9 @@ type Act = Callable[[DecisionContext, Run], Decided]
 class Deps:
     """What the actions use from the outside world, passed in so tests can replace it: the
     environment, the current folder, a clock and a sleep, the platform (`sys.platform`), the
-    factory's own folder and the agent runner to use."""
+    factory's own folder, the agent runner to use and the readiness check. `progress`, if
+    given, is told about each event a run writes while this process works on it (the command's
+    progress lines)."""
 
     env: Mapping[str, str]
     cwd: Path
@@ -83,6 +91,8 @@ class Deps:
     platform: str
     home: Path
     runner: RunnerFactory
+    progress: EventObserver | None = None
+    readiness: ReadinessCheck = check_readiness
 
 
 def default_deps() -> Deps:
@@ -127,8 +137,18 @@ class Engine:
     def _start(self, make: Callable[[Intake, str], Started]) -> Outcome:
         with self._registry() as registry:
             repo, path = self._repo(registry)
-            settings = self._settings(path, "feature")
+            # No factory.yaml yet: the readiness check names it with everything else missing.
+            settings = self._settings(path, "feature", required=False)
             profile = self._preflight(settings)
+            self._deps.readiness(
+                path,
+                settings,
+                git=self._git,
+                github=GitHub(env=self._deps.env),
+                parent_env=self._deps.env,
+                platform=self._deps.platform,
+                scratch=self._data() / READINESS,
+            ).require(path)
             if registry.get_repo(repo) is None:  # after the checks: a refused start adds nothing
                 registry.add_repo(repo, path, now=self._deps.clock())
             held: list[RunLock] = []
@@ -150,6 +170,7 @@ class Engine:
                 registry=registry,
                 clock=self._deps.clock,
                 on_claim=lock,
+                observer=self._deps.progress,
             )
             try:
                 started = make(intake, self._requested_by(path))
@@ -454,17 +475,18 @@ class Engine:
             )
         return name, path
 
-    def _settings(self, repo_path: Path, kind: Kind) -> Settings:
+    def _settings(self, repo_path: Path, kind: Kind, *, required: bool = True) -> Settings:
         global_file = self._data() / GLOBAL_SETTINGS
         global_settings = load_global_settings(
             global_file if global_file.is_file() else None, self._deps.platform
         )
         repo_file = repo_path / REPO_CONFIG
         if not repo_file.is_file():
+            if not required:
+                return merge_settings(global_settings, bootstrap=kind == "bootstrap")
             raise CliError(
-                f"{repo_file} doesn't exist. Write the repo's factory.yaml (at least "
-                "`commands.test`) and merge it to main first; the readiness check arrives "
-                "with task 2.25 and the new-project run with task 2.26."
+                f"{repo_file} doesn't exist. Write the repo's factory.yaml and merge it to main; "
+                "the run needs its commands."
             )
         return merge_settings(
             global_settings, load_repo_config(repo_file), bootstrap=kind == "bootstrap"
@@ -480,7 +502,13 @@ class Engine:
         return run_dir(self._data(), repo, run_id, indexed.slug)
 
     def _events(self, run: Run, folder: Path) -> EventLog:
-        return EventLog(folder, repo=run.repo, run_id=run.id, clock=self._deps.clock)
+        return EventLog(
+            folder,
+            repo=run.repo,
+            run_id=run.id,
+            clock=self._deps.clock,
+            observer=self._deps.progress,
+        )
 
     def _context(self, folder: Path, events: EventLog, registry: Registry) -> DecisionContext:
         return DecisionContext(
