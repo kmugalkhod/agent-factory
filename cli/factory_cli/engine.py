@@ -49,11 +49,11 @@ from factory_engine.github import GitHub
 from factory_engine.intake import Intake, Started
 from factory_engine.merge import GitFlow
 from factory_engine.paths import WINDOWS_DEVICE, data_dir, run_dir
-from factory_engine.pipeline import REPORT_GATE, ROLES, Pipeline, PipelineResult, Places
+from factory_engine.pipeline import ROLES, Pipeline, PipelineResult, Places
 from factory_engine.providers import Profile, get_profile, preflight
 from factory_engine.readiness import ReadinessCheck, check_readiness
 from factory_engine.registry import Registry, open_registry, registry_path
-from factory_engine.report import write_report
+from factory_engine.report import REPORT_GATE, write_report
 from factory_engine.run import Kind, Role, Run, RunState, load_run
 from factory_engine.states import WORKING, move
 

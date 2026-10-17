@@ -116,7 +116,7 @@ from factory_engine.git_ops import (
 )
 from factory_engine.metrics import builder_attempt, builder_gate, review_verdict
 from factory_engine.providers import Profile
-from factory_engine.report import reported, write_report
+from factory_engine.report import REPORT_GATE, reported, write_report
 from factory_engine.run import Metrics, Pause, Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
 from factory_engine.safety.secrets import redact
@@ -141,8 +141,6 @@ UPDATE_GATE = "update"
 """The `gate_result` of the update before review: the rebase and the tests rerun after it."""
 TEST_LOCK_GATE = "update.test_lock"
 """The `gate_result` saying the test lock now follows main's version of a tester's file."""
-REPORT_GATE = "report"
-"""The `gate_result` logged when the run's `report.md` couldn't be written."""
 
 StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
 PlanStop = Literal["plan_approval", "questions", "split"]
@@ -335,9 +333,11 @@ class Pipeline:
     def build_gate(self, base: str) -> BuildGateOutcome:
         """The builder gate on the worktree as it is: the test lock, the paths changed since
         `base` and the repo's tests, run by the engine. The test output is saved as the
-        builder's latest attempt's (`test-output-builder-<n>.txt`). Raises ConfigError,
-        GateError or GitError when it can't run."""
-        return check_build(
+        builder's latest attempt's (`test-output-builder-<n>.txt`). Its result goes into the
+        run's first pass (`metrics.builder_gate`, saved with the run's next save) whoever runs
+        it: the builder's stage or a retest after a rebase. Raises ConfigError, GateError or
+        GitError when it can't run."""
+        outcome = check_build(
             self.git,
             worktree=self.places.worktree,
             run_folder=self.places.run_folder,
@@ -350,6 +350,8 @@ class Pipeline:
             tester_stage=self._run.kind != "bootstrap",
             timeout=self._test_timeout,
         )
+        self._metrics(builder_gate(self._run.metrics, outcome.passed))
+        return outcome
 
     # ------------------------------------------------------------------ the loop
 
@@ -517,7 +519,6 @@ class Pipeline:
             except (ConfigError, GateError, GitError) as err:
                 self._needs_you("builder", f"the builder gate couldn't run: {err}")
                 return
-            self._metrics(builder_gate(self._run.metrics, outcome.passed))
             if self._gate("builder", outcome.event()):
                 if self._commit("builder"):
                     self._move("updating")

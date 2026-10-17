@@ -245,8 +245,41 @@ def test_a_run_that_needs_you_says_why_in_the_summary(folder: Path, settings: Se
     text = _render(_run("needs_you", pull_request=None), folder, settings)
     lines = text.splitlines()
     assert "Pull request: none" in lines
-    summary = lines[lines.index("## Summary") + 2]
-    assert "the builder reached its cap of 3 attempts." in summary
+    action = lines[lines.index("## Summary") + 3]  # the line after what was asked and built
+    assert action == "It needs you: the builder reached its cap of 3 attempts."
+
+
+def test_a_long_request_never_cuts_why_the_run_needs_you(folder: Path, settings: Settings) -> None:
+    _write(folder, {"intent.md": b"# Intent\n\n" + frame_request(("ask " * 300).encode())})
+    reason = "the builder reached its cap of 3 attempts. " + "detail " * 200
+    events = EventLog(folder, repo="pilot", run_id=4, clock=lambda: START)
+    events.append(NeedsYou(reason=reason), role="builder")
+    lines = _render(_run("needs_you"), folder, settings).splitlines()
+    [action] = [line for line in lines if line.startswith("It needs you: ")]
+    assert action.startswith("It needs you: the builder reached its cap of 3 attempts.")
+    assert action.endswith("(the full reason is in events.jsonl)")
+    assert len(action) <= 300
+    assert lines.index(action) == lines.index("## Summary") + 3  # its own line, after the ask
+
+
+def test_a_short_reason_is_given_whole(folder: Path, settings: Settings) -> None:
+    events = EventLog(folder, repo="pilot", run_id=4, clock=lambda: START)
+    events.append(NeedsYou(reason="the tests fail after the rebase."), role="builder")
+    lines = _render(_run("needs_you"), folder, settings).splitlines()
+    assert "It needs you: the tests fail after the rebase." in lines
+
+
+def test_criteria_only_the_review_judged_are_listed_too(folder: Path, settings: Settings) -> None:
+    """The review also judges intent.md's requirements that the plan doesn't cover."""
+    extra = "- AC3: not met. The spec's CSV export is missing.\n"
+    review = REVIEW.replace("\n## Findings", f"{extra}\n## Findings")
+    assert extra in review
+    _write(folder, {"review.md": review})
+    lines = _render(_run("needs_you"), folder, settings).splitlines()
+    assert "- AC3: not met, judged in review.md (not in plan.md)" in lines
+    (folder / "plan.md").unlink()
+    lines = _render(_run("needs_you"), folder, settings).splitlines()
+    assert "- AC1: met, judged in review.md (not in plan.md)" in lines
 
 
 @pytest.mark.parametrize("state", ["merged", "awaiting_merge", "needs_you", "failed", "stopped"])

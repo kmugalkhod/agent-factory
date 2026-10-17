@@ -1058,23 +1058,28 @@ def test_scripted_runs_record_their_metrics_in_run_json_and_the_registry(
 
 
 @pytest.mark.parametrize(
-    ("acts", "status"),
+    ("acts", "status", "criterion"),
     [
-        ([tester(), builder(), reviewer()], "awaiting merge"),
-        ([tester(), builder(WRONG_BUILD), builder(WRONG_BUILD), builder(WRONG_BUILD)], "needs you"),
+        ([tester(), builder(), reviewer()], "awaiting merge", "- AC1: met, `test_mul`"),
+        (
+            [tester(), builder(WRONG_BUILD), builder(WRONG_BUILD), builder(WRONG_BUILD)],
+            "needs you",
+            "- AC1: not reviewed, `test_mul`",
+        ),
     ],
     ids=["awaiting-merge", "needs-you"],
 )
 def test_the_report_is_written_when_the_run_stops(
-    world_at: Maker, acts: list[Act], status: str
+    world_at: Maker, acts: list[Act], status: str, criterion: str
 ) -> None:
     world = world_at("testing")
+    write(world.run_folder, {"plan.md": PLAN})  # the approved plan a run in testing has
     world.advance(Agents(acts))
     report = world.doc("report.md").splitlines()
     assert report[0] == f"# Report: run-{RUN_ID}-{SLUG}"
     assert f"Status: {status}" in report
     assert len(report) <= 60
-    assert "- AC1: " in "\n".join(report)
+    assert criterion in report
 
 
 def test_no_report_while_the_plan_waits_for_approval(world_at: Maker) -> None:

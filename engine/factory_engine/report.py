@@ -30,7 +30,7 @@ from pathlib import Path
 
 from factory_engine.config import Settings
 from factory_engine.errors import FactoryError, ReportError
-from factory_engine.events import Event, NeedsYou, TestRun, read_events
+from factory_engine.events import EVENTS_FILE, Event, NeedsYou, TestRun, read_events
 from factory_engine.gates.plan import PLAN_FILE, check_plan
 from factory_engine.gates.review import Finding, check_review_file
 from factory_engine.gates.tests_gate import load_tester_cases
@@ -40,6 +40,8 @@ from factory_engine.run import Role, Run, RunState
 from factory_engine.testrun import write_atomic
 
 REPORT_FILE = "report.md"
+REPORT_GATE = "report"
+"""The `gate_result` logged when the run's `report.md` couldn't be written."""
 INTENT_FILE = "intent.md"
 REQUEST_HEADING = "## Request"
 REVIEW_FILE = "review.md"
@@ -103,7 +105,7 @@ def render_report(
         "",
         "## Summary",
         "",
-        _line(_summary(run, run_folder, events, len(findings))),
+        *_summary(run, run_folder, events, len(findings)),
         "",
         "## Acceptance criteria",
         "",
@@ -132,7 +134,9 @@ def render_report(
 # ------------------------------------------------------------------ sections
 
 
-def _summary(run: Run, folder: Path, events: Sequence[Event], open_findings: int) -> str:
+def _summary(run: Run, folder: Path, events: Sequence[Event], open_findings: int) -> list[str]:
+    """Two lines: what was asked and built, then what to do next, each on its own line so a
+    long request can't cut the action you need."""
     asked = _request(folder)
     sentences = [f"Requested: {asked}" if asked else "The request is in intent.md."]
     touched = _bullets(_section(_read(folder / HANDOFF_BUILDER), "Files touched"))
@@ -144,38 +148,55 @@ def _summary(run: Run, folder: Path, events: Sequence[Event], open_findings: int
         )
     else:
         sentences.append("Nothing was built.")
+    return [_line(" ".join(_sentence(s) for s in sentences)), _next(run, events, open_findings)]
+
+
+def _next(run: Run, events: Sequence[Event], open_findings: int) -> str:
+    """What to look at or do next. A long reason the run needs you is shortened with a
+    pointer to the event log, which holds it whole."""
     findings = _count(open_findings, "open finding", "open findings")
     if run.state == "needs_you":
         reasons = [e.body.reason for e in events if isinstance(e.body, NeedsYou)]
-        why = reasons[-1] if reasons else "see the run's events."
-        sentences.append(f"It needs you: {why}")
-    elif run.state == "awaiting_merge":
-        sentences.append(
+        why = _one_line(reasons[-1]) if reasons else ""
+        if not why:
+            return f"It needs you: read the reason in {EVENTS_FILE}."
+        text = _sentence(f"It needs you: {why}")
+        if len(text) <= MAX_LINE:
+            return text
+        pointer = f" (the full reason is in {EVENTS_FILE})"
+        return text[: MAX_LINE - len(pointer) - 1].rstrip() + "…" + pointer
+    if run.state == "awaiting_merge":
+        return (
             f"Before merging, read the {findings} below and the pull request."
             if open_findings
             else "Nothing is flagged; read the pull request before merging."
         )
-    elif run.state == "merged":
+    if run.state == "merged":
         head = run.pull_request.head[:12] if run.pull_request is not None else "its head"
-        sentences.append(f"Merged at {head}, with {findings}.")
-    else:
-        where = f" in the {run.stage} stage" if run.stage else ""
-        sentences.append(f"The run ended {run.state}{where}.")
-    return " ".join(_sentence(s) for s in sentences)
+        return f"Merged at {head}, with {findings}."
+    where = f" in the {run.stage} stage" if run.stage else ""
+    return f"The run ended {run.state}{where}."
 
 
 def _criteria(folder: Path) -> list[str]:
+    """Each criterion of `plan.md` with its state in `review.md` and its tests, then any the
+    review judged that the plan doesn't list (the review template adds intent.md's
+    requirements the plan doesn't cover)."""
     plan = check_plan(folder / PLAN_FILE)
-    if not plan.criteria:
-        return ["None: plan.md has no acceptance criteria."]
     states = _judged(folder / REVIEW_FILE)
     tests = _tests_per_criterion(_read(folder / PLAN_FILE))
     lines = []
+    planned = {criterion.number for criterion in plan.criteria}
     for criterion in plan.criteria:
         state = states.get(criterion.number, "not reviewed")
         names = tests.get(criterion.number)
         named = ", ".join(f"`{name}`" for name in names) if names else "no test named"
         lines.append(_line(f"- AC{criterion.number}: {state}, {named}"))
+    for number, state in sorted(states.items()):
+        if number not in planned:
+            lines.append(f"- AC{number}: {state}, judged in review.md (not in plan.md)")
+    if not lines:
+        return ["None: plan.md has no acceptance criteria."]
     return _capped(lines, MAX_CRITERIA, "criteria", PLAN_FILE)
 
 

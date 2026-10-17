@@ -1148,6 +1148,19 @@ def test_a_merged_run_records_its_metrics_and_writes_its_report(world_at: Maker)
     assert len(report) <= 60
 
 
+def test_tests_failing_on_the_rebase_before_the_first_review_fail_the_first_pass(
+    world_at: Maker,
+) -> None:
+    """The builder's first build passed, but its retest on the rebased head (the update before
+    review) fails: the first build didn't pass its tests, so first pass is False."""
+    world = world_at("testing")
+    hooks = MovingMain(world, BREAKING_ON_MAIN)
+    done = world.advance(Agents([tester(), builder()]), hooks)
+    assert done.run.state == "needs_you"
+    assert done.run.metrics.first_pass is False
+    assert world.registry.get_run(REPO, RUN_ID) == world.run()
+
+
 def test_changes_after_the_pull_request_opened_count_as_yours_but_main_doesnt(
     world_at: Maker,
 ) -> None:
