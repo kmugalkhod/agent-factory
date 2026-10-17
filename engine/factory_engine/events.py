@@ -5,9 +5,11 @@ Each line is one JSON object: a header (`seq`, `at`, `repo`, `run_id`, `role`) a
 crash mid-write leaves an unfinished last line that readers ignore and the next writer cuts
 off before appending. Sequence numbers start at 1 and strictly increase per run.
 
-One `EventLog` writes each run; the engine runs one writer per run.
+One `EventLog` writes each run; the engine runs one writer per run. It can tell an observer
+(the CLI's progress output) about each event once the event is on disk.
 """
 
+import logging
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -20,6 +22,8 @@ from factory_engine.errors import EventLogError
 from factory_engine.run import Kind, NonNegative, PauseReason, Role, RunState
 
 EVENTS_FILE = "events.jsonl"
+
+logger = logging.getLogger(__name__)
 
 DecisionAction = Literal[
     "approve_plan", "edit_and_approve", "send_back", "answer_questions", "approve_merge"
@@ -155,17 +159,33 @@ class Event(_Model):
     body: Body
 
 
+type EventObserver = Callable[[Event], None]
+"""Told about each event once it is on disk, in sequence order (the CLI's progress output)."""
+
+
 class EventLog:
-    """Appends events to `<folder>/events.jsonl`. Safe to share between threads."""
+    """Appends events to `<folder>/events.jsonl`. Safe to share between threads.
+
+    `observer`, if given, is called with each event after it is written, while the log is
+    held, so events reach it in sequence order. It must be quick and must not append to this
+    log. An exception it raises is logged and dropped: watching a run never fails it.
+    """
 
     def __init__(
-        self, folder: Path, *, repo: str, run_id: int, clock: Callable[[], datetime]
+        self,
+        folder: Path,
+        *,
+        repo: str,
+        run_id: int,
+        clock: Callable[[], datetime],
+        observer: EventObserver | None = None,
     ) -> None:
         self._folder = folder
         self.path = folder / EVENTS_FILE
         self._repo = repo
         self._run_id = run_id
         self._clock = clock
+        self._observer = observer
         self._lock = threading.Lock()
         self._last_seq = 0
         self._recover()
@@ -203,7 +223,20 @@ class EventLog:
                     "Check the run folder is writable."
                 ) from err
             self._last_seq = event.seq
+            self._tell(event)
             return event
+
+    def _tell(self, event: Event) -> None:
+        if self._observer is None:
+            return
+        try:
+            self._observer(event)
+        except Exception:  # the event is written; a broken observer must not fail the run
+            logger.exception(
+                "%s: the event observer failed on event %d; the run carries on.",
+                self.path,
+                event.seq,
+            )
 
     def _recover(self) -> None:
         """Cut an unfinished last line and take the sequence from the file, which is the
