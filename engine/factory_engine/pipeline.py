@@ -24,7 +24,10 @@ until it waits for you or stops. One attempt of a stage is:
    A role that reaches its cap stops the run for you, as does a gate that can't run.
 
 `run.json` holds the last completed step after every step (`Step`), so a restart (task 2.24)
-can tell where the run stopped.
+can tell where the run stopped. The run's metrics (`metrics.py`, 2.27) are kept up to date on
+the way: builder retries when a builder attempt starts, first pass from the builder gate and the
+first review that decides. When `advance` stops with the run awaiting merge, merged or needing
+you, it writes `report.md` (`report.py`).
 
 Where later tasks plug in:
 
@@ -86,6 +89,7 @@ from factory_engine.errors import (
     GateError,
     GitError,
     PipelineError,
+    ReportError,
 )
 from factory_engine.events import EventLog, GateResult, NeedsYou, StageFinished, StageStarted
 from factory_engine.gates.build import BuildGateOutcome, check_build
@@ -110,8 +114,10 @@ from factory_engine.git_ops import (
     rebase_continue,
     rebase_in_progress,
 )
+from factory_engine.metrics import builder_attempt, builder_gate, review_verdict
 from factory_engine.providers import Profile
-from factory_engine.run import Pause, Role, Run, RunState
+from factory_engine.report import REPORT_GATE, reported, write_report
+from factory_engine.run import Metrics, Pause, Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
 from factory_engine.safety.secrets import redact
 from factory_engine.states import move
@@ -327,9 +333,11 @@ class Pipeline:
     def build_gate(self, base: str) -> BuildGateOutcome:
         """The builder gate on the worktree as it is: the test lock, the paths changed since
         `base` and the repo's tests, run by the engine. The test output is saved as the
-        builder's latest attempt's (`test-output-builder-<n>.txt`). Raises ConfigError,
-        GateError or GitError when it can't run."""
-        return check_build(
+        builder's latest attempt's (`test-output-builder-<n>.txt`). Its result goes into the
+        run's first pass (`metrics.builder_gate`, saved with the run's next save) whoever runs
+        it: the builder's stage or a retest after a rebase. Raises ConfigError, GateError or
+        GitError when it can't run."""
+        outcome = check_build(
             self.git,
             worktree=self.places.worktree,
             run_folder=self.places.run_folder,
@@ -342,6 +350,8 @@ class Pipeline:
             tester_stage=self._run.kind != "bootstrap",
             timeout=self._test_timeout,
         )
+        self._metrics(builder_gate(self._run.metrics, outcome.passed))
+        return outcome
 
     # ------------------------------------------------------------------ the loop
 
@@ -365,7 +375,20 @@ class Pipeline:
                     f"run {self._run.repo}/{self._run.id}: the {state} step ended with the run "
                     f"still {state}. This is an engine bug; mark the run Needs you by hand."
                 )
+        self.write_report()
         return self._result()
+
+    def write_report(self, run: Run | None = None) -> None:
+        """Write `report.md` for `run` (default: the pipeline's run) if its state gets one
+        (`report.reported`). A report that can't be written is logged (`gate_result`
+        `report`), and the run goes on as it is."""
+        run = run or self._run
+        if not reported(run.state):
+            return
+        try:
+            write_report(run, self.places.run_folder, settings=self.settings, profile=self._profile)
+        except ReportError as err:
+            self.events.append(GateResult(gate=REPORT_GATE, passed=False, reason=str(err)))
 
     async def resume_paused(self, *, note: str | None = None) -> PipelineResult:
         """Carry on a paused run: the attempt it paused in continues in the same session (told
@@ -593,6 +616,8 @@ class Pipeline:
             if await self._attempt("reviewer", prompt, resume=False) is None:
                 return
             outcome = check_review_file(self.places.run_folder / REVIEW_FILE)
+            if outcome.passed or outcome.retry == "builder":  # a malformed review decides nothing
+                self._metrics(review_verdict(self._run.metrics, outcome.passed))
             if self._gate("reviewer", outcome.event()):
                 if self._commit("reviewer"):
                     self._take_hooked(await self._hooks.publish(self, self._run), "publish")
@@ -649,10 +674,12 @@ class Pipeline:
         if paused is not None and paused.role != role:
             paused = None
         attempt = paused.attempt if paused is not None else self._attempts(role) + 1
+        metrics = self._run.metrics
         self._run = self._run.model_copy(
             update={
                 "stage": role,
                 "attempts": {**self._run.attempts, role: max(attempt, self._attempts(role))},
+                "metrics": builder_attempt(metrics, attempt) if role == "builder" else metrics,
             }
         )
         self._save(Step(role, attempt, "started").label)
@@ -888,6 +915,10 @@ class Pipeline:
 
     def _attempts(self, role: Role) -> int:
         return self._run.attempts.get(role, 0)
+
+    def _metrics(self, metrics: Metrics) -> None:
+        """Change the run's metrics; saved with the next step."""
+        self._run = self._run.model_copy(update={"metrics": metrics})
 
     def _take_note(self) -> str | None:
         note, self._note = self._note, None

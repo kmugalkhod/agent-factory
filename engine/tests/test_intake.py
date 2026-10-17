@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 from factory_engine import events as ev
+from factory_engine import intake as intake_module
 from factory_engine.config import default_settings
-from factory_engine.errors import DataFolderError, GitError, IntakeError
+from factory_engine.errors import DataFolderError, GitError, IntakeError, ReportError
 from factory_engine.events import read_events
 from factory_engine.git_ops import Git, run_branch, worktree_dir
 from factory_engine.intake import INTENT_FILE, Intake, make_slug, request_of
@@ -270,6 +271,27 @@ def test_a_worktree_that_cant_be_made_fails_the_run(place: Place, tmp_path: Path
     assert place.registry.get_run(REPO, 0) == run
     assert [type(e.body) for e in read_events(folder)] == [ev.RunCreated, ev.StateChanged]
     assert (folder / INTENT_FILE).is_file()  # the request is kept for a new start
+    assert "Status: failed" in (folder / "report.md").read_text(encoding="utf-8")  # 2.27
+
+
+def test_a_report_that_cant_be_written_is_logged_and_the_failure_still_raised(
+    place: Place, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:  # 2.27
+    lonely = tmp_path / "lonely"
+    sh(tmp_path, "init", "-b", "main", str(lonely), env=place.env)
+
+    def refuse(*args: object, **kwargs: object) -> Path:
+        raise ReportError("report.md: disk full")
+
+    monkeypatch.setattr(intake_module, "write_report", refuse)
+    with pytest.raises(GitError, match="worktree"):
+        place.intake(repo_path=lonely).feature("Add mul", requested_by="Kunal")
+
+    folder = run_dir(place.data, REPO, 0, "add-mul")
+    assert load_run(folder).state == "failed"
+    [logged] = [e.body for e in read_events(folder) if isinstance(e.body, ev.GateResult)]
+    assert logged == ev.GateResult(gate="report", passed=False, reason="report.md: disk full")
+    assert not (folder / "report.md").exists()
 
 
 def test_request_of_refuses_a_file_without_the_headings() -> None:

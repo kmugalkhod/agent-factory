@@ -13,6 +13,7 @@ UTF-8. The frame around it is fixed, so `request_of` gives the request back exac
 """
 
 import contextlib
+import logging
 import os
 import re
 import tempfile
@@ -23,12 +24,16 @@ from pathlib import Path
 
 from factory_engine.agents.runner import RunIndex, persist
 from factory_engine.config import Settings
-from factory_engine.errors import GitError, IntakeError
-from factory_engine.events import EventLog, EventObserver, RunCreated
+from factory_engine.errors import FactoryError, GitError, IntakeError
+from factory_engine.events import EventLog, EventObserver, GateResult, RunCreated
 from factory_engine.git_ops import Git, create_worktree
 from factory_engine.paths import MAX_SLUG, check_slug
+from factory_engine.providers import get_profile
+from factory_engine.report import REPORT_GATE, write_report
 from factory_engine.run import Kind, Run, allocate_run, new_run
 from factory_engine.states import move
+
+logger = logging.getLogger(__name__)
 
 INTENT_FILE = "intent.md"
 REQUEST_HEADING = b"## Request"
@@ -158,12 +163,30 @@ class Intake:
                 base=self.base,
             )
         except GitError as err:
-            persist(move(run, "failed", log=events), folder, self.registry)
+            failed = move(run, "failed", log=events)
+            persist(failed, folder, self.registry)
+            _report_failure(failed, folder, self.settings, events)
             raise GitError(
                 f"run {self.repo}/{run_id} failed: its worktree couldn't be created. {err} "
                 f"Fix that, then start the run again; the request is kept in {intent}."
             ) from err
         return Started(run=run, run_folder=folder, worktree=worktree, events=events)
+
+
+def _report_failure(run: Run, folder: Path, settings: Settings, events: EventLog) -> None:
+    """The failed run's `report.md`. A report that can't be written is logged in the run's
+    events (`gate_result` `report`), and the intake failure is raised as it was."""
+    try:
+        profile = get_profile(run.provider)
+    except FactoryError:
+        profile = None
+    try:
+        write_report(run, folder, settings=settings, profile=profile)
+    except FactoryError as err:
+        try:
+            events.append(GateResult(gate=REPORT_GATE, passed=False, reason=str(err)))
+        except FactoryError:
+            logger.warning("run %s/%s: report.md couldn't be written: %s", run.repo, run.id, err)
 
 
 def frame_request(request: bytes) -> bytes:

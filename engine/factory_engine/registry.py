@@ -6,13 +6,15 @@ tables from the run folders. Repos are the registry's own data: run folders don'
 repo's path or readiness.
 
 One `sessions` row per run and role that has a session ID, an attempt count or a token total.
+One `token_use` row per agent turn and one `pauses` row per pause (task 2.27), for usage totals
+by run, repo, role, attempt and day.
 """
 
 import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict
@@ -25,9 +27,12 @@ from factory_engine.run import (
     ApprovedMerge,
     Metrics,
     Pause,
+    PauseReason,
+    PauseRecord,
     PullRequestInfo,
     Role,
     Run,
+    TokenUse,
     load_run,
 )
 
@@ -79,14 +84,49 @@ MIGRATIONS = [
     ALTER TABLE runs ADD COLUMN pull_request TEXT;
     ALTER TABLE runs ADD COLUMN merge_approval TEXT;
     """,
+    # Run metrics (task 2.27): first pass and builder retries per run; every agent turn's
+    # tokens and every pause, one row each, so usage can be totalled by run, repo, role,
+    # attempt and day (`at` is UTC ISO 8601, so `substr(at, 1, 10)` is the UTC day).
+    """
+    ALTER TABLE runs ADD COLUMN first_pass INTEGER CHECK (first_pass IN (0, 1));
+    ALTER TABLE runs ADD COLUMN builder_retries INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE token_use (
+        repo TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt >= 1),
+        at TEXT NOT NULL,
+        input INTEGER NOT NULL,
+        output INTEGER NOT NULL,
+        cache_read INTEGER NOT NULL,
+        cache_creation INTEGER NOT NULL,
+        PRIMARY KEY (repo, run_id, seq),
+        FOREIGN KEY (repo, run_id) REFERENCES runs (repo, id) ON DELETE CASCADE
+    );
+    CREATE INDEX token_use_by_at ON token_use (at);
+    CREATE TABLE pauses (
+        repo TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        role TEXT NOT NULL,
+        attempt INTEGER NOT NULL CHECK (attempt >= 1),
+        at TEXT NOT NULL,
+        resume_at TEXT,
+        PRIMARY KEY (repo, run_id, seq),
+        FOREIGN KEY (repo, run_id) REFERENCES runs (repo, id) ON DELETE CASCADE
+    );
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 
 RUN_COLUMNS = (
     "repo, id, slug, kind, state, stage, provider, isolation, created_at, updated_at, "
     "last_completed_step, important_findings, pr_lines_changed_by_you, pause, pull_request, "
-    "merge_approval"
+    "merge_approval, first_pass, builder_retries"
 )
+RUN_COLUMN_COUNT = len(RUN_COLUMNS.split(","))
 ROLES: tuple[Role, ...] = ("planner", "tester", "builder", "reviewer")
 
 
@@ -108,6 +148,34 @@ class Session(_Model):
     session_id: str | None
     attempts: int | None
     tokens: int | None
+
+
+class TokenUseRow(_Model):
+    """One agent turn's tokens (`token_use`); `seq` orders a run's rows."""
+
+    repo: str
+    run_id: int
+    seq: int
+    role: Role
+    attempt: int
+    at: AwareDatetime
+    input: int
+    output: int
+    cache_read: int
+    cache_creation: int
+
+
+class PauseRow(_Model):
+    """One pause a run went through (`pauses`): a usage limit, a turn or time cap."""
+
+    repo: str
+    run_id: int
+    seq: int
+    reason: PauseReason
+    role: Role
+    attempt: int
+    at: AwareDatetime
+    resume_at: AwareDatetime | None
 
 
 def registry_path(data: Path) -> Path:
@@ -285,18 +353,23 @@ class Registry:
             return [self._run(row) for row in rows]
 
     def list_sessions(self, repo: str | None = None, run_id: int | None = None) -> list[Session]:
-        where, params = [], []
-        if repo is not None:
-            where.append("repo = ?")
-            params.append(repo)
-        if run_id is not None:
-            where.append("run_id = ?")
-            params.append(run_id)
-        clause = f" WHERE {' AND '.join(where)}" if where else ""
-        rows = self._read(
-            f"SELECT * FROM sessions{clause} ORDER BY repo, run_id, role", tuple(params)
-        )
+        clause, params = _where(repo, run_id)
+        rows = self._read(f"SELECT * FROM sessions{clause} ORDER BY repo, run_id, role", params)
         return [Session.model_validate(dict(row)) for row in rows]
+
+    def list_token_use(
+        self, repo: str | None = None, run_id: int | None = None
+    ) -> list[TokenUseRow]:
+        """Every agent turn's tokens, by repo, run and order (for `factory usage`)."""
+        clause, params = _where(repo, run_id)
+        rows = self._read(f"SELECT * FROM token_use{clause} ORDER BY repo, run_id, seq", params)
+        return [_token_use_row(row) for row in rows]
+
+    def list_pauses(self, repo: str | None = None, run_id: int | None = None) -> list[PauseRow]:
+        """Every pause, by repo, run and order (how often runs hit the usage limit)."""
+        clause, params = _where(repo, run_id)
+        rows = self._read(f"SELECT * FROM pauses{clause} ORDER BY repo, run_id, seq", params)
+        return [_pause_row(row) for row in rows]
 
     def rebuild_index(self, data: Path) -> int:
         """Recreate `runs` and `sessions` from every `run.json` under `<data>/runs/`.
@@ -316,6 +389,8 @@ class Registry:
 
     def _run(self, row: sqlite3.Row) -> Run:
         sessions = self.list_sessions(row["repo"], row["id"])
+        uses = self.list_token_use(row["repo"], row["id"])
+        pauses = self.list_pauses(row["repo"], row["id"])
         return Run(
             id=row["id"],
             slug=row["slug"],
@@ -331,7 +406,31 @@ class Registry:
             updated_at=datetime.fromisoformat(row["updated_at"]),
             metrics=Metrics(
                 tokens={s.role: s.tokens for s in sessions if s.tokens is not None},
+                token_use=[
+                    TokenUse(
+                        role=u.role,
+                        attempt=u.attempt,
+                        at=u.at,
+                        input=u.input,
+                        output=u.output,
+                        cache_read=u.cache_read,
+                        cache_creation=u.cache_creation,
+                    )
+                    for u in uses
+                ],
+                first_pass=None if row["first_pass"] is None else bool(row["first_pass"]),
+                builder_retries=row["builder_retries"],
                 important_findings=row["important_findings"],
+                pauses=[
+                    PauseRecord(
+                        reason=p.reason,
+                        role=p.role,
+                        attempt=p.attempt,
+                        at=p.at,
+                        resume_at=p.resume_at,
+                    )
+                    for p in pauses
+                ],
                 pr_lines_changed_by_you=row["pr_lines_changed_by_you"],
             ),
             last_completed_step=row["last_completed_step"],
@@ -372,7 +471,7 @@ def _repo(row: sqlite3.Row) -> Repo:
 def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
     conn.execute("DELETE FROM runs WHERE repo = ? AND id = ?", (run.repo, run.id))  # cascades
     conn.execute(
-        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * 16)})",
+        f"INSERT INTO runs ({RUN_COLUMNS}) VALUES ({', '.join('?' * RUN_COLUMN_COUNT)})",
         (
             run.repo,
             run.id,
@@ -390,8 +489,42 @@ def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
             run.pause.model_dump_json() if run.pause is not None else None,
             run.pull_request.model_dump_json() if run.pull_request is not None else None,
             run.merge_approval.model_dump_json() if run.merge_approval is not None else None,
+            None if run.metrics.first_pass is None else int(run.metrics.first_pass),
+            run.metrics.builder_retries,
         ),
     )
+    for seq, use in enumerate(run.metrics.token_use):
+        conn.execute(
+            "INSERT INTO token_use (repo, run_id, seq, role, attempt, at, input, output, "
+            "cache_read, cache_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run.repo,
+                run.id,
+                seq,
+                use.role,
+                use.attempt,
+                _utc(use.at),
+                use.input,
+                use.output,
+                use.cache_read,
+                use.cache_creation,
+            ),
+        )
+    for seq, pause in enumerate(run.metrics.pauses):
+        conn.execute(
+            "INSERT INTO pauses (repo, run_id, seq, reason, role, attempt, at, resume_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run.repo,
+                run.id,
+                seq,
+                pause.reason,
+                pause.role,
+                pause.attempt,
+                _utc(pause.at),
+                None if pause.resume_at is None else _utc(pause.resume_at),
+            ),
+        )
     for role in ROLES:
         values = (run.session_ids.get(role), run.attempts.get(role), run.metrics.tokens.get(role))
         if any(value is not None for value in values):
@@ -400,6 +533,37 @@ def _insert_run(conn: sqlite3.Connection, run: Run) -> None:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (run.repo, run.id, role, *values),
             )
+
+
+def _where(repo: str | None, run_id: int | None) -> tuple[str, tuple[object, ...]]:
+    where: list[str] = []
+    params: list[object] = []
+    if repo is not None:
+        where.append("repo = ?")
+        params.append(repo)
+    if run_id is not None:
+        where.append("run_id = ?")
+        params.append(run_id)
+    return (f" WHERE {' AND '.join(where)}" if where else ""), tuple(params)
+
+
+def _utc(at: datetime) -> str:
+    """UTC ISO 8601, so the text sorts in time order and starts with the UTC day."""
+    return at.astimezone(UTC).isoformat()
+
+
+def _token_use_row(row: sqlite3.Row) -> TokenUseRow:
+    values = dict(row)
+    values["at"] = datetime.fromisoformat(values["at"])
+    return TokenUseRow.model_validate(values)
+
+
+def _pause_row(row: sqlite3.Row) -> PauseRow:
+    values = dict(row)
+    values["at"] = datetime.fromisoformat(values["at"])
+    if values["resume_at"] is not None:
+        values["resume_at"] = datetime.fromisoformat(values["resume_at"])
+    return PauseRow.model_validate(values)
 
 
 def _run_folders(data: Path) -> list[Path]:

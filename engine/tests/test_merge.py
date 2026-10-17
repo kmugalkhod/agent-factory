@@ -53,6 +53,7 @@ from factory_engine.run import (
     new_run,
     save_run,
 )
+from factory_engine.states import move
 
 START = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 REPO = "pilot"
@@ -1114,3 +1115,78 @@ def test_a_test_lock_broken_before_the_merge_time_rebase_needs_you(world_at: Mak
     assert done.run.state == "needs_you"
     assert "test lock fails before the rebase" in world.needs_you_reasons()[-1]
     assert world.fake_gh.merges() == []
+
+
+# ------------------------------------------------------------------ metrics and report (2.27)
+
+
+def test_a_merged_run_records_its_metrics_and_writes_its_report(world_at: Maker) -> None:
+    world = world_at("testing")
+    opened = to_awaiting_merge(world).run
+    assert opened.pull_request is not None
+    assert opened.pull_request.opened_head == opened.pull_request.head == world.head()
+    approve_merge(world.ctx)
+
+    done = world.advance(Agents([]))
+
+    run = world.run()
+    assert done.run == run and run.state == "merged"
+    assert run.metrics.first_pass is True
+    assert run.metrics.builder_retries == 0
+    assert run.metrics.important_findings == 0
+    assert run.metrics.pr_lines_changed_by_you == 0
+    assert [(use.role, use.attempt) for use in run.metrics.token_use] == [
+        ("tester", 1),
+        ("builder", 1),
+        ("reviewer", 1),
+    ]
+    assert world.registry.get_run(REPO, RUN_ID) == run
+    report = (world.run_folder / "report.md").read_text(encoding="utf-8").splitlines()
+    assert "Status: merged" in report
+    assert f"Pull request: {PR_URL}" in report
+    assert "- AC1: met, `test_mul`" in report
+    assert len(report) <= 60
+
+
+def test_tests_failing_on_the_rebase_before_the_first_review_fail_the_first_pass(
+    world_at: Maker,
+) -> None:
+    """The builder's first build passed, but its retest on the rebased head (the update before
+    review) fails: the first build didn't pass its tests, so first pass is False."""
+    world = world_at("testing")
+    hooks = MovingMain(world, BREAKING_ON_MAIN)
+    done = world.advance(Agents([tester(), builder()]), hooks)
+    assert done.run.state == "needs_you"
+    assert done.run.metrics.first_pass is False
+    assert world.registry.get_run(REPO, RUN_ID) == world.run()
+
+
+def test_changes_after_the_pull_request_opened_count_as_yours_but_main_doesnt(
+    world_at: Maker,
+) -> None:
+    """Your feedback on the open pull request (2.23) reruns the builder, and the engine moves
+    the pull request to the new head. What changed in the run's own diff since the pull request
+    opened is counted at the merge; what main brought in by the rebases isn't."""
+    world = world_at("testing")
+    opened = to_awaiting_merge(world).run
+    feedback = move(opened, "building", log=world.events)
+    world.save(feedback)
+    world.push_main(UNRELATED_ON_MAIN)  # rebased in by the update before the second review
+    done = world.advance(Agents([builder(BETTER_BUILD), reviewer()]))
+    assert done.run.state == "awaiting_merge"
+    assert done.run.pull_request is not None and opened.pull_request is not None
+    assert done.run.pull_request.opened_head == opened.pull_request.head
+    assert done.run.pull_request.head != opened.pull_request.head
+    approve_merge(world.ctx)
+    world.push_main({"src/more.py": "MORE = 1\nMORE_2 = 2\n"})  # rebased in at merge time
+
+    world.advance(Agents([]))
+
+    run = world.run()
+    assert run.state == "merged"
+    assert run.metrics.pr_lines_changed_by_you == 1  # the docstring line
+    assert run.metrics.builder_retries == 1
+    assert run.metrics.first_pass is True  # decided by the first build and review
+    assert world.registry.get_run(REPO, RUN_ID) == run
+    report = (world.run_folder / "report.md").read_text(encoding="utf-8")
+    assert "lines you changed on the pull request: 1" in report

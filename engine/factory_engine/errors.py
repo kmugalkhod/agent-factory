@@ -87,3 +87,7 @@ class MergeError(FactoryError):
 class NotReadyError(FactoryError):
     """A repo doesn't meet the readiness bar, so no feature run starts. The message lists every
     failing condition, each with what to add or fix."""
+
+
+class ReportError(FactoryError):
+    """The run's report.md couldn't be read from the run's files or written (task 2.27)."""
