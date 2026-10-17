@@ -4,8 +4,9 @@ No feature run starts on a repo until it meets the readiness bar, because tests 
 factory checks its own work. Before a feature or spec run the engine checks, and reports every
 condition that fails, each with what to add or fix:
 
-1. Isolation: a repo with `sandbox_required` is refused on native Windows, where agents run in
-   a worktree, which doesn't confine them. The repo's commands aren't run then.
+1. Isolation: a repo with `sandbox_required` is refused, and its commands are never run: on
+   native Windows agents run in a worktree, which doesn't confine them, and elsewhere the
+   engine has no sandbox runner yet (fail closed: the repo's code never runs unconfined).
 2. GitHub: `origin` exists and points at GitHub; `git ls-remote origin` reaches it without
    asking for a login (the engine's `Git` never prompts, and a short timeout catches a hidden
    login window); origin has a `main` branch; `gh auth status` succeeds.
@@ -13,10 +14,11 @@ condition that fails, each with what to add or fix:
    count): `CLAUDE.md` and `factory.yaml` exist at the repo root, and each critical flow in
    `factory.yaml` names at least one test that exists (a file or folder, relative to the repo
    root, optionally followed by `::` and a test's name).
-4. The build, test, lint and smoke commands (factory.yaml `commands`) are each set and pass in
-   a temporary checkout of origin/main, run like the gates run the test command (`testrun`: no
-   shell, a clean environment, a timeout that stops the whole process tree). The checkout is
-   removed afterwards.
+4. The test command (factory.yaml `commands.test`) is set, and it and each of the build, lint
+   and smoke commands that is set pass in a temporary checkout of origin/main, run like the
+   gates run the test command (`testrun`: no shell, a clean environment, a timeout that stops
+   the whole process tree). The checkout is removed afterwards. Build, lint and smoke are
+   optional (agreed with Kunal, Oct 17, 2026, to cut per-repo setup; the design asks for all).
 
 When origin/main can't be read, steps 3 and 4 are reported as not checked (commands that are
 missing or can't be parsed are still named).
@@ -24,11 +26,13 @@ missing or can't be parsed are still named).
 
 import contextlib
 import dataclasses
+import logging
 import re
 import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,11 +53,18 @@ from factory_engine.testrun import (
     resolve_program,
 )
 
+_log = logging.getLogger(__name__)
+
 REMOTE_TIMEOUT = 60.0
 """Seconds `git ls-remote` and `gh auth status` may take. A login window nobody sees would
 otherwise hold the check (and later a run's push) until git's own timeout."""
 TAIL_LINES = 20
 """Lines of a failing command's output shown in its message."""
+STALE_AFTER = 6 * 3600.0
+"""Seconds after which a checkout folder an earlier check left under `scratch` is cleared. A
+check runs at most four commands of `DEFAULT_TIMEOUT` each, so a younger folder may belong to a
+check still running in another factory process."""
+CHECKOUT_PREFIX = "check-"
 CLAUDE_MD = "CLAUDE.md"
 FACTORY_YAML = "factory.yaml"
 COMMANDS: tuple[CommandName, ...] = ("build", "test", "lint", "smoke")
@@ -80,19 +91,11 @@ Condition = Literal[
     "smoke",
 ]
 
-_DOES: Mapping[CommandName, str] = {
-    "build": "builds the project",
-    "test": "runs the tests",
-    "lint": "lints the code",
-    "smoke": "runs the smoke tests (the app starts, or a health endpoint returns 200)",
-}
-_EXAMPLES: Mapping[CommandName, str] = {
-    "build": "`uv build`, `npm run build`, or for Python code with no build step "
-    "`python -m compileall -q src`",
-    "test": "`uv run pytest` or `python -m pytest`",
-    "lint": "`uv run ruff check .`, `ruff check .` or `npm run lint`",
-    "smoke": "`python -m pytest tests/smoke` or `npx playwright test smoke`",
-}
+_NO_TEST = (
+    "factory.yaml sets no `commands.test`. The readiness bar needs one command that runs the "
+    "tests, passing on main. Add it under `commands:` in factory.yaml, for example "
+    "`uv run pytest` or `python -m pytest`, then commit and push it to main."
+)
 
 
 @dataclass(frozen=True)
@@ -157,18 +160,20 @@ def check_readiness(
     command_timeout: float = DEFAULT_TIMEOUT,
     remote_timeout: float = REMOTE_TIMEOUT,
     runner: Runner = run_command,
+    clock: Callable[[], float] = time.time,
 ) -> Readiness:
     """Check the readiness bar for `repo` (its main checkout) with its merged `settings`.
 
     `parent_env` is the engine's environment (pass `os.environ`): git and gh run with it, the
     repo's commands get only the clean part `testrun.command_env` keeps. `platform` is
     `sys.platform`. The temporary checkout goes in a new folder under `scratch`, outside the
-    repo. Raises GitError only when git itself can't run.
+    repo; checkout folders earlier checks left there for over `STALE_AFTER` seconds (by
+    `clock`, epoch seconds) are cleared first. Raises GitError only when git itself can't run.
     """
     problems: list[Problem] = []
-    refused = settings.sandbox_required and platform == "win32"
+    refused = settings.sandbox_required
     if refused:
-        problems.append(Problem("sandbox", _SANDBOX))
+        problems.append(Problem("sandbox", _SANDBOX if platform == "win32" else _NO_SANDBOX))
     ref = _remote(git, repo, remote, base, remote_timeout, problems)
     problems += _gh_auth(github, repo, remote_timeout)
     planned, command_problems = _plan_commands(settings)
@@ -187,7 +192,7 @@ def check_readiness(
     problems += flow_problems(settings.critical_flows, files)
     if planned and not refused:
         try:
-            with _checkout(git, repo, ref, scratch) as tree:
+            with _checkout(git, repo, ref, scratch, clock()) as tree:
                 for name, command, argv in planned:
                     problem = _run(name, command, argv, tree, parent_env, command_timeout, runner)
                     if problem is not None:
@@ -213,6 +218,13 @@ _SANDBOX = (
     "agents run in the Claude Code sandbox (supported after version 1), or, if worktree "
     "isolation with the engine's safety controls is enough for this repo, set "
     "`sandbox_required: false` in factory.yaml. The repo's commands weren't run."
+)
+_NO_SANDBOX = (
+    "factory.yaml sets `sandbox_required: true`, and the engine can't run agents or the repo's "
+    "commands in the Claude Code sandbox yet (its sandbox runner isn't built), so the factory "
+    "refuses this repo until it is. If worktree isolation with the engine's safety controls is "
+    "enough for this repo, set `sandbox_required: false` in factory.yaml. The repo's commands "
+    "weren't run."
 )
 
 
@@ -433,18 +445,15 @@ type _Planned = tuple[CommandName, str, list[str]]
 
 
 def _plan_commands(settings: Settings) -> tuple[list[_Planned], dict[CommandName, Problem]]:
-    """The commands to run, and a problem for each one that is missing or can't run."""
+    """The commands to run, and a problem for a missing test command or one that can't run.
+    Build, lint and smoke are optional: one that isn't set is skipped."""
     planned: list[_Planned] = []
     problems: dict[CommandName, Problem] = {}
     for name in COMMANDS:
         command = getattr(settings.commands, name)
         if command is None or not command.strip():
-            problems[name] = Problem(
-                name,
-                f"factory.yaml sets no `commands.{name}`. The readiness bar needs one command "
-                f"that {_DOES[name]}, passing on main. Add it under `commands:` in factory.yaml, "
-                f"for example {_EXAMPLES[name]}, then commit and push it to main.",
-            )
+            if name == "test":
+                problems[name] = Problem(name, _NO_TEST)
             continue
         try:
             argv = parse_command(command)
@@ -458,11 +467,13 @@ def _plan_commands(settings: Settings) -> tuple[list[_Planned], dict[CommandName
 
 
 @contextlib.contextmanager
-def _checkout(git: Git, repo: Path, ref: str, scratch: Path) -> Iterator[Path]:
-    """A temporary detached worktree of `ref` in a new folder under `scratch`, removed after."""
+def _checkout(git: Git, repo: Path, ref: str, scratch: Path, now: float) -> Iterator[Path]:
+    """A temporary detached worktree of `ref` in a new folder under `scratch`, removed after.
+    Stale folders earlier checks left (see `STALE_AFTER`) are cleared first."""
+    _clear_stale(git, repo, scratch, now)
     try:
         scratch.mkdir(parents=True, exist_ok=True)
-        holder = Path(tempfile.mkdtemp(prefix="check-", dir=scratch))
+        holder = Path(tempfile.mkdtemp(prefix=CHECKOUT_PREFIX, dir=scratch))
     except OSError as err:
         raise GitError(f"{scratch}: can't create a folder for the checkout ({err}).") from err
     tree = holder / "tree"
@@ -481,17 +492,51 @@ def _remove(git: Git, repo: Path, tree: Path, holder: Path) -> None:
         with contextlib.suppress(GitError):
             done = git.run(["worktree", "remove", "--force", str(tree)], repo, check=False)
             removed = done.returncode == 0
-    shutil.rmtree(holder, onexc=_writable_and_retry)
+    _delete(holder)
     if not removed:
-        with contextlib.suppress(GitError):
-            git.run(["worktree", "prune"], repo, check=False)
+        _prune(git, repo)
 
 
-def _writable_and_retry(func: Callable[..., object], path: str, _err: BaseException) -> None:
-    """For `shutil.rmtree`: clear a read-only flag (Windows) and retry once; give up quietly."""
-    with contextlib.suppress(OSError):
+def _clear_stale(git: Git, repo: Path, scratch: Path, now: float) -> None:
+    """Delete checkout folders under `scratch` older than `STALE_AFTER`, left by earlier checks
+    whose clean-up failed (a command kept a file open, say), then prune git's record of them."""
+    try:
+        old = [
+            folder
+            for folder in scratch.iterdir()
+            if folder.name.startswith(CHECKOUT_PREFIX)
+            and folder.is_dir()
+            and now - folder.stat().st_mtime > STALE_AFTER
+        ]
+    except OSError:
+        return  # no scratch folder yet, or it can't be listed: nothing to clear
+    for folder in old:
+        _delete(folder)
+    if old:
+        _prune(git, repo)
+
+
+def _delete(folder: Path) -> None:
+    """Delete `folder`. Clean-up never changes the check's result: what can't be deleted is
+    logged, and a later check clears it."""
+    shutil.rmtree(folder, onexc=_writable_and_retry)
+    if folder.exists():
+        _log.warning("readiness: couldn't delete the checkout %s; a later check clears it", folder)
+
+
+def _prune(git: Git, repo: Path) -> None:
+    with contextlib.suppress(GitError):
+        git.run(["worktree", "prune"], repo, check=False)
+
+
+def _writable_and_retry(func: Callable[..., object], path: str, err: BaseException) -> None:
+    """For `shutil.rmtree`: clear a read-only flag (Windows) and retry once. A retry that fails
+    is logged, not raised."""
+    try:
         Path(path).chmod(stat.S_IWRITE)
         func(path)
+    except OSError as retry:
+        _log.warning("readiness: couldn't delete %s (%s; then %s)", path, err, retry)
 
 
 def _run(

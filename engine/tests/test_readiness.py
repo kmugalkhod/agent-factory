@@ -3,10 +3,12 @@ run. Fixture repos are a temporary checkout whose `origin` says GitHub but is re
 `insteadOf`, set through the environment) to a bare repo on disk; `gh` is a fake on PATH. No
 network and no real model."""
 
+import logging
 import os
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +22,9 @@ from factory_engine.errors import NotReadyError
 from factory_engine.git_ops import Git, run_command
 from factory_engine.github import GitHub
 from factory_engine.readiness import (
+    STALE_AFTER,
     Readiness,
+    _writable_and_retry,  # pyright: ignore[reportPrivateUsage] -- its logging is the behaviour
     check_readiness,
     flow_problems,
     github_remote,
@@ -315,14 +319,21 @@ def test_a_missing_file_is_named(fx: Fixture, name: str) -> None:
 # ------------------------------------------------------------------ commands
 
 
-@pytest.mark.parametrize("name", ["build", "test", "lint", "smoke"])
-def test_a_missing_command_is_named(fx: Fixture, name: str) -> None:
-    result = fx.check(settings(**{name: None}))
+def test_a_missing_test_command_is_named(fx: Fixture) -> None:
+    result = fx.check(settings(test=None))
 
-    assert conditions(result) == [name]
-    assert f"`commands.{name}`" in result.problems[0].message
+    assert conditions(result) == ["test"]
+    assert "`commands.test`" in result.problems[0].message
     assert "for example" in result.problems[0].message
     assert len(fx.calls) == 3  # the other commands still ran
+
+
+def test_a_repo_with_only_a_test_command_is_ready(fx: Fixture) -> None:
+    # Build, lint and smoke are optional (agreed with Kunal, Oct 17, 2026).
+    result = fx.check(settings(build=None, lint=None, smoke=None))
+
+    assert result.ready
+    assert len(fx.calls) == 1
 
 
 @pytest.mark.parametrize("name", ["build", "test", "lint", "smoke"])
@@ -374,10 +385,46 @@ def test_sandbox_required_is_refused_on_native_windows(fx: Fixture) -> None:
     assert fx.calls == []  # the repo's code never ran unconfined
 
 
-def test_sandbox_required_is_fine_where_the_sandbox_exists(fx: Fixture) -> None:
-    result = fx.check(settings(sandbox_required=True), platform="linux")
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_sandbox_required_is_refused_until_a_sandbox_runner_exists(
+    fx: Fixture, platform: str
+) -> None:
+    result = fx.check(settings(sandbox_required=True), platform=platform)
+
+    assert conditions(result) == ["sandbox"]
+    assert "sandbox runner isn't built" in result.problems[0].message
+    assert fx.calls == []  # fail closed: no command runs unconfined on any platform
+
+
+# ------------------------------------------------------------------ clean-up
+
+
+def test_a_stale_checkout_left_by_an_earlier_check_is_cleared(fx: Fixture) -> None:
+    fx.scratch.mkdir(parents=True)
+    stale, fresh = fx.scratch / "check-stale", fx.scratch / "check-fresh"
+    for folder in (stale, fresh):
+        (folder / "tree").mkdir(parents=True)
+        (folder / "tree" / "left.txt").write_text("x", encoding="utf-8")
+    now = time.time()
+    os.utime(stale, (now - STALE_AFTER - 60, now - STALE_AFTER - 60))
+
+    result = fx.check(clock=lambda: now)
 
     assert result.ready
+    assert not stale.exists()
+    assert fresh.exists()  # may belong to a check still running elsewhere
+
+
+def test_a_checkout_that_cant_be_deleted_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def busy(path: str) -> None:
+        raise PermissionError(f"{path} is in use")
+
+    with caplog.at_level(logging.WARNING, logger="factory_engine.readiness"):
+        _writable_and_retry(busy, str(tmp_path), PermissionError("in use"))
+
+    assert str(tmp_path) in caplog.text
 
 
 # ------------------------------------------------------------------ GitHub
@@ -464,9 +511,9 @@ def test_every_failing_condition_is_reported_together(fx: Fixture) -> None:
     fx.push("drop CLAUDE.md")
     fx.logged_out()
 
-    result = fx.check(settings(build=None, smoke="python scripts/fail.py"))
+    result = fx.check(settings(test=None, smoke="python scripts/fail.py"))
 
-    assert conditions(result) == ["gh_auth", "claude_md", "build", "smoke"]
+    assert conditions(result) == ["gh_auth", "claude_md", "test", "smoke"]
     with pytest.raises(NotReadyError) as caught:
         result.require(fx.repo)
     text = str(caught.value)
