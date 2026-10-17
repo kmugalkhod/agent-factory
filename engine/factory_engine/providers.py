@@ -6,8 +6,9 @@ milestone 4.
 
 An agent's environment is built from a clean base, never from the parent's: a short list of
 system variables an agent's tools need, a few fixed settings for the commands it runs, then the
-profile's own credentials, then the agent's `CLAUDE_CONFIG_DIR`. Anything else in the parent, such as a leftover `ANTHROPIC_*` or proxy
-variable, would silently switch the provider, so it never reaches the agent.
+profile's own credentials, then the agent's `CLAUDE_CONFIG_DIR`. Anything else in the parent,
+such as a leftover `ANTHROPIC_*` or proxy variable, would silently switch the provider, so it
+never reaches the agent.
 """
 
 from collections.abc import Mapping

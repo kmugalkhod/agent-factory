@@ -176,9 +176,15 @@ class Git:
     def _env(self) -> dict[str, str]:
         env = {k: v for k, v in self.env.items() if k.upper() not in _LOCATION_VARS}
         # Replace objects (`git replace`) only change what git shows, not what a push sends, so
-        # the engine always reads the real commits.
+        # the engine always reads the real commits. Nothing may wait for you: no terminal
+        # prompt, and no Git Credential Manager window (one asking which saved account to use
+        # held a push until its timeout), so a missing login fails at once.
         env.update(
-            GIT_TERMINAL_PROMPT="0", GIT_EDITOR="true", LC_ALL="C", GIT_NO_REPLACE_OBJECTS="1"
+            GIT_TERMINAL_PROMPT="0",
+            GCM_INTERACTIVE="never",
+            GIT_EDITOR="true",
+            LC_ALL="C",
+            GIT_NO_REPLACE_OBJECTS="1",
         )
         return env
 
@@ -446,7 +452,10 @@ def push_run_branch(
                 f"push of {expected} refused: the remote branch changed since the engine last "
                 f"pushed it. Check who pushed to it, then decide in the run. ({detail})"
             )
-        raise GitError(f"push of {expected} failed (exit {done.returncode}): {detail}")
+        raise GitError(
+            f"push of {expected} failed (exit {done.returncode}): {detail}. If git couldn't log "
+            "in to GitHub, `gh auth setup-git` makes git use your gh login."
+        )
     git.run(["update-ref", lease, head], worktree)
 
 
