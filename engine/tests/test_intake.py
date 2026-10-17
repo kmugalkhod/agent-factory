@@ -299,3 +299,12 @@ def test_a_refusing_on_claim_publishes_nothing(place: Place) -> None:
     folder = run_dir(place.data, REPO, 0, "add-mul")
     assert sorted(path.name for path in folder.iterdir()) == []
     assert place.registry.get_run(REPO, 0) is None
+
+
+def test_the_run_event_log_tells_the_observer(place: Place) -> None:
+    seen: list[ev.Event] = []
+
+    started = replace(place.intake(), observer=seen.append).feature("Add mul", requested_by="Kunal")
+
+    assert seen == read_events(started.run_folder)
+    assert isinstance(seen[0].body, ev.RunCreated)

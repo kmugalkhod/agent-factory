@@ -338,3 +338,58 @@ def test_tail_on_a_run_without_events_waits(tmp_path: Path) -> None:  # issue 2
     assert tail.poll() == []
     _log(tmp_path).append(NeedsYou(reason="first"))
     assert [e.seq for e in tail.poll()] == [1]
+
+
+# ------------------------------------------------------------ observer (CLI progress output)
+
+
+def _observed_log(folder: Path, observer: events.EventObserver) -> EventLog:
+    ticks = _clock()
+    return EventLog(folder, repo="app", run_id=3, clock=lambda: next(ticks), observer=observer)
+
+
+def test_the_observer_sees_each_appended_event_in_order(tmp_path: Path) -> None:
+    seen: list[Event] = []
+    log = _observed_log(tmp_path, seen.append)
+
+    written = [log.append(body, role=role) for body, role in ONE_OF_EACH]
+
+    assert seen == written == read_events(tmp_path)
+
+
+def test_the_observer_isnt_told_about_a_failed_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Event] = []
+    log = _observed_log(tmp_path, seen.append)
+
+    def failing_open(self: Path, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(EventLogError):
+        log.append(NeedsYou(reason="lost"))
+
+    assert seen == []
+
+
+def test_an_observer_that_raises_doesnt_fail_the_append(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken(event: Event) -> None:
+        raise RuntimeError("printer broke")
+
+    log = _observed_log(tmp_path, broken)
+
+    first = log.append(NeedsYou(reason="one"))
+    second = log.append(NeedsYou(reason="two"))
+
+    assert [first.seq, second.seq] == [1, 2]
+    assert read_events(tmp_path) == [first, second]
+    assert "printer broke" in caplog.text
+
+
+def test_a_log_without_an_observer_still_appends(tmp_path: Path) -> None:
+    log = _log(tmp_path)
+
+    assert log.append(NeedsYou(reason="one")).seq == 1

@@ -25,7 +25,7 @@ from pathlib import Path
 from factory_engine.agents.runner import RunIndex, persist
 from factory_engine.config import Settings
 from factory_engine.errors import FactoryError, GitError, IntakeError
-from factory_engine.events import EventLog, RunCreated
+from factory_engine.events import EventLog, EventObserver, RunCreated
 from factory_engine.git_ops import Git, create_worktree
 from factory_engine.paths import MAX_SLUG, check_slug
 from factory_engine.providers import get_profile
@@ -61,7 +61,8 @@ class Started:
 class Intake:
     """Starts runs on one repo. Everything it uses is passed in: the data folder, the repo's
     name and main checkout, the run's effective settings (provider and isolation), git, the
-    registry and a clock, and optionally what to do once a run's folder is claimed."""
+    registry and a clock, and optionally what to do once a run's folder is claimed and who watches
+    the run's events."""
 
     data: Path
     repo: str
@@ -75,6 +76,8 @@ class Intake:
     on_claim: Callable[[Path], None] | None = None
     """Called with the run folder as soon as it is claimed, before anything is written into it
     or indexed (the CLI takes the run's lock there). If it raises, the run isn't published."""
+    observer: EventObserver | None = None
+    """Given to the run's event log: told about each event once it is written (`EventLog`)."""
 
     def feature(self, description: str, *, requested_by: str, slug: str | None = None) -> Started:
         """Start a feature run from your description, written into `intent.md` as given. The
@@ -144,7 +147,9 @@ class Intake:
             now=now,
         )
         persist(run, folder, self.registry)
-        events = EventLog(folder, repo=self.repo, run_id=run_id, clock=self.clock)
+        events = EventLog(
+            folder, repo=self.repo, run_id=run_id, clock=self.clock, observer=self.observer
+        )
         events.append(RunCreated(kind=kind, spec=spec))
         try:
             worktree = create_worktree(
