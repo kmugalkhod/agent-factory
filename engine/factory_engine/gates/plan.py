@@ -27,6 +27,11 @@ Rules, checked line by line (no Markdown parser, so the result never depends on 
   parts.
 - Questions (optional): numbered; `Why it matters:` and `Default if unanswered:` are read
   when present.
+- Design (optional, required for UI changes): when Files names a UI file (`UI_SUFFIXES`, not a
+  test file: `.test.` or `.spec.` in its name, or under a `tests` or `__tests__` folder), the
+  plan must have `## Design` with at least one filled list item (layout, look, states): not
+  only a label and placeholders, as in the template. A Design section, when present, needs
+  such items whatever the files.
 
 Every problem is reported at once, so one retry can fix them all.
 """
@@ -43,8 +48,24 @@ GATE = "plan"
 PLAN_FILE = "plan.md"
 
 REQUIRED = ("Context", "Past runs used", "Files", "Steps", "Acceptance criteria", "Test cases")
-OPTIONAL = ("Split", "Questions")
-SECTIONS = REQUIRED + OPTIONAL
+OPTIONAL = ("Design", "Split", "Questions")
+SECTIONS = (
+    "Context",
+    "Past runs used",
+    "Design",
+    "Files",
+    "Steps",
+    "Acceptance criteria",
+    "Test cases",
+    "Split",
+    "Questions",
+)
+"""Every heading in the template's order."""
+
+# Files a person sees: the plan for them must say how they look (`## Design`).
+UI_SUFFIXES = (".tsx", ".jsx", ".vue", ".svelte", ".html", ".htm", ".css", ".scss", ".sass")
+_TEST_NAME = (".test.", ".spec.")
+_TEST_FOLDERS = frozenset({"tests", "test", "__tests__"})
 
 # Words naming a result someone can observe. Only verb forms that are rarely nouns, so "the
 # output is clean" or "logs are tidy" stay vague.
@@ -63,6 +84,9 @@ _NUMBERED = re.compile(r"^(\d{1,9})[.)]\s+(\S.*)$")
 _BULLET = re.compile(r"^[-*+]\s+(\S.*)$")
 _PLACEHOLDER = re.compile(r"^<[^<>]*>$")
 _FILE = re.compile(r"^`([^`]+)`")
+_PLACEHOLDERS = re.compile(r"<[^<>]*>")
+_LABEL = re.compile(r"[\w ]*:")
+_FORMATTING = re.compile(r"[*_`~]")  # Markdown emphasis around a label, as in `**Layout:**`
 _FENCES = ("```", "~~~")
 _CODE = re.compile(r"`[^`]+`")
 _DIGIT = re.compile(r"\d")
@@ -85,6 +109,7 @@ class ProblemKind(StrEnum):
     VAGUE_CRITERIA = "vague_criteria"
     SPLIT = "split"
     QUESTIONS = "questions"
+    DESIGN = "design"
 
 
 @dataclass(frozen=True)
@@ -118,8 +143,8 @@ class Question:
 
 @dataclass(frozen=True)
 class PlanCheck:
-    """The gate's verdict and what it read. `split` and `questions` are None when the plan has
-    no such section; they are filled even when the plan fails."""
+    """The gate's verdict and what it read. `design`, `split` and `questions` are None when the
+    plan has no such section; they are filled even when the plan fails."""
 
     problems: tuple[Problem, ...]
     files: tuple[str, ...] = ()
@@ -127,6 +152,7 @@ class PlanCheck:
     criteria: tuple[Criterion, ...] = ()
     split: tuple[SplitPart, ...] | None = None
     questions: tuple[Question, ...] | None = None
+    design: tuple[str, ...] | None = None
 
     @property
     def passed(self) -> bool:
@@ -150,6 +176,8 @@ class PlanCheck:
             f"{_count(len(self.criteria), 'acceptance criterion', 'acceptance criteria')}, "
             f"{quality}."
         )
+        if self.design:
+            reason += f" Its design lists {_count(len(self.design), 'item', 'items')}."
         extras: list[str] = []
         if self.split:
             extras.append(f"proposes a split into {_count(len(self.split), 'part', 'parts')}")
@@ -209,6 +237,17 @@ def check_plan_text(text: str) -> PlanCheck:
             numbers = ", ".join(str(c.number) for c in criteria)
             problems.append(Problem(ProblemKind.VAGUE_CRITERIA, _VAGUE.format(numbers=numbers)))
 
+    design: tuple[str, ...] | None = None
+    if "Design" in bodies:
+        design = tuple(item.text for item in _items(bodies["Design"]) if _filled(item.text))
+        if not design:
+            problems.append(Problem(ProblemKind.DESIGN, _EMPTY_DESIGN))
+    else:
+        shown = [path for path in files if is_ui_file(path)]
+        if shown:
+            listed = ", ".join(f"`{path}`" for path in shown)
+            problems.append(Problem(ProblemKind.DESIGN, _NO_DESIGN.format(files=listed)))
+
     split: tuple[SplitPart, ...] | None = None
     if "Split" in bodies:
         split, split_problems = _split(bodies["Split"])
@@ -227,7 +266,24 @@ def check_plan_text(text: str) -> PlanCheck:
         criteria=criteria,
         split=split,
         questions=questions,
+        design=design,
     )
+
+
+def _filled(text: str) -> bool:
+    """Whether a Design item says something: not just a label (bold or not) and placeholders,
+    as in the template's `Layout: <where things sit>`."""
+    rest = _FORMATTING.sub("", _PLACEHOLDERS.sub("", text)).strip()
+    return bool(rest) and not _LABEL.fullmatch(rest)
+
+
+def is_ui_file(path: str) -> bool:
+    """Whether a Files path is one people see: a UI suffix and not a test (module rules)."""
+    parts = path.replace("\\", "/").lower().split("/")
+    name = parts[-1]
+    if any(marker in name for marker in _TEST_NAME) or _TEST_FOLDERS & set(parts[:-1]):
+        return False
+    return name.endswith(UI_SUFFIXES)
 
 
 def is_measurable(text: str) -> bool:
@@ -259,6 +315,17 @@ _NO_PARTS = (
     "`## Split` has no numbered parts. List the parts in order as "
     "`1. <part title>: <scope>, depends on <none | part N>`, or delete the section when the "
     "change needs no split."
+)
+_NO_DESIGN = (
+    "The plan changes files people see ({files}) but has no `## Design`. Add it after "
+    "`## Past runs used`: list the layout (including phone width), the look (colours, type, "
+    "spacing), the states (empty, error, loading) and anything the request leaves open that "
+    "makes the app better to use. List the style files in `## Files`."
+)
+_EMPTY_DESIGN = (
+    "`## Design` has no filled items. List the layout (including phone width), the look "
+    "(colours, type, spacing) and the states (empty, error, loading) as bullets, or delete "
+    "the section when nothing people see changes."
 )
 _NO_QUESTIONS = (
     "`## Questions` has no numbered questions. Number each question (`1.`, `2.`, ...), or "

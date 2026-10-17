@@ -19,6 +19,13 @@ Write `plan.md` in the run folder from the plan template. The `write-plan` and
 
 - **Context:** what is asked, what exists today, what changes.
 - **Past runs used:** every past run you used and what you took from it, or "None".
+- **Design:** for any change people see, design it for this app, its users and its purpose:
+  layout (phone and desktop), look (colours, type, spacing), states (empty, error, loading,
+  success) and small extras the request leaves open that make it better to use. Think like a
+  product designer: the request says what, the design says how it should feel. Don't reuse a
+  stock look, keep it consistent with what the app already has, and list the style files in
+  Files. Turn what matters into acceptance criteria someone can check. Delete the section when
+  nothing people see changes. The gate fails a plan that changes UI files without it.
 - **Files:** every file to create or change, including the test files the tester will write.
 - **Steps:** small, ordered steps the builder can check one at a time.
 - **Acceptance criteria:** numbered and measurable: a command, an input and its expected output,

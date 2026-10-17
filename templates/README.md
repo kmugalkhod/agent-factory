@@ -34,10 +34,12 @@ request. Answers are appended after `## Answers`, so it stays the last heading.
 ## plan.md
 
 Written by the planner. The planner gate checks that it names files, steps and measurable
-acceptance criteria.
+acceptance criteria, and that a plan changing a file people see (`.tsx`, `.css`, `.html`, ...)
+has a filled `Design`.
 
 - `Context`
 - `Past runs used`
+- `Design` (optional)
 - `Files`
 - `Steps`
 - `Acceptance criteria`

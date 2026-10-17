@@ -475,3 +475,142 @@ def test_split_and_questions_are_returned_when_the_plan_fails() -> None:
     check = check_plan_text(make({"Files": "None", "Questions": "1. Which format?"}))
     assert not check.passed
     assert check.questions == (Question(number=1, text="Which format?", why=None, default=None),)
+
+
+# ------------------------------------------------------------------ Design for UI changes
+
+DESIGN = (
+    "- Layout: a centred card, 640px wide, one column on a phone\n"
+    "- Look: neutral background, one accent colour, rounded inputs and buttons\n"
+    "- States: an empty-list message and an inline error under the field"
+)
+UI_FILES = (
+    "- `src/App.tsx`: change, show the list\n"
+    "- `src/App.css`: create, the card layout\n"
+    "- `src/App.test.tsx`: change, tests for the list (tester)"
+)
+
+
+def make_ui(design: str | None, files: str = UI_FILES) -> str:
+    """A plan with a Design section (None leaves it out) in its template place."""
+    sections: dict[str, str | None] = {
+        "Context": GOOD["Context"],
+        "Past runs used": GOOD["Past runs used"],
+        "Design": design,
+        "Files": files,
+    }
+    sections |= {name: GOOD[name] for name in ("Steps", "Acceptance criteria", "Test cases")}
+    parts = ["# Plan: run-42-habit-list", ""]
+    for heading, body in sections.items():
+        if body is not None:
+            parts += [f"## {heading}", "", body, ""]
+    return "\n".join(parts)
+
+
+def test_ui_plan_with_a_design_passes() -> None:
+    assert check_plan_text(make_ui(DESIGN)).passed
+
+
+def test_ui_plan_returns_its_design() -> None:
+    check = check_plan_text(make_ui(DESIGN))
+    assert check.design is not None
+    assert len(check.design) == 3
+    assert check.design[0].startswith("Layout:")
+
+
+def test_plan_without_a_design_returns_none() -> None:
+    assert check_plan_text(make()).design is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/App.tsx",
+        "src/components/Button.jsx",
+        "index.html",
+        "public/about.htm",
+        "src/App.css",
+        "src/styles/app.scss",
+        "src/Card.vue",
+        "src/Card.svelte",
+        r"src\components\HabitList.tsx",
+        "SRC/APP.TSX",
+    ],
+)
+def test_ui_file_without_a_design_fails_on_design(path: str) -> None:
+    check = check_plan_text(make_ui(None, files=f"- `{path}`: change, the page"))
+    assert kinds(check) == (ProblemKind.DESIGN,)
+    assert path in check.reason
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/lib/habits.ts",
+        "cli/factory_cli/status.py",
+        "src/App.test.tsx",
+        "src/components/Button.spec.jsx",
+        "tests/App.habits.test.tsx",
+        "tests/e2e/home.html",
+    ],
+)
+def test_non_ui_files_need_no_design(path: str) -> None:
+    assert check_plan_text(make_ui(None, files=f"- `{path}`: change, the logic")).passed
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "None",
+        "- <layout>\n- <look>",
+        "Make it look nice.",
+        "- Layout: <where>\n- Look: <colours>",
+        "- **Layout:** <where>\n- _Look_: <colours>\n- `States`: <which>",
+    ],
+)
+def test_design_without_filled_items_fails_on_design(body: str) -> None:
+    check = check_plan_text(make_ui(body))
+    assert kinds(check) == (ProblemKind.DESIGN,)
+    assert "`## Design`" in check.reason
+
+
+def test_design_without_items_fails_even_when_no_ui_file_changes() -> None:
+    check = check_plan_text(make_ui("None", files=GOOD["Files"]))
+    assert kinds(check) == (ProblemKind.DESIGN,)
+
+
+def test_missing_design_reason_says_what_to_write() -> None:
+    reason = check_plan_text(make_ui(None)).reason
+    assert "`## Design`" in reason
+    assert "src/App.tsx" in reason and "src/App.css" in reason
+    assert "src/App.test.tsx" not in reason
+    for topic in ("layout", "colour", "state", "phone"):
+        assert topic in reason.lower()
+
+
+def test_design_after_files_fails_on_headings() -> None:
+    text = make_ui(None) + "\n## Design\n\n" + DESIGN + "\n"
+    assert ProblemKind.HEADINGS in kinds(check_plan_text(text))
+
+
+def test_template_has_design_between_past_runs_and_files() -> None:
+    headings = [
+        line[3:].strip()
+        for line in TEMPLATE.read_text(encoding="utf-8").splitlines()
+        if line.startswith("## ")
+    ]
+    assert headings.index("Past runs used") + 1 == headings.index("Design")
+    assert headings.index("Design") + 1 == headings.index("Files")
+
+
+def test_passing_reason_mentions_the_design() -> None:
+    assert "design" in check_plan_text(make_ui(DESIGN)).reason.lower()
+
+
+def test_unfilled_template_design_fails_on_design() -> None:
+    assert ProblemKind.DESIGN in kinds(check_plan(TEMPLATE))
+
+
+def test_design_item_with_a_placeholder_and_real_text_counts() -> None:
+    check = check_plan_text(make_ui("- Look: warm greens <decided with Kunal> for a calm feel"))
+    assert check.passed

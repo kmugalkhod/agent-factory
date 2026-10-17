@@ -11,6 +11,15 @@ changes. Point to intent.md for the full request.>
 
 - run-<id>-<slug>: <what was reused or avoided>
 
+## Design
+
+<Only for changes people see, else delete. Made for this app and its users, not a stock look.>
+
+- Layout: <where things sit, at phone and desktop width>
+- Look: <colours, type and spacing that suit this app>
+- States: <empty, error, loading and success, and what each one shows>
+- Extras: <small touches the request leaves open that make it better to use, or "None">
+
 ## Files
 
 <Every file to create or change, one per line, with the reason. Tests go under the tester's paths.>

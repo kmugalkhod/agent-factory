@@ -23,6 +23,8 @@ Check the diff against `intent.md` and `plan.md`. The `review-rubric` skill has 
 - **Scope:** files changed outside the plan's list, and why.
 - **Correctness and safety:** wrong behaviour, unhandled errors, secrets, paths outside the repo.
 - **Fit:** the conventions in `CLAUDE.md` and the surrounding code.
+- **Design:** when the plan has a `## Design`, every item in it is built: layout, look, states
+  and extras. A missing state or an unstyled screen is a criterion not met.
 
 Severities:
 

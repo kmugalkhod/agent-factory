@@ -16,7 +16,8 @@ in the run folder and fill it in. Don't write the file from memory.
 
 - Keep every `## ` heading, in order, spelled exactly as in the template. Gates read them.
 - Replace every `<angle bracket>` placeholder, including the guidance under each heading.
-- Delete `## Split` and `## Questions` entirely, heading included, when they don't apply.
+- Delete `## Design`, `## Split` and `## Questions` entirely, heading included, when they don't
+  apply. `## Design` is required when Files names a file people see (`.tsx`, `.css`, `.html`, ...).
 - At most 60 lines. No code fences: gates read the file line by line.
 
 ## Procedure
@@ -38,6 +39,13 @@ in the run folder and fill it in. Don't write the file from memory.
 
 **Past runs used.** One line per past run you read and what you took from it or avoided. Write
 "None" when there were none; the heading stays.
+
+**Design** (for anything people see). Designed for this app and its users, never a stock
+look, and consistent with what the app already has. One line each for the layout (phone and
+desktop), the look (colours, type, spacing), the states (empty, error, loading, success) and
+extras: small things the request leaves open that make it better to use. A bare form and a
+bullet list is not a design. Turn the parts that matter into acceptance criteria, such as
+"the empty list shows a message" or "the layout is one column below 600px wide".
 
 **Files.** Every file to create or change, one per line, with `create` or `change` and why.
 Include the test files the tester will write, under the tester's paths. The builder may touch
