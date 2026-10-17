@@ -178,6 +178,15 @@ class PauseRow(_Model):
     resume_at: AwareDatetime | None
 
 
+class UsageRecords(_Model):
+    """What `factory usage` totals, read from one committed version: every agent turn's tokens,
+    every pause, and each run's slug by (repo, run ID)."""
+
+    token_use: list[TokenUseRow]
+    pauses: list[PauseRow]
+    slugs: dict[tuple[str, int], str]
+
+
 def registry_path(data: Path) -> Path:
     return data / REGISTRY_FILE
 
@@ -370,6 +379,18 @@ class Registry:
         clause, params = _where(repo, run_id)
         rows = self._read(f"SELECT * FROM pauses{clause} ORDER BY repo, run_id, seq", params)
         return [_pause_row(row) for row in rows]
+
+    def list_usage(self, repo: str | None = None) -> UsageRecords:
+        """Every turn's tokens, every pause and the runs' slugs, for one repo or all, from one
+        committed version so the totals agree with each other (for `factory usage`)."""
+        with self._snapshot():
+            clause, params = _where(repo, None)
+            rows = self._read(f"SELECT repo, id, slug FROM runs{clause}", params)
+            return UsageRecords(
+                token_use=self.list_token_use(repo),
+                pauses=self.list_pauses(repo),
+                slugs={(row["repo"], row["id"]): row["slug"] for row in rows},
+            )
 
     def rebuild_index(self, data: Path) -> int:
         """Recreate `runs` and `sessions` from every `run.json` under `<data>/runs/`.

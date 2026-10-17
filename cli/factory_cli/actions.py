@@ -8,11 +8,13 @@ where the run stopped.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Literal, Protocol
 
 from factory_engine.pipeline import Stop
 from factory_engine.run import Role, Run
+from factory_engine.usage import Grouping, Usage
 
 type Ending = Stop | Literal["interrupted"]
 """Where the pipeline stopped (`PipelineResult.stop`), or `interrupted` by Ctrl-C."""
@@ -74,3 +76,7 @@ class EngineActions(Protocol):
     def resume(self, run_id: int, *, note: str | None) -> Outcome: ...
 
     def attach(self, run_id: int, *, role: Role | None) -> str: ...
+
+    def usage(self, *, by: Grouping, since: date | None, all_repos: bool) -> Usage:
+        """Token totals by `by` from the UTC day `since` on, for the repo or every repo."""
+        ...

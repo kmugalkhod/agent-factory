@@ -1,9 +1,10 @@
 """Tests for the `factory` command (task 2.28): each command calls the matching engine action on
 a stub, exit codes (0 done, 2 needs you, 1 error) and the status listing."""
 
+import json
 import re
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from factory_engine import events as ev
 from factory_engine.errors import DecisionError, FactoryError
 from factory_engine.events import Body, Event, EventObserver
 from factory_engine.run import Pause, Role, Run, RunState, new_run
+from factory_engine.usage import Grouping, Usage, UsageGroup, UsageTotals
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=UTC)
 FOLDER = Path("data") / "runs" / "pilot" / "3-add-mul"
@@ -55,8 +57,10 @@ class Stub:
         rows: Sequence[RunRow] = (),
         error: FactoryError | None = None,
         events: Sequence[tuple[Body, Role | None]] = (),
+        usage: Usage | None = None,
     ) -> None:
         self.result = result or outcome()
+        self.usage_result = usage or usage_of()
         self.rows = list(rows)
         self.error = error
         self.events = list(events)
@@ -129,6 +133,41 @@ class Stub:
     def attach(self, run_id: int, *, role: Role | None) -> str:
         self._call("attach", run_id, role)
         return "claude --resume session-1"
+
+    def usage(self, *, by: Grouping, since: date | None, all_repos: bool) -> Usage:
+        self._call("usage", by, since, all_repos)
+        return self.usage_result
+
+
+def counts(
+    tokens: tuple[int, int, int, int], *, turns: int = 1, runs: int = 1, hits: int = 0
+) -> dict[str, Any]:  # Any: unpacked into UsageGroup next to its str fields
+    i, o, r, c = tokens
+    return {
+        "turns": turns,
+        "input": i,
+        "output": o,
+        "cache_read": r,
+        "cache_creation": c,
+        "total": i + o + r + c,
+        "runs": runs,
+        "usage_limit_hits": hits,
+        "runs_hit_usage_limit": min(hits, runs),
+    }
+
+
+def usage_of(
+    groups: Sequence[UsageGroup] = (), *, by: Grouping = "run", repo: str | None = "pilot"
+) -> Usage:
+    """A `factory usage` answer whose total sums `groups` (runs counted once per group)."""
+    total = {name: sum(getattr(g, name) for g in groups) for name in UsageTotals.model_fields}
+    return Usage(by=by, repo=repo, since=None, groups=list(groups), total=UsageTotals(**total))
+
+
+def run_group(run_id: int, slug: str, tokens: tuple[int, int, int, int], **kw: int) -> UsageGroup:
+    return UsageGroup(
+        key=f"pilot/{run_id}", repo="pilot", run_id=run_id, slug=slug, **counts(tokens, **kw)
+    )
 
 
 def invoke(stub: Stub, *args: str) -> Any:
@@ -513,10 +552,124 @@ def test_verbose_adds_tool_calls_and_agent_messages(flag: str) -> None:
     assert re.search(_TIME + r" \[planner\] agent: Plan written.", done.output)
 
 
-@pytest.mark.parametrize("args", [["status"], ["status", "3"], ["stop", "3"], ["attach", "3"]])
+@pytest.mark.parametrize(
+    "args", [["status"], ["status", "3"], ["stop", "3"], ["attach", "3"], ["usage"]]
+)
 def test_other_commands_watch_no_events(args: list[str]) -> None:
     stub = Stub(events=WORK)
 
     invoke(stub, *args)
 
     assert stub.observers == [None]
+
+
+# ------------------------------------------------------------------ usage (2.29)
+
+TWO_RUNS = usage_of(
+    [
+        run_group(3, "add-mul", (1_204, 8_331, 540_112, 25_010), turns=12, hits=1),
+        run_group(4, "fix", (90, 400, 10_000, 2_000), turns=2),
+    ]
+)
+
+
+def test_usage_lists_tokens_per_run_with_each_kind_apart() -> None:
+    stub = Stub(usage=TWO_RUNS)
+
+    done = invoke(stub, "usage")
+
+    assert stub.calls == [("usage", ("run", None, False))]
+    assert done.exit_code == 0
+    lines = done.output.splitlines()
+    assert "pilot" in lines[0]
+    assert "by run" in lines[0]
+    assert lines[1].split() == [
+        "RUN", "TURNS", "INPUT", "OUTPUT", "CACHE", "READ", "CACHE", "WRITE", "TOTAL", "LIMIT",
+        "HITS",
+    ]  # fmt: skip
+    assert lines[2].split() == [
+        "3-add-mul", "12", "1,204", "8,331", "540,112", "25,010", "574,657", "1"
+    ]  # fmt: skip
+    assert lines[3].split() == ["4-fix", "2", "90", "400", "10,000", "2,000", "12,490", "0"]
+    assert lines[4].split() == [
+        "TOTAL", "14", "1,294", "8,731", "550,112", "27,010", "587,147", "1"
+    ]  # fmt: skip
+
+
+def test_usage_says_where_the_tokens_go_and_how_often_the_limit_was_hit() -> None:
+    done = invoke(Stub(usage=TWO_RUNS), "usage")
+
+    assert "cache read 93.7%" in done.output
+    assert "input 0.2%" in done.output
+    assert "Usage limit hit 1 time, in 1 of 2 runs." in done.output
+
+
+def test_usage_passes_the_grouping_the_day_and_every_repo() -> None:
+    roles = usage_of(
+        [UsageGroup(key="planner", **counts((5, 5, 5, 5), runs=2))], by="role", repo=None
+    )
+    stub = Stub(usage=roles)
+
+    done = invoke(stub, "usage", "--by", "role", "--since", "2026-10-14", "--all")
+
+    assert stub.calls == [("usage", ("role", date(2026, 10, 14), True))]
+    assert done.exit_code == 0
+    assert "every repo" in done.output.splitlines()[0]
+    assert done.output.splitlines()[1].split()[:3] == ["ROLE", "RUNS", "TURNS"]
+    assert "planner" in done.output
+
+
+def test_usage_for_every_repo_names_each_runs_repo() -> None:
+    done = invoke(Stub(usage=usage_of(TWO_RUNS.groups, repo=None)), "usage", "--all")
+
+    assert "pilot/3-add-mul" in done.output
+
+
+@pytest.mark.parametrize("by", ["run", "repo", "role", "day"])
+def test_usage_json_is_the_engines_answer(by: str) -> None:
+    stub = Stub(usage=TWO_RUNS)
+
+    done = invoke(stub, "usage", "--by", by, "--json")
+
+    assert done.exit_code == 0
+    assert stub.calls == [("usage", (by, None, False))]
+    assert Usage.model_validate(json.loads(done.output)) == TWO_RUNS
+    assert json.loads(done.output)["groups"][0]["cache_read"] == 540_112
+
+
+def test_usage_with_nothing_recorded_says_so() -> None:
+    done = invoke(Stub(), "usage")
+
+    assert done.exit_code == 0
+    assert "No token use recorded" in done.output
+
+
+def test_usage_json_with_nothing_recorded_is_still_json() -> None:
+    done = invoke(Stub(), "usage", "--json")
+
+    assert json.loads(done.output)["groups"] == []
+
+
+@pytest.mark.parametrize("since", ["yesterday", "2026-13-01", "14/10/2026"])
+def test_usage_refuses_a_since_that_isnt_a_date(since: str) -> None:
+    stub = Stub()
+
+    done = invoke(stub, "usage", "--since", since)
+
+    assert done.exit_code == 1
+    assert "YYYY-MM-DD" in done.output
+    assert stub.calls == []
+
+
+def test_usage_refuses_an_unknown_grouping() -> None:
+    stub = Stub()
+
+    assert run_command(make_app(stub.factory), ["usage", "--by", "week"]) == 1
+    assert stub.calls == []
+
+
+def test_usage_engine_error_exits_1() -> None:
+    done = invoke(Stub(error=FactoryError("registry.db: can't read the registry.")), "usage")
+
+    assert done.exit_code == 1
+    assert "can't read the registry" in done.output

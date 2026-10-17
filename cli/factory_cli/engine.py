@@ -24,7 +24,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from factory_cli.actions import Outcome, RunDetail, RunRow
@@ -56,6 +56,7 @@ from factory_engine.registry import Registry, open_registry, registry_path
 from factory_engine.report import REPORT_GATE, write_report
 from factory_engine.run import Kind, Role, Run, RunState, load_run
 from factory_engine.states import WORKING, move
+from factory_engine.usage import Grouping, Usage, read_usage
 
 GLOBAL_SETTINGS = "settings.yaml"
 """The global settings file in the data folder (optional; `token_expires` lives there)."""
@@ -368,6 +369,13 @@ class Engine:
         )
         lines.append(_attach_command(self._deps.platform, worktree, config, session))
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------ usage
+
+    def usage(self, *, by: Grouping, since: date | None, all_repos: bool) -> Usage:
+        with self._registry() as registry:
+            repo = None if all_repos else self._repo(registry)[0]
+            return read_usage(registry, by=by, repo=repo, since=since)
 
     # ------------------------------------------------------------------ the pipeline
 

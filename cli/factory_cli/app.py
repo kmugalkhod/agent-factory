@@ -1,5 +1,5 @@
 """The `factory` command (Typer): start a run, see its status, decide on it, stop, resume and
-attach.
+attach, and see where tokens go (`usage`).
 
 Every command takes the repo from the current folder unless `--repo` names it, and calls one
 engine action (`actions.EngineActions`). Commands that drive a run (`start`, `approve`,
@@ -15,6 +15,7 @@ exits 1 too, so 2 always means a run waits for you.
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn, cast
@@ -28,6 +29,7 @@ from factory_engine.events import EventObserver
 from factory_engine.pipeline import ROLES, Stop
 from factory_engine.run import Role, Run
 from factory_engine.states import WORKING
+from factory_engine.usage import Grouping, Usage, UsageTotals
 
 type EngineFactory = Callable[[Path | None, EventObserver | None], EngineActions]
 """Makes the engine actions for a repo (the `--repo` folder, or None for the current folder)
@@ -59,6 +61,13 @@ class RoleName(StrEnum):
     tester = "tester"
     builder = "builder"
     reviewer = "reviewer"
+
+
+class GroupBy(StrEnum):
+    run = "run"
+    repo = "repo"
+    role = "role"
+    day = "day"
 
 
 RepoOption = Annotated[
@@ -241,6 +250,32 @@ def make_app(engine: EngineFactory) -> typer.Typer:
         chosen = cast(Role, role.value) if role is not None else None
         echo([call(lambda: actions.attach(run, role=chosen))])
 
+    @app.command()
+    def usage(
+        by: Annotated[
+            GroupBy, typer.Option(help="Group the totals by run, repo, role or UTC day.")
+        ] = GroupBy.run,
+        since: Annotated[
+            str | None,
+            typer.Option(help="Count from this UTC day on (YYYY-MM-DD).", show_default=False),
+        ] = None,
+        all_repos: Annotated[bool, typer.Option("--all", help="Count every repo.")] = False,
+        as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead.")] = False,
+        repo: RepoOption = None,
+    ) -> None:
+        """Token totals by run, repo, role or day, and how often runs hit the usage limit.
+
+        Input, output, cache read and cache write (cache creation) tokens are shown apart.
+        """
+        first = parse_day(since) if since is not None else None
+        actions = engine(repo, None)
+        grouping = cast(Grouping, by.value)
+        found = call(lambda: actions.usage(by=grouping, since=first, all_repos=all_repos))
+        if as_json:
+            typer.echo(found.model_dump_json(indent=2))
+            return
+        echo(usage_lines(found))
+
     return app
 
 
@@ -319,6 +354,13 @@ def parse_answers(text: str) -> list[str]:
         else:
             answers[-1].append(line)
     return ["\n".join(lines).strip() for lines in answers]
+
+
+def parse_day(text: str) -> date:
+    try:
+        return date.fromisoformat(text.strip())
+    except ValueError:
+        fail(f"--since takes a UTC day as YYYY-MM-DD, such as 2026-10-14, not {text!r}.")
 
 
 # ------------------------------------------------------------------ what the command prints
@@ -450,3 +492,71 @@ def _attempts(run: Run) -> str:
 
 def _tokens(run: Run) -> str:
     return f"{sum(run.metrics.tokens.values()):,}"
+
+
+_USAGE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("TURNS", "turns"),
+    ("INPUT", "input"),
+    ("OUTPUT", "output"),
+    ("CACHE READ", "cache_read"),
+    ("CACHE WRITE", "cache_creation"),
+    ("TOTAL", "total"),
+    ("LIMIT HITS", "usage_limit_hits"),
+)
+
+
+def usage_lines(usage: Usage) -> list[str]:
+    """`factory usage`: a heading, one row per group and a total row, then where the tokens
+    went and how often runs hit the usage limit."""
+    where = "every repo" if usage.repo is None else f"repo {usage.repo}"
+    since = f" from {usage.since.isoformat()}" if usage.since is not None else ""
+    if not usage.groups:
+        return [f"No token use recorded for {where}{since}."]
+    days = " (UTC days)" if usage.by == "day" or usage.since is not None else ""
+    columns = (("RUNS", "runs"),) if usage.by != "run" else ()
+    columns += _USAGE_COLUMNS
+
+    def cells(name: str, counts: UsageTotals) -> tuple[str, ...]:
+        return (name, *(f"{getattr(counts, field):,}" for _, field in columns))
+
+    header = (usage.by.upper(), *(title for title, _ in columns))
+    body = [cells(_group_name(usage, g.key, g.run_id, g.slug), g) for g in usage.groups]
+    rows = [header, *body, cells("TOTAL", usage.total)]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(header))]
+    table = [
+        "  ".join(
+            cell.ljust(width) if i == 0 else cell.rjust(width)
+            for i, (cell, width) in enumerate(zip(row, widths, strict=True))
+        ).rstrip()
+        for row in rows
+    ]
+    return [f"Tokens for {where} by {usage.by}{since}{days}", *table, *_usage_footer(usage.total)]
+
+
+def _group_name(usage: Usage, key: str, run_id: int | None, slug: str | None) -> str:
+    if usage.by != "run" or run_id is None:
+        return key
+    name = f"{run_id}-{slug}" if slug else str(run_id)
+    return f"{key.rsplit('/', 1)[0]}/{name}" if usage.repo is None else name
+
+
+def _usage_footer(total: UsageTotals) -> list[str]:
+    lines: list[str] = []
+    if total.total:
+        shares = ", ".join(
+            f"{label} {100 * amount / total.total:.1f}%"
+            for label, amount in (
+                ("input", total.input),
+                ("output", total.output),
+                ("cache read", total.cache_read),
+                ("cache write", total.cache_creation),
+            )
+        )
+        lines.append(f"Of {total.total:,} tokens: {shares}.")
+    runs = f"{total.runs} run{'s' if total.runs != 1 else ''}"
+    if total.usage_limit_hits:
+        times = f"{total.usage_limit_hits} time{'s' if total.usage_limit_hits != 1 else ''}"
+        lines.append(f"Usage limit hit {times}, in {total.runs_hit_usage_limit} of {runs}.")
+    else:
+        lines.append(f"Usage limit not hit ({runs}).")
+    return lines
