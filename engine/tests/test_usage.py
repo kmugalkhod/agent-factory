@@ -204,3 +204,31 @@ def test_usage_round_trips_through_json(reg: Registry) -> None:
     usage = read_usage(reg, by="day", repo=None, since=date(2026, 10, 14))
 
     assert Usage.model_validate_json(usage.model_dump_json()) == usage
+
+
+def test_a_usage_limit_hit_with_no_turn_still_makes_a_group(tmp_path: Path) -> None:
+    run = seeded_run(
+        "pilot",
+        5,
+        "stuck",
+        [use("planner", 1, DAY1, 100, 10, 1000, 50)],
+        [pause("usage_limit", "tester", DAY2), pause("turn_cap", "builder", DAY2)],
+    )
+    with open_registry(tmp_path / "registry.db") as reg:
+        reg.upsert_run(run)
+
+        by_role = read_usage(reg, by="role", repo="pilot", since=None)
+        by_run = read_usage(reg, by="run", repo="pilot", since=date(2026, 10, 15))
+        by_day = read_usage(reg, by="day", repo=None, since=None)
+
+    hit_only = UsageTotals.model_validate(totals(0, (0, 0, 0, 0), hits=1, runs_hit=1))
+    assert [(g.key, counts(g)) for g in by_role.groups] == [
+        ("planner", UsageTotals.model_validate(totals(1, (100, 10, 1000, 50)))),
+        ("tester", hit_only),  # the tester's agent hit the limit before any turn finished
+    ]
+    assert [(g.key, g.slug, counts(g)) for g in by_run.groups] == [("pilot/5", "stuck", hit_only)]
+    assert by_run.total == hit_only  # the earlier turn is before --since
+    assert [(g.key, counts(g)) for g in by_day.groups] == [
+        ("2026-10-14", UsageTotals.model_validate(totals(1, (100, 10, 1000, 50)))),
+        ("2026-10-15", hit_only),
+    ]
