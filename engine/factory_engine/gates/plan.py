@@ -86,6 +86,7 @@ _PLACEHOLDER = re.compile(r"^<[^<>]*>$")
 _FILE = re.compile(r"^`([^`]+)`")
 _PLACEHOLDERS = re.compile(r"<[^<>]*>")
 _LABEL = re.compile(r"[\w ]*:")
+_FORMATTING = re.compile(r"[*_`~]")  # Markdown emphasis around a label, as in `**Layout:**`
 _FENCES = ("```", "~~~")
 _CODE = re.compile(r"`[^`]+`")
 _DIGIT = re.compile(r"\d")
@@ -270,9 +271,9 @@ def check_plan_text(text: str) -> PlanCheck:
 
 
 def _filled(text: str) -> bool:
-    """Whether a Design item says something: not just a label and placeholders, as in the
-    template's `Layout: <where things sit>`."""
-    rest = _PLACEHOLDERS.sub("", text).strip()
+    """Whether a Design item says something: not just a label (bold or not) and placeholders,
+    as in the template's `Layout: <where things sit>`."""
+    rest = _FORMATTING.sub("", _PLACEHOLDERS.sub("", text)).strip()
     return bool(rest) and not _LABEL.fullmatch(rest)
 
 

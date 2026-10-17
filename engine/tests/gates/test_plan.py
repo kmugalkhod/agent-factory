@@ -558,7 +558,16 @@ def test_non_ui_files_need_no_design(path: str) -> None:
     assert check_plan_text(make_ui(None, files=f"- `{path}`: change, the logic")).passed
 
 
-@pytest.mark.parametrize("body", ["None", "- <layout>\n- <look>", "Make it look nice."])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "None",
+        "- <layout>\n- <look>",
+        "Make it look nice.",
+        "- Layout: <where>\n- Look: <colours>",
+        "- **Layout:** <where>\n- _Look_: <colours>\n- `States`: <which>",
+    ],
+)
 def test_design_without_filled_items_fails_on_design(body: str) -> None:
     check = check_plan_text(make_ui(body))
     assert kinds(check) == (ProblemKind.DESIGN,)
