@@ -93,6 +93,7 @@ def test_agent_env_holds_only_the_basics_the_credential_and_the_config_dir() -> 
         "PATH": PARENT["PATH"],
         "SYSTEMROOT": PARENT["SystemRoot"],
         "TEMP": PARENT["TEMP"],
+        "PYTHONDONTWRITEBYTECODE": "1",
         TOKEN_VAR: TOKEN,
         "CLAUDE_CONFIG_DIR": str(CONFIG_DIR),
     }
