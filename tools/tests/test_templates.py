@@ -75,6 +75,7 @@ def test_plan_sections_match_the_acceptance_criteria() -> None:
     assert contract()["plan.md"] == [
         ("Context", False),
         ("Past runs used", False),
+        ("Design", True),
         ("Files", False),
         ("Steps", False),
         ("Acceptance criteria", False),

@@ -9,6 +9,11 @@ filter. The change spans the registry, the CLI and the UI. See intent.md.
 
 None
 
+## Design
+
+- Layout: a label chip row above the board's columns, wrapping on a phone
+- States: no labels yet shows the row hidden; a filter with no matches shows a message
+
 ## Files
 
 - `engine/factory_engine/registry.py`: change, add the labels column

@@ -45,6 +45,9 @@ This folder holds `review.md`, an exact copy of the factory's review template. C
   from strings, data deleted or overwritten without a check.
 - **Fit.** The conventions in `CLAUDE.md` and the surrounding code: naming, error handling,
   layout.
+- **Design.** When `plan.md` has a `## Design`, every item in it is built: layout at phone and
+  desktop width, look, each state and the extras. Read the style files and components, not just
+  the tests. A listed state that is missing, or a screen left unstyled, is a criterion not met.
 
 ## Severities
 

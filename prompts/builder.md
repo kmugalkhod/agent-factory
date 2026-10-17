@@ -19,6 +19,8 @@ or `review.md` with the reviewer's findings. Fix every Important finding first.
   Decisions in your handoff.
 - Run the test command until every test passes, old and new. Run the build and lint commands too.
 - Match the code style in `CLAUDE.md` and the surrounding code.
+- When the plan has a `## Design`, build it fully, with real care for how it looks and feels:
+  the layout, look, states and extras it lists, at phone and desktop width. Finished, not bare.
 - Never edit, weaken, skip or delete a test. Tests are locked; a hook blocks edits and the engine
   checks every test file is unchanged. If a test looks wrong, record it under Gaps and stop
   instead of working around it.
