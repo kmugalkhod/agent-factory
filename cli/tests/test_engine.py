@@ -529,6 +529,25 @@ def test_commands_find_the_run_from_inside_its_worktree(world: World) -> None:
     assert stopped.state == "stopped"
 
 
+# ------------------------------------------------------------------ usage (2.29)
+
+
+def test_usage_totals_the_repos_token_use_from_the_registry(world: World) -> None:
+    world.engine().start_feature("Add mul to calc", slug=None)
+    run = load_run(world.folder())
+
+    by_role = world.engine().usage(by="role", since=None, all_repos=False)
+    by_run = world.engine(cwd=world.data).usage(by="run", since=None, all_repos=True)
+
+    assert [(g.key, g.total) for g in by_role.groups] == [
+        ("planner", run.metrics.tokens["planner"])
+    ]
+    assert by_role.repo == "pilot"
+    assert by_role.total.turns == len(run.metrics.token_use) > 0
+    assert [(g.key, g.slug) for g in by_run.groups] == [("pilot/0", "add-mul-to-calc")]
+    assert by_run.repo is None
+
+
 # ------------------------------------------------------------------ progress output
 
 

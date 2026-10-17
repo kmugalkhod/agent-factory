@@ -18,6 +18,7 @@ from factory_engine.registry import (
     Registry,
     Session,
     TokenUseRow,
+    UsageRecords,
     open_registry,
     registry_path,
 )
@@ -357,6 +358,22 @@ def test_token_use_and_pauses_are_listed_per_run(reg: Registry) -> None:  # for 
         )
     ]
     assert reg.list_pauses("api") == []
+
+
+def test_list_usage_reads_turns_pauses_and_run_slugs_together(reg: Registry) -> None:  # 2.29
+    reg.upsert_run(_busy_run("app", 3, "status-json"))
+    reg.upsert_run(_run("api", 1, "x"))
+
+    app = reg.list_usage("app")
+    every = reg.list_usage()
+
+    assert app == UsageRecords(
+        token_use=reg.list_token_use("app"),
+        pauses=reg.list_pauses("app"),
+        slugs={("app", 3): "status-json"},
+    )
+    assert every.slugs == {("api", 1): "x", ("app", 3): "status-json"}
+    assert every.token_use == app.token_use
 
 
 def test_token_use_is_stored_in_utc_so_days_group_in_sql(reg: Registry) -> None:
