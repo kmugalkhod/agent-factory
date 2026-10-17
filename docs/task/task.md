@@ -623,7 +623,7 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
 - **Tests:** Scenario tests with the fake runner and an empty fixture repo; one live test (marked `live`).
 - **Depends on:** 2.21, 2.22, 2.25
 
-### [ ] 2.27 Run metrics and report
+### [x] 2.27 Run metrics and report
 
 - **What:** Record per run:
   - first-pass result (first build passed tests and review)
@@ -639,6 +639,13 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - `report.md` follows the template and is at most one page.
 - **Tests:** Unit and scenario tests.
 - **Depends on:** 2.20, 2.22
+- **Note:** Design gaps settled without Kunal (milestone 2 autopilot), safest option chosen:
+  - `run.json`'s `metrics` (pure updates in `metrics.py`) gains `token_use` (one record per agent turn: role, attempt, UTC time, input, output, cache read and creation tokens; `tokens` stays the total per role), `first_pass`, `builder_retries` and `pauses` (every pause with its reason, role, attempt, time and reset time, kept after the run carries on). The recorder adds `token_use`, the watchdog adds the pause, the pipeline the rest.
+  - First pass: None until decided, then decided once. False when a builder gate fails or the first review that decides finds an Important problem; True when that review approves with no failed build before it. A malformed review decides nothing, nor does a rebase conflict sent to the builder; later reruns don't change it. Builder retries are the builder attempts after the first, conflict resolutions and reruns included (they count against the cap). Important findings stay as 2.19 counts them.
+  - Lines you changed on the PR before merge: lines added plus removed in the run's own change between the head the pull request was opened at (`pull_request.opened_head`, what you were first shown) and the head merged, with main's changes left out: the opened change is carried onto the merged head's base with `git merge-tree --write-tree --merge-base` (Git 2.40 or later) and `git diff --numstat` compares it with the merged head. Binary files count no lines. Measured when the engine merges, else None. The engine merges only the head it tested (2.22), so what changes an open pull request is your feedback (2.23 reruns, then publish moves it); commits anyone else pushes to the run branch make the engine's push or merge refuse, and the run needs you. If the opened change doesn't apply cleanly to the new base, or git fails, it stays None and a `gate_result` `metrics.pr_lines` says why; the merge stands.
+  - Registry migration 4: `runs.first_pass` and `runs.builder_retries`, and the tables `token_use` and `pauses` (one row per record, `seq` in order, deleted with their run, rebuilt from `run.json`). `at` is UTC ISO 8601, so `substr(at, 1, 10)` is the UTC day. `Registry.list_token_use` and `list_pauses` (by repo and run) are what `factory usage` (2.29) reads: totals by run, repo, role, attempt and day, and pauses with reason `usage_limit`.
+  - `report.md` (`report.py`) is written into the run folder whenever the run stops in one of the template's statuses: awaiting merge, merged, needs you (when `advance` returns, and after `settle` for a split), failed (intake can't make the worktree) and stopped (`factory stop`). Not while it waits for plan approval or is paused. It is rewritten each time. A report that can't be written logs `gate_result` `report` and changes nothing else.
+  - The report is built by the engine with no model: the request's first line, files the builder touched and what to look at (why it needs you, the open findings); each plan criterion with its state in the last `review.md` and the tests its Test cases name; the last test command, result and the tester's test count; the last verdict and its findings; provider and models, isolation, builder attempts, tokens per role and per attempt, first pass, retries, findings, usage-limit pauses, lines you changed and the duration (created to last update); the builder's Gaps as follow-ups. It keeps the template's headings and stays within 60 lines: lists are cut with a pointer to the file that holds the rest, lines are made single and shortened, so no file text adds a heading or a fence. Run records in the repo's `docs/runs/` aren't built in milestone 2; the report stays in the factory's run folder.
 
 ### [x] 2.28 CLI: run commands
 

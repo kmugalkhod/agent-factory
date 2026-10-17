@@ -38,17 +38,18 @@ from factory_engine.config import (
     merge_settings,
 )
 from factory_engine.decisions import Decided, DecisionContext
-from factory_engine.errors import DataFolderError
-from factory_engine.events import EventLog, NeedsYou, read_events
+from factory_engine.errors import DataFolderError, FactoryError
+from factory_engine.events import EventLog, GateResult, NeedsYou, read_events
 from factory_engine.gates.plan import PLAN_FILE, Question, check_plan
 from factory_engine.git_ops import Git, worktree_dir
 from factory_engine.github import GitHub
 from factory_engine.intake import Intake, Started
 from factory_engine.merge import GitFlow
 from factory_engine.paths import WINDOWS_DEVICE, data_dir, run_dir
-from factory_engine.pipeline import ROLES, Pipeline, PipelineResult, Places
-from factory_engine.providers import Profile, preflight
+from factory_engine.pipeline import REPORT_GATE, ROLES, Pipeline, PipelineResult, Places
+from factory_engine.providers import Profile, get_profile, preflight
 from factory_engine.registry import Registry, open_registry, registry_path
+from factory_engine.report import write_report
 from factory_engine.run import Kind, Role, Run, RunState, load_run
 from factory_engine.states import WORKING, move
 
@@ -222,7 +223,7 @@ class Engine:
 
     def stop(self, run_id: int) -> Run:
         with self._registry() as registry:
-            repo, _ = self._repo(registry)
+            repo, path = self._repo(registry)
             folder = self._folder(registry, repo, run_id)
             with RunLock(folder / LOCK_FILE):
                 run = load_run(folder)
@@ -234,7 +235,26 @@ class Engine:
                 stopped = move(run, "stopped", log=self._events(run, folder))
                 stopped = stopped.model_copy(update={"pause": None})
                 persist(stopped, folder, registry)
+                self._report(stopped, folder, path)
                 return stopped
+
+    def _report(self, run: Run, folder: Path, repo_path: Path) -> None:
+        """The stopped run's `report.md`, with the models when the repo's settings load. A
+        report that can't be written is logged; the stop stands."""
+        try:
+            settings: Settings | None = self._settings(repo_path, run.kind)
+        except FactoryError:
+            settings = None
+        try:
+            profile = get_profile(run.provider)
+        except FactoryError:
+            profile = None
+        try:
+            write_report(run, folder, settings=settings, profile=profile)
+        except FactoryError as err:
+            self._events(run, folder).append(
+                GateResult(gate=REPORT_GATE, passed=False, reason=str(err))
+            )
 
     def resume(self, run_id: int, *, note: str | None) -> Outcome:
         with self._registry() as registry:
@@ -361,6 +381,8 @@ class Engine:
         except KeyboardInterrupt:
             return Outcome(load_run(folder), "interrupted", folder)
         result = decisions.settle(self._context(folder, events, registry), result)
+        if result.run.state != pipeline.run.state:  # a split that needs you: report it too
+            pipeline.write_report(result.run)
         return _outcome(result, folder)
 
     def _pipeline(

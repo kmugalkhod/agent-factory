@@ -8,8 +8,9 @@
   `FakeAgentRunner` (in `fake.py`) replays scripted messages for tests.
 - `SessionRecorder` turns the agent's messages into the run's record, the same way for both:
   its text becomes `message` events, its session ID is saved to `run.json` and the registry as
-  soon as it is known, and each turn's usage becomes a `tokens` event and is added to the
-  role's total. Listeners (the watchdog, `watchdog.py`) see every message after it is recorded.
+  soon as it is known, and each turn's usage becomes a `tokens` event, a dated `token_use`
+  record of its attempt and part of the role's total. Listeners (the watchdog, `watchdog.py`)
+  see every message after it is recorded.
 
 A runner drives one agent at a time. While it runs, `interrupt` stops the current turn and
 `send` gives the agent a note: a turn in progress is interrupted first, then the agent carries
@@ -38,6 +39,7 @@ from claude_agent_sdk.types import HookCallback as SdkHookCallback
 from factory_engine.config import Effort, Settings
 from factory_engine.errors import AgentError
 from factory_engine.events import Message, Tokens
+from factory_engine.metrics import token_use
 from factory_engine.providers import Profile, agent_env, resolve_model
 from factory_engine.run import Role, Run, save_run
 from factory_engine.safety.hook import EventSink, HookCallback
@@ -368,13 +370,21 @@ class SessionRecorder:
         return isinstance(session, str) and bool(session) and session != self.session_id
 
     def _save(self, *, session: object = None, usage: Usage | None = None) -> None:
-        update: dict[str, object] = {"updated_at": self._clock()}
+        now = self._clock()
+        update: dict[str, object] = {"updated_at": now}
         if isinstance(session, str):
             update["session_ids"] = {**self._run.session_ids, self.role: session}
         if usage is not None:
-            tokens = dict(self._run.metrics.tokens)
-            tokens[self.role] = tokens.get(self.role, 0) + usage.total
-            update["metrics"] = self._run.metrics.model_copy(update={"tokens": tokens})
+            update["metrics"] = token_use(
+                self._run.metrics,
+                role=self.role,
+                attempt=self.attempt,
+                at=now,
+                input=usage.input,
+                output=usage.output,
+                cache_read=usage.cache_read,
+                cache_creation=usage.cache_creation,
+            )
         self.save(self._run.model_copy(update=update))
 
 

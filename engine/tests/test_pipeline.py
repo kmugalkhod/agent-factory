@@ -990,3 +990,108 @@ def test_an_update_hook_can_send_the_run_back_to_the_builder(world_at: Maker) ->
     assert second.resume == agents.sessions[1]
     assert second.prompt.startswith("rebase conflict in src/calc.py")
     assert world.doc("attempts/handoff-builder-1.md") == handoff("attempt 1")
+
+
+# ------------------------------------------------------------------ metrics and report (2.27)
+
+TURN = 120  # tokens of each scripted agent run: result(session, 100, 20)
+
+
+def _metric_values(run: Run) -> tuple[bool | None, int, int]:
+    return (run.metrics.first_pass, run.metrics.builder_retries, run.metrics.important_findings)
+
+
+@pytest.mark.parametrize(
+    ("acts", "state", "expected", "attempts"),
+    [
+        (
+            [tester(), builder(), reviewer()],
+            "awaiting_merge",
+            (True, 0, 0),
+            [("tester", 1), ("builder", 1), ("reviewer", 1)],
+        ),
+        (
+            [tester(), builder(WRONG_BUILD), builder(), reviewer()],
+            "awaiting_merge",
+            (False, 1, 0),
+            [("tester", 1), ("builder", 1), ("builder", 2), ("reviewer", 1)],
+        ),
+        (
+            [tester(), builder(), reviewer(REVIEW_IMPORTANT), builder(BETTER_BUILD), reviewer()],
+            "awaiting_merge",
+            (False, 1, 1),
+            [("tester", 1), ("builder", 1), ("reviewer", 1), ("builder", 2), ("reviewer", 2)],
+        ),
+        (
+            [tester(), builder(), reviewer(REVIEW_MALFORMED), reviewer()],
+            "awaiting_merge",
+            (True, 0, 0),  # a malformed review decides nothing
+            [("tester", 1), ("builder", 1), ("reviewer", 1), ("reviewer", 2)],
+        ),
+        (
+            [tester(), builder(WRONG_BUILD), builder(WRONG_BUILD), builder(WRONG_BUILD)],
+            "needs_you",
+            (False, 2, 0),
+            [("tester", 1), ("builder", 1), ("builder", 2), ("builder", 3)],
+        ),
+    ],
+    ids=["first-pass", "build-retried", "review-sends-back", "malformed-review", "builder-cap"],
+)
+def test_scripted_runs_record_their_metrics_in_run_json_and_the_registry(
+    world_at: Maker,
+    acts: list[Act],
+    state: RunState,
+    expected: tuple[bool | None, int, int],
+    attempts: list[tuple[Role, int]],
+) -> None:
+    world = world_at("testing")
+
+    done = world.advance(Agents(acts))
+
+    run = world.run()
+    assert done.run == run and run.state == state
+    assert _metric_values(run) == expected
+    assert [(use.role, use.attempt) for use in run.metrics.token_use] == attempts
+    assert all(use.input + use.output == TURN for use in run.metrics.token_use)
+    assert run.metrics.pr_lines_changed_by_you is None  # nothing merged
+    assert world.registry.get_run(REPO, RUN_ID) == run
+
+
+@pytest.mark.parametrize(
+    ("acts", "status"),
+    [
+        ([tester(), builder(), reviewer()], "awaiting merge"),
+        ([tester(), builder(WRONG_BUILD), builder(WRONG_BUILD), builder(WRONG_BUILD)], "needs you"),
+    ],
+    ids=["awaiting-merge", "needs-you"],
+)
+def test_the_report_is_written_when_the_run_stops(
+    world_at: Maker, acts: list[Act], status: str
+) -> None:
+    world = world_at("testing")
+    world.advance(Agents(acts))
+    report = world.doc("report.md").splitlines()
+    assert report[0] == f"# Report: run-{RUN_ID}-{SLUG}"
+    assert f"Status: {status}" in report
+    assert len(report) <= 60
+    assert "- AC1: " in "\n".join(report)
+
+
+def test_no_report_while_the_plan_waits_for_approval(world_at: Maker) -> None:
+    world = world_at("pending")
+    world.advance(Agents([planner()]))
+    assert not (world.run_folder / "report.md").exists()
+
+
+def test_a_usage_limit_pause_is_counted_after_the_run_resumes(world_at: Maker) -> None:
+    world = world_at("pending")
+    reset = START + timedelta(hours=1)
+    agents = Agents([Act("planner", extra=(rate_limit(int(reset.timestamp())),)), planner()])
+
+    done = world.advance(agents)
+
+    assert done.run.pause is None
+    assert [(p.reason, p.role, p.attempt) for p in done.run.metrics.pauses] == [
+        ("usage_limit", "planner", 1)
+    ]
+    assert world.registry.get_run(REPO, RUN_ID) == done.run

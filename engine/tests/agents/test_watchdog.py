@@ -37,7 +37,16 @@ from factory_engine.config import default_settings
 from factory_engine.errors import AgentError
 from factory_engine.events import EventLog, NeedsYou, Paused, StateChanged, read_events
 from factory_engine.registry import Registry
-from factory_engine.run import Pause, Role, Run, RunState, load_run, new_run, save_run
+from factory_engine.run import (
+    Pause,
+    PauseRecord,
+    Role,
+    Run,
+    RunState,
+    load_run,
+    new_run,
+    save_run,
+)
 
 START = datetime(2026, 10, 11, 12, 0, tzinfo=UTC)
 LIMITS = Limits(stall=timedelta(minutes=10), max_time=timedelta(minutes=120))
@@ -410,6 +419,27 @@ def test_usage_limit_pauses_with_a_resume_time(world: World, tmp_path: Path) -> 
     assert StateChanged(from_state="building", to_state="paused") in bodies
     paused = [b for b in bodies if isinstance(b, Paused)]
     assert paused == [Paused(reason="usage_limit", detail=watched.trip.detail, resume_at=reset)]
+
+
+def test_a_usage_limit_is_kept_in_the_metrics_after_the_reset(
+    world: World, tmp_path: Path
+) -> None:  # 2.27: how often runs hit the usage limit
+    reset = START + timedelta(hours=2)
+    world.watch(FakeAgentRunner([_limit_turn(reset)]), _spec(tmp_path, attempt=2))
+    world.run = unpause(
+        load_run(world.folder),
+        now=reset,
+        events=world.events,
+        run_folder=world.folder,
+        registry=world.registry,
+    )
+    saved = load_run(world.folder)
+    [paused_at] = [e.at for e in read_events(world.folder) if isinstance(e.body, Paused)]
+    assert saved.pause is None
+    assert saved.metrics.pauses == [
+        PauseRecord(reason="usage_limit", role="builder", attempt=2, at=paused_at, resume_at=reset)
+    ]
+    assert world.indexed() == saved
 
 
 class CountsInterrupts(FakeAgentRunner):

@@ -48,11 +48,53 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class TokenUse(_Model):
+    """The tokens of one agent turn (one result message): whose, which attempt, and when, so
+    usage can be totalled by run, role, attempt and day."""
+
+    role: Role
+    attempt: Annotated[int, Field(ge=1)]
+    at: AwareDatetime
+    input: NonNegative
+    output: NonNegative
+    cache_read: NonNegative = 0
+    cache_creation: NonNegative = 0
+
+    @property
+    def total(self) -> int:
+        return self.input + self.output + self.cache_read + self.cache_creation
+
+
+class PauseRecord(_Model):
+    """A pause the run went through (a usage limit, a turn or time cap), kept after the run
+    carries on, so how often runs hit the usage limit can be counted."""
+
+    reason: PauseReason
+    role: Role
+    attempt: Annotated[int, Field(ge=1)]
+    at: AwareDatetime
+    resume_at: AwareDatetime | None
+
+
 class Metrics(_Model):
-    """Per-run quality data (design: "Quality metrics"). Reporting arrives with the UI."""
+    """Per-run quality data (design: "Quality metrics"; `metrics.py` keeps it up to date).
+
+    - `tokens`: the total per role; `token_use`: each turn's tokens, per attempt and dated.
+    - `first_pass`: whether the first build passed its tests and the review; None until decided.
+    - `builder_retries`: builder attempts after the first.
+    - `important_findings`: summed over every review of the run.
+    - `pauses`: every pause, usage limits included.
+    - `pr_lines_changed_by_you`: lines added or removed in the run's change between the head the
+      pull request opened at and the head merged, main's changes left out; None until the
+      engine merges.
+    """
 
     tokens: dict[Role, NonNegative] = {}
+    token_use: list[TokenUse] = []
+    first_pass: bool | None = None
+    builder_retries: NonNegative = 0
     important_findings: NonNegative = 0
+    pauses: list[PauseRecord] = []
     pr_lines_changed_by_you: NonNegative | None = None
 
 
@@ -72,12 +114,14 @@ class Pause(_Model):
 class PullRequestInfo(_Model):
     """The run's pull request (git flow step 5). `head` is the commit last pushed, whose tests
     passed. `rebased_from` is the head you approved, when the engine rebased it onto a newer
-    main at merge time (step 6); None otherwise."""
+    main at merge time (step 6); None otherwise. `opened_head` is the head it was opened at,
+    for the lines you changed before the merge (2.27)."""
 
     number: Annotated[int, Field(ge=1)]
     url: str
     head: str
     rebased_from: str | None = None
+    opened_head: str | None = None  # the head it was opened at: what you were first shown
 
 
 class ApprovedMerge(_Model):

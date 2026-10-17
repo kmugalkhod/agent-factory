@@ -36,6 +36,7 @@ from factory_engine.agents.runner import (
 from factory_engine.config import Caps
 from factory_engine.errors import AgentError
 from factory_engine.events import EventLog, NeedsYou, Paused
+from factory_engine.metrics import pause_hit
 from factory_engine.run import Pause, PauseReason, Role, Run
 from factory_engine.states import move
 
@@ -274,10 +275,12 @@ def _settle(recorder: SessionRecorder, spec: AgentSpec, trip: Trip, events: Even
             session_id=recorder.session_id,
             resume_at=trip.resume_at,
         )
-        moved = move(run, "paused", log=events).model_copy(update={"pause": pause})
-        events.append(
+        moved = move(run, "paused", log=events)
+        event = events.append(
             Paused(reason=reason, detail=trip.detail, resume_at=trip.resume_at), role=spec.role
         )
+        metrics = pause_hit(moved.metrics, pause, at=event.at)  # kept after the run resumes
+        moved = moved.model_copy(update={"pause": pause, "metrics": metrics})
     recorder.save(moved)
     return moved
 

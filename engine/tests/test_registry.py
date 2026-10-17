@@ -3,7 +3,7 @@
 import sqlite3
 import sys
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -14,8 +14,10 @@ from factory_engine.paths import run_dir
 from factory_engine.registry import (
     MIGRATIONS,
     SCHEMA_VERSION,
+    PauseRow,
     Registry,
     Session,
+    TokenUseRow,
     open_registry,
     registry_path,
 )
@@ -23,8 +25,10 @@ from factory_engine.run import (
     ApprovedMerge,
     Metrics,
     Pause,
+    PauseRecord,
     PullRequestInfo,
     Run,
+    TokenUse,
     allocate_run,
     new_run,
     save_run,
@@ -57,7 +61,33 @@ def _busy_run(repo: str, run_id: int, slug: str) -> Run:
         session_ids={"planner": "s-plan", "builder": "s-build"},
         updated_at=NOW + timedelta(minutes=5),
         last_completed_step="tester_gate",
-        metrics=Metrics(tokens={"planner": 500, "reviewer": 40}, important_findings=1),
+        metrics=Metrics(
+            tokens={"planner": 500, "reviewer": 40},
+            token_use=[
+                TokenUse(role="planner", attempt=1, at=NOW, input=400, output=100),
+                TokenUse(
+                    role="reviewer",
+                    attempt=1,
+                    at=NOW + timedelta(minutes=3),
+                    input=30,
+                    output=5,
+                    cache_read=4,
+                    cache_creation=1,
+                ),
+            ],
+            important_findings=1,
+            first_pass=False,
+            builder_retries=1,
+            pauses=[
+                PauseRecord(
+                    reason="usage_limit",
+                    role="builder",
+                    attempt=2,
+                    at=NOW + timedelta(minutes=4),
+                    resume_at=NOW + timedelta(hours=2),
+                )
+            ],
+        ),
     )
 
 
@@ -72,7 +102,7 @@ def _dump(path: Path) -> dict[str, list[tuple[object, ...]]]:
     with sqlite3.connect(path) as conn:
         return {
             table: conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2, 3").fetchall()
-            for table in ("runs", "sessions")
+            for table in ("runs", "sessions", "token_use", "pauses")
         }
 
 
@@ -251,6 +281,116 @@ def test_version_2_database_gains_the_pull_request_columns(tmp_path: Path) -> No
         assert reg.get_run("app", 3) == _run("app", 3, "status-json")
 
 
+def test_a_run_keeps_its_metrics(reg: Registry) -> None:  # 2.27
+    run = _busy_run("app", 3, "status-json").model_copy(
+        update={
+            "metrics": _busy_run("app", 3, "status-json").metrics.model_copy(
+                update={"first_pass": True, "pr_lines_changed_by_you": 12}
+            )
+        }
+    )
+    reg.upsert_run(run)
+    assert reg.get_run("app", 3) == run
+
+
+def test_version_3_database_gains_the_metrics_columns_and_tables(tmp_path: Path) -> None:
+    path = tmp_path / "registry.db"
+    with sqlite3.connect(path) as conn:
+        for step in range(3):
+            conn.executescript(MIGRATIONS[step])
+        conn.execute("PRAGMA user_version = 3")
+        conn.execute(
+            "INSERT INTO runs (repo, id, slug, kind, state, stage, provider, isolation, "
+            "created_at, updated_at, last_completed_step, important_findings, "
+            "pr_lines_changed_by_you, pause, pull_request, merge_approval) VALUES "
+            "('app', 3, 'status-json', 'feature', 'pending', NULL, 'subscription', "
+            "'worktree', ?, ?, NULL, 0, NULL, NULL, NULL, NULL)",
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+    conn.close()
+    with open_registry(path) as reg:
+        assert reg.get_run("app", 3) == _run("app", 3, "status-json")
+        reg.upsert_run(_busy_run("app", 3, "status-json"))
+        assert reg.get_run("app", 3) == _busy_run("app", 3, "status-json")
+
+
+def test_token_use_and_pauses_are_listed_per_run(reg: Registry) -> None:  # for 2.29
+    reg.upsert_run(_busy_run("app", 3, "status-json"))
+    reg.upsert_run(_run("api", 1, "x"))
+    assert reg.list_token_use() == reg.list_token_use("app", 3)
+    assert reg.list_token_use("app", 3) == [
+        TokenUseRow(
+            repo="app",
+            run_id=3,
+            seq=0,
+            role="planner",
+            attempt=1,
+            at=NOW,
+            input=400,
+            output=100,
+            cache_read=0,
+            cache_creation=0,
+        ),
+        TokenUseRow(
+            repo="app",
+            run_id=3,
+            seq=1,
+            role="reviewer",
+            attempt=1,
+            at=NOW + timedelta(minutes=3),
+            input=30,
+            output=5,
+            cache_read=4,
+            cache_creation=1,
+        ),
+    ]
+    assert reg.list_pauses("app") == [
+        PauseRow(
+            repo="app",
+            run_id=3,
+            seq=0,
+            reason="usage_limit",
+            role="builder",
+            attempt=2,
+            at=NOW + timedelta(minutes=4),
+            resume_at=NOW + timedelta(hours=2),
+        )
+    ]
+    assert reg.list_pauses("api") == []
+
+
+def test_token_use_is_stored_in_utc_so_days_group_in_sql(reg: Registry) -> None:
+    """`at` is UTC ISO 8601: its first 10 characters are the UTC day."""
+    late = datetime(2026, 10, 10, 23, 30, tzinfo=timezone(timedelta(hours=-2)))  # 01:30 UTC
+    run = _run("app", 3, "status-json").model_copy(
+        update={
+            "metrics": Metrics(
+                tokens={"builder": 30},
+                token_use=[
+                    TokenUse(role="builder", attempt=1, at=NOW, input=10, output=0),
+                    TokenUse(role="builder", attempt=2, at=late, input=20, output=0),
+                ],
+            )
+        }
+    )
+    reg.upsert_run(run)
+    assert reg.get_run("app", 3) == run
+    with sqlite3.connect(reg.path) as conn:
+        days = conn.execute(
+            "SELECT substr(at, 1, 10), role, SUM(input + output + cache_read + cache_creation) "
+            "FROM token_use GROUP BY 1, 2 ORDER BY 1"
+        ).fetchall()
+    conn.close()
+    assert days == [("2026-10-10", "builder", 10), ("2026-10-11", "builder", 20)]
+
+
+def test_token_use_rows_go_with_their_run(reg: Registry) -> None:
+    reg.upsert_run(_busy_run("app", 3, "status-json"))
+    reg.upsert_run(_run("app", 3, "status-json"))  # the same run, metrics cleared
+    assert reg.list_token_use() == []
+    assert reg.list_pauses() == []
+
+
 def test_upsert_updates_the_run_and_its_sessions(reg: Registry) -> None:  # AC1
     reg.upsert_run(_busy_run("app", 3, "status-json"))
     later = _busy_run("app", 3, "status-json").model_copy(
@@ -317,7 +457,7 @@ def test_rebuild_reproduces_the_index_exactly(tmp_path: Path) -> None:  # AC3
     with open_registry(path) as reg:
         _seed_runs(data, reg)
     before = _dump(path)
-    assert before["runs"] and before["sessions"]
+    assert before["runs"] and before["sessions"] and before["token_use"] and before["pauses"]
 
     with open_registry(path) as reg:
         assert reg.rebuild_index(data) == 3

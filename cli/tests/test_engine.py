@@ -346,6 +346,16 @@ def test_stop_moves_the_run_to_stopped(world: World) -> None:
         world.engine().stop(0)
 
 
+def test_stop_writes_the_runs_report(world: World) -> None:  # 2.27
+    world.engine().start_feature("Add mul to calc", slug=None)
+
+    world.engine().stop(0)
+
+    report = (world.folder() / "report.md").read_text(encoding="utf-8").splitlines()
+    assert report[0].startswith("# Report: run-0-")
+    assert "Status: stopped" in report
+
+
 def test_resume_carries_an_interrupted_stage_on(world: World) -> None:
     world.engine().start_feature("Add mul to calc", slug=None)
     set_state(world, "planning")  # as a Ctrl-C mid-stage leaves it

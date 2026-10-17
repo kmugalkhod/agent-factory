@@ -17,10 +17,11 @@
 - `merge`, in `awaiting_merge` once your approval is recorded (`decisions.approve_merge`): if
   main moved since the pull request's head was tested, rebase onto it, rerun the tests and push
   the tested commit, then fetch main again (at most `MERGE_REBASES` rebases). Then merge through
-  `gh`, pinned to the tested head, and remove the worktree (→ merged). Anything that fails stops
-  the run for you, with nothing merged. `gh pr merge` can pin the head but not main: a push to
-  main between the last fetch and the merge isn't seen, which branch protection's "Require
-  branches to be up to date before merging" closes on GitHub's side.
+  `gh`, pinned to the tested head, record the lines you changed on the pull request since it
+  opened (`metrics.lines_changed`, 2.27), and remove the worktree (→ merged). Anything that
+  fails stops the run for you, with nothing merged. `gh pr merge` can pin the head but not
+  main: a push to main between the last fetch and the merge isn't seen, which branch
+  protection's "Require branches to be up to date before merging" closes on GitHub's side.
 
 No code path merges without your approval: `merge_approved` is the engine's only call of
 `github.merge_pr`, and it refuses unless `run.json` holds an approval for this pull request at
@@ -54,6 +55,7 @@ from factory_engine.git_ops import (
     worktree_changes,
 )
 from factory_engine.github import GitHub, MergeApproval, PullRequest, merge_pr, open_pr, pr_body
+from factory_engine.metrics import lines_changed
 from factory_engine.pipeline import (
     REVIEW_FILE,
     UPDATE_GATE,
@@ -69,6 +71,8 @@ from factory_engine.run import PullRequestInfo, Run
 MERGE_UPDATE_GATE = "merge.update"
 """The `gate_result` of a rebase onto a main that moved after your approval, and its tests."""
 CLEANUP_GATE = "merge.cleanup"
+PR_LINES_GATE = "metrics.pr_lines"
+"""The `gate_result` logged when the lines you changed on the pull request can't be measured."""
 """The `gate_result` of removing the worktree after the merge."""
 MERGE_REBASES = 3
 """How many times main may move during one merge (each a rebase and a test run) before the run
@@ -259,7 +263,7 @@ class GitFlow(Hooks):
                 return pipeline.stop_for_you(
                     None, f"the run branch is pushed, but the pull request wasn't opened: {err}"
                 )
-            info = PullRequestInfo(number=pr.number, url=pr.url, head=head)
+            info = PullRequestInfo(number=pr.number, url=pr.url, head=head, opened_head=head)
         return pipeline.record(
             run.model_copy(update={"pull_request": info, "merge_approval": None})
         )
@@ -325,7 +329,10 @@ class GitFlow(Hooks):
             merge_approved(self.gh, places.repo, run, places.run_folder)
         except FactoryError as err:
             return pipeline.stop_for_you(None, f"the merge failed: {err}")
-        pipeline.record(run.model_copy(update={"merge_approval": None}))
+        metrics = run.metrics.model_copy(
+            update={"pr_lines_changed_by_you": self._lines_you_changed(pipeline, pr)}
+        )
+        pipeline.record(run.model_copy(update={"merge_approval": None, "metrics": metrics}))
         pipeline.move_to("merged")
         self._clean_up(pipeline)
         return pipeline.run
@@ -365,6 +372,32 @@ class GitFlow(Hooks):
             f"after the rebase onto the {self.base} that moved after your approval, so nothing "
             "was merged or pushed",
         )
+
+    def _lines_you_changed(self, pipeline: Pipeline, pr: PullRequestInfo) -> int | None:
+        """The lines changed in the run's own change between the head the pull request opened
+        at and the head just merged (`metrics.lines_changed`). None when it can't be measured,
+        which is logged; the merge stands either way."""
+        if pr.opened_head is None:
+            return None
+        try:
+            lines = lines_changed(
+                pipeline.git,
+                pipeline.places.worktree,
+                opened=pr.opened_head,
+                merged=pr.head,
+                base_ref=f"refs/remotes/{self.remote}/{self.base}",
+            )
+        except GitError as err:
+            reason = f"the lines changed on the pull request couldn't be measured: {err}"
+        else:
+            if lines is not None:
+                return lines
+            reason = (
+                "the lines changed on the pull request weren't measured: the change as it was "
+                f"opened at {pr.opened_head[:12]} doesn't apply cleanly to the merged head's base."
+            )
+        pipeline.events.append(GateResult(gate=PR_LINES_GATE, passed=False, reason=reason))
+        return None
 
     def _clean_up(self, pipeline: Pipeline) -> None:
         """Remove the worktree after the merge; the run branch stays. A failure is logged:

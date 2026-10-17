@@ -270,6 +270,7 @@ def test_a_worktree_that_cant_be_made_fails_the_run(place: Place, tmp_path: Path
     assert place.registry.get_run(REPO, 0) == run
     assert [type(e.body) for e in read_events(folder)] == [ev.RunCreated, ev.StateChanged]
     assert (folder / INTENT_FILE).is_file()  # the request is kept for a new start
+    assert "Status: failed" in (folder / "report.md").read_text(encoding="utf-8")  # 2.27
 
 
 def test_request_of_refuses_a_file_without_the_headings() -> None:
