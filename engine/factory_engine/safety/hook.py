@@ -70,10 +70,12 @@ class HookPolicy:
         worktree: Path,
         run_folder: Path,
         locked: Iterable[str] = (),
+        read_only: Iterable[Path] = (),
         windows: bool = sys.platform == "win32",
     ) -> "HookPolicy":
         """`settings` are the run's effective settings (bootstrap applied for run 0); `locked`
-        holds the worktree-relative paths of the files the tester created."""
+        holds the worktree-relative paths of the files the tester created; `read_only` the
+        folders file tools may read but never write (the agent's skills)."""
         return cls(
             role=role,
             paths=PathPolicy.build(
@@ -82,6 +84,7 @@ class HookPolicy:
                 worktree=worktree,
                 run_folder=run_folder,
                 locked=locked,
+                read_only=read_only,
                 windows=windows,
             ),
             shell=ShellPolicy.build(

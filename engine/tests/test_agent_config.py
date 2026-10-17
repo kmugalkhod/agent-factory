@@ -153,17 +153,23 @@ def test_roles_with_a_shell_keep_the_shell_tools(tmp_path: Path, role: Role) -> 
         ("reviewer", []),
     ],
 )
-def test_allow_rules_equal_the_role_shell_allowlist(  # AC2
+def test_allow_rules_are_the_file_tools_and_the_role_shell_allowlist(  # AC2
     tmp_path: Path, role: Role, commands: list[str]
 ) -> None:
+    """dontAsk refuses an edit no rule approves, even in the worktree, so the file tools are
+    approved by name; the path hook limits where each may go."""
     allow = _permissions(_write(tmp_path, role))["allow"]
-    assert allow == [rule for cmd in commands for rule in (f"Bash({cmd})", f"Bash({cmd} *)")]
+    shell = [rule for cmd in commands for rule in (f"Bash({cmd})", f"Bash({cmd} *)")]
+    assert allow == ["Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep", *shell]
 
 
 def test_allow_rules_follow_a_changed_allowlist(tmp_path: Path) -> None:  # AC2
     settings = _settings(builder={"shell_allowlist": ["lint"]})
     allow = _permissions(_write(tmp_path, "builder", settings))["allow"]
-    assert allow == ["Bash(uv run ruff check .)", "Bash(uv run ruff check . *)"]
+    assert [rule for rule in allow if rule.startswith("Bash")] == [
+        "Bash(uv run ruff check .)",
+        "Bash(uv run ruff check . *)",
+    ]
 
 
 # ----------------------------------------------------------------- skills

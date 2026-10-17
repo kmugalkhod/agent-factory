@@ -1,6 +1,8 @@
 """Path check for the file tools (Read, Write, Edit, MultiEdit, NotebookEdit, Glob, Grep).
 
-An agent may read anything in its worktree and its run folder, except secrets (`.env*`). It may
+An agent may read anything in its worktree and its run folder, except secrets (`.env*`), and
+the read-only folders it is given: its own copy of the factory skills, whose templates the skills
+tell it to copy. It may
 write in the worktree only where its role's `write_paths` allow and its `deny_paths` don't, and
 never to a protected file. The builder may not change files the tester created (the test lock).
 In the run folder a role may write only its own run docs: the run-doc names in its
@@ -79,6 +81,7 @@ class PathPolicy:
     run_docs: frozenset[str]
     locked: frozenset[str]
     windows: bool
+    read_only: tuple[Path, ...] = ()
 
     @classmethod
     def build(
@@ -89,9 +92,11 @@ class PathPolicy:
         worktree: Path,
         run_folder: Path,
         locked: Iterable[str] = (),
+        read_only: Iterable[Path] = (),
         windows: bool = sys.platform == "win32",
     ) -> "PathPolicy":
-        """`locked` holds the worktree-relative paths of the files the tester created."""
+        """`locked` holds the worktree-relative paths of the files the tester created;
+        `read_only` the folders the agent may read but never write (its skills)."""
         docs = {p for p in settings.write_paths if p in RUN_DOCS}
         if role not in NO_HANDOFF:
             docs.add(f"handoff-{role}.md")
@@ -105,6 +110,7 @@ class PathPolicy:
             run_docs=frozenset(_key(d, windows) for d in docs),
             locked=frozenset(_key(_locked_entry(root, p, windows), windows) for p in locked),
             windows=windows,
+            read_only=tuple(p.resolve() for p in read_only),
         )
 
 
@@ -193,7 +199,7 @@ def _link_decision(
     opened; a linked folder can't be judged by the glob, which filters the files inside it."""
     if is_file and not _glob_may_match(glob, rel, link.name, policy.windows):
         return None
-    if _working_relative(policy, target) is None:
+    if _readable_relative(policy, target) is None:
         return _block(
             f"the search would follow {link}, a link outside the worktree. Narrow `path` or "
             "`glob` to skip it."
@@ -218,13 +224,18 @@ def _glob_may_match(glob: str | None, rel: str, name: str, windows: bool) -> boo
     return _matches(target, (glob.replace("\\", "/").removeprefix("./"),), windows)
 
 
-def _working_relative(policy: PathPolicy, path: Path) -> str | None:
-    rel = _relative(path, policy.worktree, policy.windows)
-    return rel if rel is not None else _relative(path, policy.run_folder, policy.windows)
+def _readable_relative(policy: PathPolicy, path: Path) -> str | None:
+    """`path` relative to the folder it may be read from: the worktree, the run folder or a
+    read-only folder. None when it is in none of them."""
+    for root in (policy.worktree, policy.run_folder, *policy.read_only):
+        rel = _relative(path, root, policy.windows)
+        if rel is not None:
+            return rel
+    return None
 
 
 def _read(policy: PathPolicy, raw: str, path: Path) -> PathDecision:
-    rel = _working_relative(policy, path)
+    rel = _readable_relative(policy, path)
     if rel is None:
         return _outside(policy, raw)
     if _matches(rel, SECRETS, policy.windows):

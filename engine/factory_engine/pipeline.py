@@ -59,7 +59,7 @@ from typing import Literal, cast, get_args
 
 from claude_agent_sdk import ClaudeSDKError
 
-from factory_engine.agent_config import agent_config_dir, write_agent_config
+from factory_engine.agent_config import SKILLS_DIR, agent_config_dir, write_agent_config
 from factory_engine.agents.runner import (
     AgentResult,
     AgentRunner,
@@ -676,6 +676,7 @@ class Pipeline:
                 worktree=places.worktree,
                 run_folder=places.run_folder,
                 locked=locked,
+                read_only=(config_dir / SKILLS_DIR,),
             )
             spec = build_spec(
                 role=role,
