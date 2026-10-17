@@ -21,6 +21,7 @@ from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder
 from factory_engine.agents.watchdog import RESUME_PROMPT
 from factory_engine.config import Settings
 from factory_engine.errors import DecisionError, FactoryError, NotReadyError, ProviderError
+from factory_engine.events import Event, EventObserver, read_events
 from factory_engine.git_ops import worktree_dir
 from factory_engine.paths import repo_runs_dir, run_dir
 from factory_engine.readiness import Problem, Readiness
@@ -142,6 +143,7 @@ class World:
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
         platform: str = "win32",
+        progress: EventObserver | None = None,
     ) -> Engine:
         deps = Deps(
             env=self.env if env is None else env,
@@ -151,6 +153,7 @@ class World:
             platform=platform,
             home=FACTORY,
             runner=self.planner.factory,
+            progress=progress,
             readiness=self.readiness,
         )
         return Engine(deps, repo)
@@ -514,3 +517,37 @@ def test_commands_find_the_run_from_inside_its_worktree(world: World) -> None:
     assert (row.run.repo, row.run.id) == ("pilot", 0)
     assert detail.run_folder == world.folder()
     assert stopped.state == "stopped"
+
+
+# ------------------------------------------------------------------ progress output
+
+
+def test_start_tells_the_progress_observer_every_event_as_it_is_written(world: World) -> None:
+    seen: list[Event] = []
+
+    world.engine(progress=seen.append).start_feature("Add mul to calc", slug=None)
+
+    assert seen == read_events(world.folder())
+    assert {type(e.body).__name__ for e in seen} >= {"RunCreated", "StageStarted", "GateResult"}
+
+
+def test_a_decision_and_the_rerun_reach_the_progress_observer(world: World) -> None:
+    world.planner.plans.append(PLAN)
+    world.engine().start_feature("Add mul to calc", slug=None)
+    before = len(read_events(world.folder()))
+    seen: list[Event] = []
+
+    world.engine(progress=seen.append).send_back(0, "Keep it small.")
+
+    assert seen == read_events(world.folder(), after=before)
+    assert type(seen[0].body).__name__ == "Decision"
+
+
+def test_a_broken_progress_observer_doesnt_stop_the_run(world: World) -> None:
+    def broken(event: Event) -> None:
+        raise RuntimeError("the terminal went away")
+
+    done = world.engine(progress=broken).start_feature("Add mul to calc", slug=None)
+
+    assert done.stop == "plan_approval"
+    assert done.run.state == "awaiting_plan_approval"

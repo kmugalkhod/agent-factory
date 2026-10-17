@@ -7,7 +7,8 @@ checks the readiness bar before a new run (`factory_engine.readiness`; a repo th
 gets no run, and every failing condition is listed) and builds the engine's objects: the
 registry, the run's event log, intake, the decisions and a `Pipeline` with the real agent
 runner (the watchdog lives inside the pipeline). It runs the pipeline in the foreground until
-the run waits for you or stops.
+the run waits for you or stops; the run's event log tells `Deps.progress` about each event as
+it is written, so the command can print progress lines.
 
 A process holds the run's lock (`lock.py`) while it decides on a run or drives it, so two
 factory processes never write the same run. Ctrl-C stops the pipeline; the run stays in the
@@ -41,7 +42,7 @@ from factory_engine.config import (
 )
 from factory_engine.decisions import Decided, DecisionContext
 from factory_engine.errors import DataFolderError
-from factory_engine.events import EventLog, NeedsYou, read_events
+from factory_engine.events import EventLog, EventObserver, NeedsYou, read_events
 from factory_engine.gates.plan import PLAN_FILE, Question, check_plan
 from factory_engine.git_ops import Git, worktree_dir
 from factory_engine.github import GitHub
@@ -78,7 +79,9 @@ type Act = Callable[[DecisionContext, Run], Decided]
 class Deps:
     """What the actions use from the outside world, passed in so tests can replace it: the
     environment, the current folder, a clock and a sleep, the platform (`sys.platform`), the
-    factory's own folder, the agent runner to use and the readiness check."""
+    factory's own folder, the agent runner to use and the readiness check. `progress`, if
+    given, is told about each event a run writes while this process works on it (the command's
+    progress lines)."""
 
     env: Mapping[str, str]
     cwd: Path
@@ -87,6 +90,7 @@ class Deps:
     platform: str
     home: Path
     runner: RunnerFactory
+    progress: EventObserver | None = None
     readiness: ReadinessCheck = check_readiness
 
 
@@ -165,6 +169,7 @@ class Engine:
                 registry=registry,
                 clock=self._deps.clock,
                 on_claim=lock,
+                observer=self._deps.progress,
             )
             try:
                 started = make(intake, self._requested_by(path))
@@ -491,7 +496,13 @@ class Engine:
         return run_dir(self._data(), repo, run_id, indexed.slug)
 
     def _events(self, run: Run, folder: Path) -> EventLog:
-        return EventLog(folder, repo=run.repo, run_id=run.id, clock=self._deps.clock)
+        return EventLog(
+            folder,
+            repo=run.repo,
+            run_id=run.id,
+            clock=self._deps.clock,
+            observer=self._deps.progress,
+        )
 
     def _context(self, folder: Path, events: EventLog, registry: Registry) -> DecisionContext:
         return DecisionContext(
