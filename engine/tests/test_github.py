@@ -16,6 +16,7 @@ from factory_engine.github import (
     PullRequest,
     merge_pr,
     open_pr,
+    open_prs,
     pr_body,
 )
 
@@ -36,6 +37,8 @@ if os.environ.get("FAKE_GH_FAIL"):
     sys.exit(1)
 if args[:2] == ["pr", "create"]:
     print(os.environ.get("FAKE_GH_URL", "https://github.com/kunal/pilot/pull/7"))
+if args[:2] == ["pr", "list"]:
+    print(os.environ.get("FAKE_GH_LIST", "[]"))
 """
 
 
@@ -113,6 +116,38 @@ def test_open_pr_runs_gh_pr_create_from_the_run_branch_into_main(
     assert args[args.index("--head") + 1] == "factory/run-3-status-json"
     assert args[args.index("--title") + 1] == "factory(run-3): status json"
     assert Path(str(call["cwd"])).resolve() == folders[0].resolve()
+
+
+def test_open_prs_lists_the_run_branchs_open_pull_requests_with_their_heads(
+    fake: FakeGh, folders: tuple[Path, Path]
+) -> None:
+    url = "https://github.com/kunal/pilot/pull/7"
+    fake.env["FAKE_GH_LIST"] = json.dumps([{"number": 7, "url": url, "headRefOid": SHA}])
+
+    found = open_prs(fake.gh, folders[0], run_id=3, slug=SLUG)
+
+    assert found == [PullRequest(number=7, url=url, head=SHA)]
+    [call] = fake.calls()
+    args = call["args"]
+    assert isinstance(args, list)
+    assert args[:2] == ["pr", "list"]
+    assert args[args.index("--head") + 1] == "factory/run-3-status-json"
+    assert args[args.index("--base") + 1] == "main"
+    assert args[args.index("--state") + 1] == "open"
+
+
+def test_open_prs_is_empty_when_none_is_open(fake: FakeGh, folders: tuple[Path, Path]) -> None:
+    assert open_prs(fake.gh, folders[0], run_id=3, slug=SLUG) == []
+
+
+@pytest.mark.parametrize("listed", ["not json", '[{"number": "7"}]', '[{"number": 7}]'])
+def test_open_prs_refuses_an_answer_it_cant_read(
+    fake: FakeGh, folders: tuple[Path, Path], listed: str
+) -> None:
+    fake.env["FAKE_GH_LIST"] = listed
+
+    with pytest.raises(GitHubError, match="gh pr list"):
+        open_prs(fake.gh, folders[0], run_id=3, slug=SLUG)
 
 
 def test_the_body_goes_through_a_file_in_the_run_folder(

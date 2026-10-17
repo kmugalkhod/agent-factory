@@ -11,7 +11,7 @@ write outside the worktree. Before a stage the engine takes a `Baseline`; after 
 2. `post_stage.outside_worktree`: nothing changed in the watched folders (the data folder by
    default: other runs, other worktrees, other agents' config folders), except the places that
    may change during a stage. In the run folder only the role's own run docs and the engine's
-   `run.json` and `events.jsonl` may change.
+   `run.json`, `events.jsonl` and `attempt.json` may change.
 3. `post_stage.allowed_paths`: every path the stage's diff touches (added, changed or deleted,
    committed or not) is one the role may write, judged by the path hook's write rules on the
    name git records, never on where a link leads. A link (git mode 120000) fails for every role.
@@ -40,7 +40,7 @@ from factory_engine.errors import GateError, GitError
 from factory_engine.events import EVENTS_FILE, EventLog, GateResult, NeedsYou
 from factory_engine.git_ops import Git
 from factory_engine.registry import REGISTRY_FILE
-from factory_engine.run import RUN_FILE, Role, Run
+from factory_engine.run import ATTEMPT_FILE, RUN_FILE, Role, Run
 from factory_engine.safety.paths import PathPolicy, check_worktree_name
 from factory_engine.safety.secrets import SecretFinding, scan_diff, scan_text
 from factory_engine.states import move
@@ -51,7 +51,8 @@ ALLOWED_PATHS = "post_stage.allowed_paths"
 SECRETS = "post_stage.secrets"
 GATES = (MAIN_CHECKOUT, OUTSIDE_WORKTREE, ALLOWED_PATHS, SECRETS)
 
-ENGINE_FILES = frozenset({RUN_FILE, EVENTS_FILE})  # the engine writes these during a stage
+# the engine writes these during a stage
+ENGINE_FILES = frozenset({RUN_FILE, EVENTS_FILE, ATTEMPT_FILE})
 # in the main checkout's git folders (its own and, for a linked checkout, the shared one)
 GIT_WATCHED = ("config", "config.worktree", "hooks", "info")
 SQLITE_SUFFIXES = ("", "-wal", "-shm", "-journal")

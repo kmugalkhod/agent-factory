@@ -5,6 +5,7 @@ prompts. The body is published, so it goes through the secret redaction first, a
 as a file in the run folder (kept as a record), never on the command line.
 """
 
+import json
 import re
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -69,6 +70,7 @@ class GitHub:
 class PullRequest:
     number: int
     url: str
+    head: str | None = None  # its head commit, when `gh` said (`open_prs`)
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,47 @@ def open_pr(
             "Check the repo on GitHub before retrying, so no second pull request is opened."
         )
     return PullRequest(number=int(found.group("number")), url=found.group(0))
+
+
+def open_prs(
+    gh: GitHub, repo: Path, *, run_id: int, slug: str, base: str = "main"
+) -> list[PullRequest]:
+    """The open pull requests from the run branch into `base`, each with its head commit, so a
+    pull request opened before the engine stopped can be found instead of opened again."""
+    head = run_branch(run_id, slug)
+    out = gh.run(
+        [
+            "pr",
+            "list",
+            "--head",
+            head,
+            "--base",
+            base,
+            "--state",
+            "open",
+            "--json",
+            "number,url,headRefOid",
+        ],
+        repo,
+    )
+    try:
+        listed = json.loads(out or "[]")
+    except ValueError as err:
+        raise GitHubError(f"`gh pr list` for {head} didn't print JSON ({err}).") from err
+    found: list[PullRequest] = []
+    for item in listed if isinstance(listed, list) else [listed]:
+        number = item.get("number") if isinstance(item, dict) else None
+        url = item.get("url") if isinstance(item, dict) else None
+        sha = item.get("headRefOid") if isinstance(item, dict) else None
+        if (
+            not isinstance(number, int)
+            or not isinstance(url, str)
+            or not isinstance(sha, str)
+            or _PR_URL.match(url) is None
+        ):
+            raise GitHubError(f"`gh pr list` for {head} printed a pull request it can't read.")
+        found.append(PullRequest(number=number, url=url, head=sha))
+    return found
 
 
 def merge_pr(

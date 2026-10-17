@@ -223,7 +223,7 @@ def make_app(engine: EngineFactory) -> typer.Typer:
         repo: RepoOption = None,
         verbose: VerboseOption = False,
     ) -> None:
-        """Carry on a paused or interrupted run (a new attempt of its stage) until it needs you."""
+        """Carry on a paused or interrupted run from where it stopped, until it needs you."""
         actions = engine(repo, progress(verbose))
         finish(lambda: actions.resume(run, note=note))
 
@@ -421,10 +421,15 @@ def status_table(rows: Sequence[RunRow], *, with_repo: bool) -> list[str]:
         for row in rows
     ]
     widths = [max(len(line[i]) for line in [header, *body]) for i in range(len(header))]
-    return [
+    table = [
         "  ".join(cell.ljust(width) for cell, width in zip(line, widths, strict=True)).rstrip()
         for line in [header, *body]
     ]
+    if any(_shown_state(row.run, row.running).endswith("(interrupted)") for row in rows):
+        table.append(
+            "Interrupted runs carry on from their last completed step with `factory resume <run>`."
+        )
+    return table
 
 
 def _waiting(run: Run, detail: RunDetail) -> Stop | None:
