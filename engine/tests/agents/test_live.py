@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from factory_engine.agent_config import write_agent_config
+from factory_engine.agent_config import SKILLS_DIR, write_agent_config
 from factory_engine.agents.runner import ClaudeAgentRunner, SessionRecorder, build_spec
 from factory_engine.config import default_settings
 from factory_engine.events import EventLog
@@ -62,7 +62,13 @@ def test_agent_completes_a_one_line_task_in_a_temporary_repo(tmp_path: Path) -> 
     )
     save_run(run, run_folder)
     events = EventLog(run_folder, repo="live", run_id=1, clock=_clock)
-    policy = HookPolicy.build("builder", settings, worktree=worktree, run_folder=run_folder)
+    policy = HookPolicy.build(
+        "builder",
+        settings,
+        worktree=worktree,
+        run_folder=run_folder,
+        read_only=(config_dir / SKILLS_DIR,),
+    )
     spec = build_spec(
         role="builder",
         attempt=1,

@@ -608,3 +608,50 @@ def test_a_junction_relative_to_the_cwd_is_blocked(roots: dict[str, Path]) -> No
     policy, src = _policy(roots, "planner"), roots["wt"] / "src"
     decision = check_file_tool(policy, "Grep", {"pattern": "x", "path": "data"}, cwd=src)
     _assert(decision, False, "outside")
+
+
+# ------------------------------------------------------ read-only folders
+
+
+def _skills(roots: dict[str, Path]) -> tuple[PathPolicy, Path]:
+    """A planner policy with a read-only skills folder holding a template and a `.env`."""
+    skills = roots["out"].parent / "agent" / "skills"
+    (skills / "write-plan").mkdir(parents=True)
+    (skills / "write-plan" / "plan.md").write_text("# Plan\n", encoding="utf-8")
+    (skills / "write-plan" / ".env").write_text("", encoding="utf-8")
+    policy = PathPolicy.build(
+        "planner",
+        _role_settings("planner"),
+        worktree=roots["wt"],
+        run_folder=roots["run"],
+        read_only=(skills,),
+    )
+    return policy, skills
+
+
+@pytest.mark.parametrize("tool", ["Read", "Glob"])
+def test_a_read_only_folder_can_be_read(roots: dict[str, Path], tool: str) -> None:
+    policy, skills = _skills(roots)
+    key = "file_path" if tool == "Read" else "path"
+    target = skills / "write-plan" / ("plan.md" if tool == "Read" else "")
+    _assert(check_file_tool(policy, tool, {key: str(target), "pattern": "*.md"}), True, "")
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_a_read_only_folder_is_never_written(roots: dict[str, Path], tool: str) -> None:
+    policy, skills = _skills(roots)
+    target = skills / "write-plan" / "plan.md"
+    _assert(check_file_tool(policy, tool, {"file_path": str(target)}), False, "outside")
+
+
+def test_a_secrets_file_in_a_read_only_folder_is_blocked(roots: dict[str, Path]) -> None:
+    policy, skills = _skills(roots)
+    target = skills / "write-plan" / ".env"
+    _assert(check_file_tool(policy, "Read", {"file_path": str(target)}), False, "secrets")
+
+
+def test_a_folder_next_to_a_read_only_folder_stays_outside(roots: dict[str, Path]) -> None:
+    policy, skills = _skills(roots)
+    (skills.parent / "projects").mkdir()
+    target = skills.parent / "projects" / "session.jsonl"
+    _assert(check_file_tool(policy, "Read", {"file_path": str(target)}), False, "outside")

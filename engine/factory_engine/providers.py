@@ -5,9 +5,10 @@ names, and names the credential variables it needs. Only `subscription` exists u
 milestone 4.
 
 An agent's environment is built from a clean base, never from the parent's: a short list of
-system variables an agent's tools need, then the profile's own credentials, then the agent's
-`CLAUDE_CONFIG_DIR`. Anything else in the parent, such as a leftover `ANTHROPIC_*` or proxy
-variable, would silently switch the provider, so it never reaches the agent.
+system variables an agent's tools need, a few fixed settings for the commands it runs, then the
+profile's own credentials, then the agent's `CLAUDE_CONFIG_DIR`. Anything else in the parent,
+such as a leftover `ANTHROPIC_*` or proxy variable, would silently switch the provider, so it
+never reaches the agent.
 """
 
 from collections.abc import Mapping
@@ -52,6 +53,12 @@ BASE_VARS = (
     "LC_ALL",
     "TERM",
 )
+
+# Fixed settings for the commands an agent runs. Python writes no `__pycache__` into the
+# worktree: in a repo that doesn't ignore it, a cache file under `src/` is a change outside the
+# tester's paths, and the post-stage check stops the run. The engine's own test runs set the
+# same (`testrun.COMMAND_VARS`).
+COMMAND_VARS: Mapping[str, str] = MappingProxyType({"PYTHONDONTWRITEBYTECODE": "1"})
 
 
 @dataclass(frozen=True)
@@ -100,6 +107,7 @@ def agent_env(parent: Mapping[str, str], profile: Profile, config_dir: Path) -> 
     """
     by_upper = {key.upper(): value for key, value in parent.items()}
     env = {name: by_upper[name] for name in BASE_VARS if name in by_upper}
+    env.update(COMMAND_VARS)
     for name in profile.credentials:
         value = by_upper.get(name, "").strip()
         if not value:

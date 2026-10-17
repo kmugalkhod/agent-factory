@@ -401,3 +401,19 @@ def test_secret_in_a_target_is_never_logged(
     assert SECRET not in (roots["run"] / "events.jsonl").read_text(encoding="utf-8")
     [event] = _tool_calls(roots)
     assert event.target and "…" in event.target
+
+
+def test_a_read_only_folder_reaches_the_path_check(roots: dict[str, Path]) -> None:
+    """The agent's skills folder is readable through the hook, and still never writable."""
+    skills = roots["out"]
+    policy = HookPolicy.build(
+        "planner", _settings(), worktree=roots["wt"], run_folder=roots["run"], read_only=(skills,)
+    )
+    callback = make_safety_hook(policy, _log(roots))
+    note = str(skills / "notes.txt")
+
+    def call(tool: str, tool_input: dict[str, object]) -> Mapping[str, object]:
+        return asyncio.run(callback(_input(roots, tool, tool_input), "toolu_1", {"signal": None}))
+
+    assert call("Read", {"file_path": note}) == {}
+    assert "outside" in _denied(call("Write", {"file_path": note, "content": "y"}))

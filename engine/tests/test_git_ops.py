@@ -3,6 +3,7 @@ clean-up, against temporary repos and a bare "remote"."""
 
 import ast
 import subprocess
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -517,6 +518,24 @@ def test_leftover_git_dir_in_the_environment_is_ignored(repos: Repos, tmp_path: 
     )
     assert repos.run(worktree, "branch", "--show-current") == "factory/run-3-status-json"
     assert repos.run(other, "branch", "--list") == ""
+
+
+def test_git_never_waits_for_a_prompt_or_a_login_window(
+    repos: Repos, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Mapping[str, str]] = []
+    real = git_ops.run_command
+
+    def spy(
+        argv: Sequence[str], cwd: Path, env: Mapping[str, str], timeout: float
+    ) -> subprocess.CompletedProcess[str]:
+        seen.append(env)
+        return real(argv, cwd, env, timeout)
+
+    monkeypatch.setattr(git_ops, "run_command", spy)
+    repos.git.out(["status", "--porcelain"], repos.repo)
+    assert seen[0]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen[0]["GCM_INTERACTIVE"] == "never"
 
 
 def test_a_git_failure_raises_with_the_command_and_its_error(repos: Repos, tmp_path: Path) -> None:

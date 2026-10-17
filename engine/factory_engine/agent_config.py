@@ -6,13 +6,15 @@ or history. Claude Code keeps the agent's session transcripts here too, so the f
 outside the run folder, where other roles can't read them.
 
 How the rules keep an agent in its worktree:
-- `defaultMode: dontAsk` refuses any call that isn't approved instead of asking. Claude Code
-  approves reads and edits on its own only inside the working folders: the worktree, plus the
-  run folder added through `additionalDirectories`. So everything outside them is refused.
+- `defaultMode: dontAsk` refuses any call that isn't approved instead of asking. It refuses
+  file edits too, even inside the working folders (the worktree, plus the run folder added
+  through `additionalDirectories`): only an allow rule approves them.
+- Allow rules approve the file tools by name, and the role's shell allowlist. Which paths a
+  file tool may touch is the path hook's job (`safety.paths`): it runs before these rules and
+  denies anything outside the role's paths, so an allowed tool still can't leave them.
 - Deny rules, which beat every allow rule, name the sensitive places: `~/.ssh`, `~/.aws`, your
-  own `~/.claude`, `.env*` files anywhere, and other repos and runs the caller lists.
-- Allow rules are exactly the role's shell allowlist; a role with no shell has the shell tools
-  denied outright. Write paths are enforced by the runner and the path hook, not here.
+  own `~/.claude`, `.env*` files anywhere, and other repos and runs the caller lists. A role
+  with no shell has the shell tools denied outright.
 """
 
 import os
@@ -35,6 +37,8 @@ SKILLS_DIR = "skills"
 
 SECRET_PATTERNS = ("~/.ssh/**", "~/.aws/**", "~/.claude/**", "//**/.env*")
 SHELL_TOOLS = ("Bash", "PowerShell")
+FILE_TOOLS = ("Read", "Edit", "Write", "NotebookEdit", "Glob", "Grep")
+"""Approved by name; the path hook decides which paths each one may touch."""
 
 
 class _Model(BaseModel):
@@ -114,7 +118,7 @@ def write_agent_config(
 
 
 def _allow_rules(role: RoleSettings, settings: Settings) -> list[str]:
-    rules: list[str] = []
+    rules: list[str] = list(FILE_TOOLS)
     for name in role.shell_allowlist:
         command: str | None = getattr(settings.commands, name)
         if command:  # a command that isn't configured adds no rule
