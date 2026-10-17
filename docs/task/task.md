@@ -599,6 +599,10 @@ All engine code lives in `engine/factory_engine/`; tests in `engine/tests/`. Tes
   - Done atomically so a restart can tell them apart: the stage commit's step and the move to the next state are one save; a review's Important findings, the reviewer's failed step and the move to the builder are one save (the findings are never counted twice).
   - A run from before `attempt.json` (no record) whose agent started gets a new attempt of its stage, the 2.28 behaviour. An unreadable `attempt.json` needs you. A note you gave a decision whose agent never started isn't kept; give it again with `--note`. Runs that need you stay out of scope (feedback, 2.23).
   - `Step` and `UPDATE_STEP` moved to `recovery.py` (still importable from `pipeline`); `git_ops.stage_message` gives the stage commit's message.
+- **Note:** Review fixes (PR #38):
+  - The update's rebase saves its progress in `attempt.json` (`update`: started from which head, finished at which). After a restart, a finished rebase goes on to the test lock and the tests instead of the pre-rebase checks, which would compare main's change to a locked test with the old lock. A head that isn't the saved one (or a rebase waiting) needs you, as does a rebase that started and left the head moved without being saved as finished.
+  - Publish looks for an open pull request from the run branch (`github.open_prs`, `gh pr list --head ... --state open`) before opening one, and adopts it when its head is the pushed commit: `gh pr create` may have run before the engine stopped. Several, or one at another head, need you.
+  - A builder fail that stops the run (a flagged fail, tests still failing after a conflict resolution) saves its failed step in the same write as the stop, so a restart can't take it for a retry. The other failed steps lead to a retry or to a cap counted from `run.attempts`, which a restart reaches the same way.
 
 ### [x] 2.25 Readiness check
 

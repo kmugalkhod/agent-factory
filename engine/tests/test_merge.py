@@ -23,11 +23,12 @@ import pytest
 
 import factory_engine
 from factory_engine import events as ev
+from factory_engine import merge
 from factory_engine.agents.fake import FakeAgentRunner, result, system_init
 from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder, not_running
 from factory_engine.config import Settings, default_settings, merge_settings, parse_overrides
 from factory_engine.decisions import DecisionContext, approve_merge
-from factory_engine.errors import DecisionError
+from factory_engine.errors import DecisionError, PipelineError
 from factory_engine.events import EventLog, read_events
 from factory_engine.git_ops import Git, create_worktree, rebase_in_progress, run_branch
 from factory_engine.github import GitHub
@@ -153,7 +154,28 @@ if args[:2] == ["pr", "merge"] and os.environ.get("FAKE_GH_FAIL_MERGE"):
     sys.stderr.write("GraphQL: Pull request is not mergeable (mergePullRequest)\\n")
     sys.exit(1)
 if args[:2] == ["pr", "create"]:
+    with open(os.environ["FAKE_GH_LOG"] + ".open", "a", encoding="utf-8") as opened:
+        opened.write(args[args.index("--head") + 1] + "\\n")
     print(os.environ["FAKE_GH_URL"])
+if args[:2] == ["pr", "list"]:
+    if os.environ.get("FAKE_GH_LIST"):
+        print(os.environ["FAKE_GH_LIST"])
+        sys.exit(0)
+    import subprocess
+    head = args[args.index("--head") + 1]
+    try:
+        with open(os.environ["FAKE_GH_LOG"] + ".open", encoding="utf-8") as opened:
+            heads = opened.read().split()
+    except FileNotFoundError:
+        heads = []
+    found = []
+    if head in heads:
+        out = subprocess.run(
+            ["git", "ls-remote", "origin", "refs/heads/" + head],
+            capture_output=True, text=True, check=True,
+        ).stdout.split()
+        found.append({"number": 7, "url": os.environ["FAKE_GH_URL"], "headRefOid": out[0]})
+    print(json.dumps(found))
 """
 
 
@@ -300,6 +322,30 @@ class FakeGh:
     def creates(self) -> list[list[str]]:
         return [args for args in self.calls() if args[:2] == ["pr", "create"]]
 
+    def lists(self) -> list[list[str]]:
+        return [args for args in self.calls() if args[:2] == ["pr", "list"]]
+
+
+class Killed(BaseException):
+    """The engine process dying: a crash, a restart or Ctrl-C."""
+
+
+class Index:
+    """The registry. With `kill_at`, the engine dies the first time `run.json` holds that step,
+    before the registry hears of it."""
+
+    def __init__(self, registry: Registry) -> None:
+        self.registry = registry
+        self.kill_at: str | None = None
+        self.kills = 0
+
+    def upsert_run(self, run: Run) -> None:
+        if self.kill_at is not None and run.last_completed_step == self.kill_at:
+            self.kill_at = None
+            self.kills += 1
+            raise Killed
+        self.registry.upsert_run(run)
+
 
 # ------------------------------------------------------------------ the world
 
@@ -346,6 +392,7 @@ class World:
         save_run(run, self.run_folder)
         self.registry = Registry(registry_path(self.data))
         self.registry.upsert_run(run)
+        self.index = Index(self.registry)
         self.events = EventLog(self.run_folder, repo=REPO, run_id=RUN_ID, clock=self.time.clock)
         self.settings: Settings = merge_settings(
             default_settings(sys.platform),
@@ -370,9 +417,9 @@ class World:
     def flow(self) -> GitFlow:
         return GitFlow(self.fake_gh.gh)
 
-    def advance(self, agents: Agents, hooks: Hooks | None = None) -> PipelineResult:
-        """Build a pipeline from the run as saved and carry it on, as the CLI does."""
-        pipeline = Pipeline(
+    def pipeline(self, agents: Agents, hooks: Hooks | None = None) -> Pipeline:
+        """A pipeline from the run as saved, as the CLI (or a restarted engine) builds it."""
+        return Pipeline(
             load_run(self.run_folder),
             places=self.places,
             settings=self.settings,
@@ -381,12 +428,22 @@ class World:
             git=self.git,
             runner=agents,
             events=self.events,
-            registry=self.registry,
+            registry=self.index,
             clock=self.time.clock,
             sleep=self.time.sleep,
             hooks=hooks or self.flow(),
         )
-        return asyncio.run(pipeline.advance())
+
+    def advance(self, agents: Agents, hooks: Hooks | None = None) -> PipelineResult:
+        """Build a pipeline from the run as saved and carry it on, as the CLI does."""
+        return asyncio.run(self.pipeline(agents, hooks).advance())
+
+    def killed_then_recovered(self, agents: Agents, hooks: Hooks | None = None) -> Run:
+        """Carry the run on until the engine dies, then recover it with a new pipeline (as
+        `factory resume` does) until it waits or stops."""
+        with pytest.raises(Killed):
+            self.advance(agents, hooks)
+        return asyncio.run(self.pipeline(agents, hooks).recover()).run
 
     def push_main(self, files: dict[str, str]) -> str:
         """Move main on the remote: commit `files` from the second clone. Returns the commit."""
@@ -1114,3 +1171,118 @@ def test_a_test_lock_broken_before_the_merge_time_rebase_needs_you(world_at: Mak
     assert done.run.state == "needs_you"
     assert "test lock fails before the rebase" in world.needs_you_reasons()[-1]
     assert world.fake_gh.merges() == []
+
+
+# ------------------------------------------------------------------ killed and recovered
+
+
+class Dies:
+    """Wraps a function of `merge` so the engine dies at its first call: before it runs, or
+    right after it returns (`after`)."""
+
+    def __init__(self, func: Callable[..., object], *, after: bool) -> None:
+        self.func = func
+        self.after = after
+        self.calls = 0
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        self.calls += 1
+        if self.calls == 1 and not self.after:
+            raise Killed
+        done = self.func(*args, **kwargs)
+        if self.calls == 1:
+            raise Killed
+        return done
+
+
+def test_an_update_killed_after_its_rebase_finishes_the_lock_and_tests_on_resume(
+    world_at: Maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = world_at("testing")
+    hooks = MovingMain(world, MAIN_EDIT)  # main changes a test file the tester changed too
+    agents = Agents([tester_editing_calc_tests(), builder(), reviewer()])
+    # The engine dies after the clean rebase, before the test lock follows it.
+    monkeypatch.setattr(merge, "rebase_tester_files", Dies(merge.rebase_tester_files, after=False))
+
+    run = world.killed_then_recovered(agents, hooks)
+
+    # Not the pre-rebase check against the old lock (which would need you): the lock follows
+    # the finished rebase and the tests run on it.
+    assert run.state == "awaiting_merge"
+    assert world.needs_you_reasons() == []
+    rebased = sh(world.worktree, "rev-parse", "HEAD:tests/test_calc.py", env=world.env)
+    assert lock(world)["tests/test_calc.py"] == rebased
+    assert summary(world.run_folder).count(f"gate {TEST_LOCK_GATE} pass") == 1
+
+
+def test_a_finished_rebase_that_isnt_the_worktrees_head_after_a_kill_needs_you(
+    world_at: Maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = world_at("testing")
+    hooks = MovingMain(world, UNRELATED_ON_MAIN)
+    monkeypatch.setattr(merge, "rebase_tester_files", Dies(merge.rebase_tester_files, after=False))
+    agents = Agents([tester(), builder()])
+    with pytest.raises(Killed):
+        world.advance(agents, hooks)
+    assert hooks.before is not None
+    sh(world.worktree, "reset", "-q", "--hard", hooks.before, env=world.env)  # not as left
+
+    done = asyncio.run(world.pipeline(agents, hooks).recover())
+
+    assert done.run.state == "needs_you"
+    assert "isn't what the engine left" in world.needs_you_reasons()[-1]
+
+
+def test_a_pull_request_opened_before_a_kill_is_adopted_not_opened_again(
+    world_at: Maker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = world_at("testing")
+    # `gh pr create` opened it, and the engine died before saving its number.
+    monkeypatch.setattr(merge, "open_pr", Dies(merge.open_pr, after=True))
+    agents = Agents([tester(), builder(), reviewer()])
+
+    run = world.killed_then_recovered(agents)
+
+    assert run.state == "awaiting_merge"
+    assert len(world.fake_gh.creates()) == 1
+    pr = run.pull_request
+    assert pr is not None and (pr.number, pr.url, pr.head) == (7, PR_URL, world.head())
+    assert len(agents.of("reviewer")) == 1  # the review that passed isn't run again
+
+
+def test_an_open_pull_request_at_another_head_is_neither_adopted_nor_opened_again(
+    world_at: Maker,
+) -> None:
+    world = world_at("testing")
+    other = "f" * 40
+    listed = [{"number": 9, "url": "https://github.com/kunal/pilot/pull/9", "headRefOid": other}]
+    world.fake_gh.env["FAKE_GH_LIST"] = json.dumps(listed)
+
+    done = world.advance(Agents([tester(), builder(), reviewer()]))
+
+    assert done.run.state == "needs_you"
+    assert "#9" in world.needs_you_reasons()[-1]
+    assert world.fake_gh.creates() == []
+    assert done.run.pull_request is None
+
+
+def test_tests_failing_after_a_resolution_still_need_you_when_killed_at_the_failed_step(
+    world_at: Maker,
+) -> None:
+    world = world_at("testing")
+    hooks = MovingMain(world, SUB_ON_MAIN)
+    wrong = ADD + SUB + "\n\ndef mul(a, b):\n    return a + b\n"  # resolved, but wrong
+    agents = Agents([tester(), builder(), builder(wrong)])
+    world.index.kill_at = "builder 2 failed"
+    with pytest.raises(Killed):
+        world.advance(agents, hooks)
+
+    # The stop is saved with the failed step, so a restart finds the run waiting for you,
+    # not a builder retry to start.
+    run = world.run()
+    assert world.index.kills == 1
+    assert (run.state, run.last_completed_step) == ("needs_you", "builder 2 failed")
+    with pytest.raises(PipelineError, match="nothing to recover"):
+        asyncio.run(world.pipeline(Agents([]), hooks).recover())
+    assert run.attempts["builder"] == 2
+    assert "tests still fail after the builder resolved" in world.needs_you_reasons()[-1]

@@ -9,7 +9,10 @@ The pipeline saves the last completed step of each stage attempt in `run.json` (
   role's session before it began, whether it resumed that session, whether a rebase waited for
   the builder, and the reviewer's try in its review round.
 - `retry` (`RetryNote`): what the next attempt is told. Written before a failed gate's step is
-  saved, and when a review or a hook sends the run back to the builder.
+  saved, and when a review or a hook sends the run back to the builder. A failed step that stops
+  the run for you is saved with the stop, so a restart never makes it a retry.
+- `update` (`UpdateProgress`): the update's rebase, once started and once finished, so a restart
+  after a finished rebase goes on to the test lock and the tests instead of starting again.
 
 `resume_point` says where a run that a crash or Ctrl-C left in `pending` or a working state
 carries on; `Pipeline.recover` acts on it. By the last completed step of the run's stage:
@@ -170,11 +173,21 @@ class RetryNote(_Model):
     message: str | None = None
 
 
+class UpdateProgress(_Model):
+    """How far the update before review got with its rebase onto main: started from `base`,
+    and finished without conflicts at `rebased` (None until it has)."""
+
+    base: str
+    rebased: str | None = None
+
+
 class Recovery(_Model):
-    """`attempt.json`: the attempt in flight or last run, and what the next attempt is told."""
+    """`attempt.json`: the attempt in flight or last run, what the next attempt is told, and
+    the update's rebase progress."""
 
     attempt: AttemptRecord | None = None
     retry: RetryNote | None = None
+    update: UpdateProgress | None = None
 
 
 def load_recovery(folder: Path) -> Recovery:

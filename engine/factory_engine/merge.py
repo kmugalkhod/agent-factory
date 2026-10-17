@@ -38,6 +38,7 @@ from factory_engine.errors import (
     GitError,
     GitHubError,
     MergeError,
+    RunFileError,
 )
 from factory_engine.events import Decision, GateResult, read_events
 from factory_engine.gates.build import check_lock
@@ -53,7 +54,15 @@ from factory_engine.git_ops import (
     run_branch,
     worktree_changes,
 )
-from factory_engine.github import GitHub, MergeApproval, PullRequest, merge_pr, open_pr, pr_body
+from factory_engine.github import (
+    GitHub,
+    MergeApproval,
+    PullRequest,
+    merge_pr,
+    open_pr,
+    open_prs,
+    pr_body,
+)
 from factory_engine.pipeline import (
     REVIEW_FILE,
     UPDATE_GATE,
@@ -64,6 +73,7 @@ from factory_engine.pipeline import (
     locked_conflict_reason,
     locked_conflicts,
 )
+from factory_engine.recovery import UpdateProgress
 from factory_engine.run import PullRequestInfo, Run
 
 MERGE_UPDATE_GATE = "merge.update"
@@ -166,22 +176,47 @@ class GitFlow(Hooks):
     # ------------------------------------------------------------------ update before review
 
     async def update(self, pipeline: Pipeline, run: Run) -> Run:
+        """Rebase onto main, then rerun the tests. The rebase's progress is saved (started from
+        which head, finished at which), so after a restart a finished rebase goes on to the
+        test lock and the tests; a worktree that doesn't match what was saved needs you."""
         git, worktree = pipeline.git, pipeline.places.worktree
         run = pipeline.run
+        context = f"after the rebase onto {self.base}"
         try:
-            if rebase_in_progress(git, worktree, run_id=run.id, slug=run.slug):
+            saved = pipeline.update_progress()
+            rebasing = rebase_in_progress(git, worktree, run_id=run.id, slug=run.slug)
+            head = git.out(["rev-parse", "HEAD"], worktree)
+            if saved is not None and saved.rebased is not None:
+                if rebasing or head != saved.rebased:
+                    return pipeline.stop_for_you(None, _unlike_saved(saved.rebased, head, rebasing))
+                tested = _retest(pipeline, UPDATE_GATE, context)
+                return tested if isinstance(tested, Run) else pipeline.run
+            if rebasing:
                 rebase_abort(git, worktree, run_id=run.id, slug=run.slug)  # start it again
+                head = git.out(["rev-parse", "HEAD"], worktree)
+            if saved is not None and head != saved.base:
+                return pipeline.stop_for_you(
+                    None,
+                    f"the rebase onto {self.base} started from {saved.base} before the engine "
+                    f"stopped, and the worktree's head is now {head}, so whether it finished "
+                    "can't be told. Check the worktree's branch, then decide the run.",
+                )
             problem = _before_rebase(pipeline)
             if problem is not None:
                 return pipeline.stop_for_you(None, f"the run isn't rebased onto main: {problem}")
+            progress = UpdateProgress(base=head)
+            pipeline.save_update_progress(progress)
             step = rebase_onto_main(
                 git, worktree, run_id=run.id, slug=run.slug, remote=self.remote, base=self.base
             )
-        except (GitError, GateError) as err:
+            if not step.conflicts:
+                rebased = git.out(["rev-parse", "HEAD"], worktree)
+                pipeline.save_update_progress(progress.model_copy(update={"rebased": rebased}))
+        except (GitError, GateError, RunFileError) as err:
             return pipeline.stop_for_you(None, f"the rebase onto {self.base} couldn't run: {err}")
         if step.conflicts:
             return self._conflicts(pipeline, run, step.conflicts)
-        tested = _retest(pipeline, UPDATE_GATE, f"after the rebase onto {self.base}")
+        tested = _retest(pipeline, UPDATE_GATE, context)
         return tested if isinstance(tested, Run) else pipeline.run
 
     def _conflicts(self, pipeline: Pipeline, run: Run, files: Sequence[str]) -> Run:
@@ -244,25 +279,55 @@ class GitFlow(Hooks):
         if run.pull_request is not None:
             info = run.pull_request.model_copy(update={"head": head, "rebased_from": None})
         else:
-            try:
-                pr = open_pr(
-                    self.gh,
-                    places.repo,
-                    places.run_folder,
-                    run_id=run.id,
-                    slug=run.slug,
-                    title=pr_title(run),
-                    body=pr_text(run, places.run_folder),
-                    base=self.base,
-                )
-            except GitHubError as err:
-                return pipeline.stop_for_you(
-                    None, f"the run branch is pushed, but the pull request wasn't opened: {err}"
-                )
+            # One opened before the engine stopped, its number not saved, is adopted.
+            pr = self._open_already(pipeline, run, head)
+            if isinstance(pr, Run):
+                return pr
+            if pr is None:
+                try:
+                    pr = open_pr(
+                        self.gh,
+                        places.repo,
+                        places.run_folder,
+                        run_id=run.id,
+                        slug=run.slug,
+                        title=pr_title(run),
+                        body=pr_text(run, places.run_folder),
+                        base=self.base,
+                    )
+                except GitHubError as err:
+                    return pipeline.stop_for_you(
+                        None, f"the run branch is pushed, but the pull request wasn't opened: {err}"
+                    )
             info = PullRequestInfo(number=pr.number, url=pr.url, head=head)
         return pipeline.record(
             run.model_copy(update={"pull_request": info, "merge_approval": None})
         )
+
+    def _open_already(self, pipeline: Pipeline, run: Run, head: str) -> PullRequest | Run | None:
+        """A pull request from the run branch that is already open (`gh pr create` ran before
+        the engine stopped, and its number wasn't saved): adopted when its head is the pushed
+        `head`. None when there is none; the run, stopped for you, when one can't be adopted."""
+        places = pipeline.places
+        try:
+            found = open_prs(self.gh, places.repo, run_id=run.id, slug=run.slug, base=self.base)
+        except GitHubError as err:
+            return pipeline.stop_for_you(
+                None,
+                f"the run branch is pushed, but whether a pull request is already open for it "
+                f"can't be told: {err}",
+            )
+        if not found:
+            return None
+        if len(found) > 1 or found[0].head != head:
+            listed = ", ".join(f"#{pr.number} at {pr.head}" for pr in found)
+            return pipeline.stop_for_you(
+                None,
+                f"pull requests from the run branch are already open ({listed}), not one at the "
+                f"pushed head {head}, so none was opened or adopted. Close the extra ones or "
+                "decide the run.",
+            )
+        return found[0]
 
     # ------------------------------------------------------------------ merge
 
@@ -408,6 +473,16 @@ def _before_rebase(pipeline: Pipeline) -> str | None:
             "the tester, changed or gone."
         )
     return None
+
+
+def _unlike_saved(rebased: str, head: str, rebasing: bool) -> str:
+    """Why a rebase saved as finished can't be taken up after a restart."""
+    now = "a rebase waits in the worktree" if rebasing else f"the worktree's head is {head}"
+    return (
+        f"the rebase onto main had finished at {rebased} before the engine stopped, but {now}, "
+        "so the worktree isn't what the engine left. Check the worktree's branch, then decide "
+        "the run."
+    )
 
 
 def _retest(pipeline: Pipeline, gate: str, context: str) -> str | Run:

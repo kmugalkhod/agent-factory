@@ -129,6 +129,7 @@ from factory_engine.recovery import (
     SavedBaseline,
     Step,
     StepName,
+    UpdateProgress,
     load_recovery,
     resume_point,
     save_recovery,
@@ -334,6 +335,16 @@ class Pipeline:
         """Save `run` (`run.json` and the registry) as the pipeline's run; returns it."""
         self._persist(run)
         return run
+
+    def update_progress(self) -> UpdateProgress | None:
+        """How far the update's rebase got before a restart (`attempt.json`); None if no
+        rebase of this update was started."""
+        return load_recovery(self.places.run_folder).update
+
+    def save_update_progress(self, progress: UpdateProgress | None) -> None:
+        """Save how far the update's rebase got, so a restart can go on from there."""
+        saved = load_recovery(self.places.run_folder)
+        self._save_recovery(saved.model_copy(update={"update": progress}))
 
     def attempts_left(self, role: Role) -> int:
         """How many attempts `role` has left under its cap in this run."""
@@ -607,18 +618,18 @@ class Pipeline:
             retry = RetryNote(
                 role="builder", reason=outcome.reason, message=outcome.resume_message()
             )
-            if self._gate("builder", outcome.event(), retry):
+            stop: str | None = None  # a fail that stops the run for you, not a retry
+            if outcome.flagged:
+                stop = outcome.reason
+            elif resolving:
+                stop = (
+                    "the tests still fail after the builder resolved the conflicts of the rebase "
+                    f"onto main: {outcome.reason}"
+                )
+            if self._gate("builder", outcome.event(), retry, stop=stop):
                 await self._pass_stage("builder")
                 return
-            if outcome.flagged:
-                self._needs_you("builder", outcome.reason)
-                return
-            if resolving:
-                self._needs_you(
-                    "builder",
-                    "the tests still fail after the builder resolved the conflicts of the rebase "
-                    f"onto main: {outcome.reason}",
-                )
+            if stop is not None:
                 return
             reason, message = outcome.reason, outcome.resume_message()
 
@@ -696,6 +707,7 @@ class Pipeline:
     async def _update(self) -> None:
         self._take_hooked(await self._hooks.update(self, self._run), "update")
         if self._run.state == "updating":
+            self.save_update_progress(None)
             self._save(UPDATE_STEP)
             self._move("reviewing")
 
@@ -1089,14 +1101,28 @@ class Pipeline:
         self.events.append(NeedsYou(reason=reason), role=role)
         self._persist(run.model_copy(update={"pause": None}))
 
-    def _gate(self, role: Role, result: GateResult, retry: RetryNote | None = None) -> bool:
+    def _gate(
+        self,
+        role: Role,
+        result: GateResult,
+        retry: RetryNote | None = None,
+        *,
+        stop: str | None = None,
+    ) -> bool:
         """Log the gate's result and save the step; whether it passed. On a fail, `retry` (what
-        the next attempt is told) is saved first, so a restart after the step still tells it."""
+        the next attempt is told) is saved first, so a restart after the step still tells it;
+        with `stop`, the fail stops the run for you, saved in the same write as the step, so a
+        restart can't take it for a retry."""
         self.events.append(result, role=role)
-        if not result.passed and retry is not None:
+        if not result.passed and retry is not None and stop is None:
             self._save_retry(retry)
         name: StepName = "passed" if result.passed else "failed"
-        self._save(Step(role, self._attempts(role), name).label)
+        label = Step(role, self._attempts(role), name).label
+        if not result.passed and stop is not None:
+            self._run = self._run.model_copy(update={"last_completed_step": label})
+            self._needs_you(role, stop)
+            return False
+        self._save(label)
         return result.passed
 
     def _commit(self, role: Role, target: RunState | None, *, made: bool = False) -> bool:
