@@ -23,7 +23,7 @@ from factory_engine.agents.runner import AgentResult, AgentSpec, SessionRecorder
 from factory_engine.errors import AgentError
 from factory_engine.events import EventLog, Message, Tokens, read_events
 from factory_engine.registry import Registry
-from factory_engine.run import Role, Run, load_run, new_run, save_run
+from factory_engine.run import Role, Run, TokenUse, load_run, new_run, save_run
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=UTC)
 
@@ -178,6 +178,30 @@ def test_tokens_per_role_and_attempt_equal_the_scripted_totals(
     indexed = world.registry.get_run("repo-a", 3)
     assert indexed is not None
     assert indexed.metrics.tokens == saved.metrics.tokens
+
+
+def test_each_result_is_kept_as_dated_token_use_of_its_attempt(
+    world: World, tmp_path: Path
+) -> None:  # 2.27
+    world.play(
+        FakeAgentRunner([[result("p", 100, 20, cache_read=7)]]),
+        _spec(tmp_path, "planner", 1),
+        "planner",
+        1,
+    )
+    world.play(
+        FakeAgentRunner([[result("b", 30, 4, cache_creation=2)]]),
+        _spec(tmp_path, "builder", 2),
+        "builder",
+        2,
+    )
+    saved = load_run(world.folder)
+    assert saved.metrics.token_use == [
+        TokenUse(role="planner", attempt=1, at=NOW, input=100, output=20, cache_read=7),
+        TokenUse(role="builder", attempt=2, at=NOW, input=30, output=4, cache_creation=2),
+    ]
+    assert saved.metrics.tokens == {"planner": 127, "builder": 36}
+    assert world.registry.get_run("repo-a", 3) == saved
 
 
 def test_outcome_usage_is_this_attempts_total(world: World, tmp_path: Path) -> None:
