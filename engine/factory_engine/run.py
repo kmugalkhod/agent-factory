@@ -40,6 +40,8 @@ PauseReason = Literal["usage_limit", "turn_cap", "time_cap"]
 NonNegative = Annotated[int, Field(ge=0)]
 
 RUN_FILE = "run.json"
+ATTEMPT_FILE = "attempt.json"
+"""The attempt in flight and what the next one is told, for crash recovery (`recovery.py`)."""
 CLAIMS = ".ids"
 CLAIMED_ID = re.compile(r"\d+")
 

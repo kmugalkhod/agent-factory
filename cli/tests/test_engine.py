@@ -357,6 +357,26 @@ def test_resume_carries_an_interrupted_stage_on(world: World) -> None:
     assert "Carry on." in world.planner.specs[-1].prompt
 
 
+def test_resume_carries_an_interrupted_run_on_from_its_last_completed_step(
+    world: World,
+) -> None:
+    world.engine().start_feature("Add mul to calc", slug=None)
+    # As a crash leaves it after the plan's gate passed, before the engine moved the run on.
+    run = load_run(world.folder())
+    set_state(world, "planning")
+    save_run(
+        load_run(world.folder()).model_copy(update={"last_completed_step": "planner 1 passed"}),
+        world.folder(),
+    )
+
+    done = world.engine().resume(0, note=None)
+
+    assert done.stop == "plan_approval"
+    assert len(world.planner.specs) == 1  # the plan that passed isn't made again
+    assert done.run.attempts == run.attempts == {"planner": 1}
+    assert done.run.last_completed_step == "planner 1 committed"
+
+
 def test_resume_carries_on_a_paused_attempt_in_its_session(world: World) -> None:
     world.engine().start_feature("Add mul to calc", slug=None)
     pause = Pause(

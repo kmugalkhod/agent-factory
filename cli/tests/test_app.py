@@ -414,6 +414,13 @@ def test_status_lists_runs_with_state_stage_attempts_and_tokens() -> None:
     assert "1,234" in lines[1]
     assert "4-fix" in lines[2]
     assert "interrupted" in lines[2]  # in a working state, but no factory process has it
+    assert "factory resume <run>" in lines[3]  # how an interrupted run carries on
+
+
+def test_status_says_nothing_about_resuming_when_no_run_is_interrupted() -> None:
+    done = invoke(Stub(rows=[RunRow(make_run("building"), running=True)]), "status")
+
+    assert "factory resume" not in done.output
 
 
 def test_status_all_lists_every_repo() -> None:

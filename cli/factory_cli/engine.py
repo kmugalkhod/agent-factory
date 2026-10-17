@@ -8,9 +8,10 @@ builds the engine's objects: the registry, the run's event log, intake, the deci
 pipeline in the foreground until the run waits for you or stops.
 
 A process holds the run's lock (`lock.py`) while it decides on a run or drives it, so two
-factory processes never write the same run. Ctrl-C stops the pipeline; the run stays in the
-state it was in, and `resume` carries it on with a new attempt of that stage. A paused run
-instead carries on the attempt it paused in, in the same session (`Pipeline.resume_paused`).
+factory processes never write the same run. Ctrl-C or a crash stops the pipeline; the run stays
+in the state it was in, and `resume` carries it on from its last completed step
+(`Pipeline.recover`, task 2.24). A paused run instead carries on the attempt it paused in, in
+the same session (`Pipeline.resume_paused`).
 """
 
 import asyncio
@@ -255,8 +256,10 @@ class Engine:
                     registry=registry,
                     events=self._events(run, folder),
                     note=note,
-                    # A paused run carries on the attempt it paused in, in the same session.
+                    # A paused run carries on the attempt it paused in, in the same session;
+                    # an interrupted one from its last completed step.
                     continue_paused=run.state == "paused",
+                    recover=run.state != "paused",
                 )
 
     # ------------------------------------------------------------------ status and attach
@@ -342,6 +345,7 @@ class Engine:
         events: EventLog,
         note: str | None,
         continue_paused: bool = False,
+        recover: bool = False,
     ) -> Outcome:
         """Run the pipeline in the foreground until the run waits for you or stops."""
         pipeline = self._pipeline(
@@ -356,6 +360,8 @@ class Engine:
         try:
             if continue_paused:
                 result = asyncio.run(pipeline.resume_paused(note=note))
+            elif recover:
+                result = asyncio.run(pipeline.recover(note=note))
             else:
                 result = asyncio.run(pipeline.advance(note=note))
         except KeyboardInterrupt:

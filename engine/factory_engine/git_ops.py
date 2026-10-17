@@ -244,6 +244,11 @@ def create_worktree(
     return folder
 
 
+def stage_message(run_id: int, role: Role, attempt: int) -> str:
+    """The message of a stage's commit (`commit_stage`)."""
+    return f"factory(run-{run_id}): {role} attempt {attempt}"
+
+
 def commit_stage(
     git: Git, worktree: Path, *, run_id: int, slug: str, role: Role, attempt: int
 ) -> str:
@@ -254,7 +259,7 @@ def commit_stage(
         raise GitError(f"attempt {attempt} is invalid; attempts count from 1.")
     _require_branch(git, worktree, run_branch(run_id, slug))
     git.run(["add", "--all", "--", "."], worktree)
-    message = f"factory(run-{run_id}): {role} attempt {attempt}"
+    message = stage_message(run_id, role, attempt)
     git.run(["commit", "--allow-empty", "--no-verify", "-m", message], worktree)
     return git.out(["rev-parse", "HEAD"], worktree)
 

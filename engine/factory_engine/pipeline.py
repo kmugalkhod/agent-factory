@@ -23,8 +23,9 @@ until it waits for you or stops. One attempt of a stage is:
      cap; a malformed `review.md` gives the reviewer a new session.
    A role that reaches its cap stops the run for you, as does a gate that can't run.
 
-`run.json` holds the last completed step after every step (`Step`), so a restart (task 2.24)
-can tell where the run stopped.
+`run.json` holds the last completed step after every step (`Step`), and `attempt.json` the
+attempt in flight (`recovery.py`), so a restart can tell where the run stopped:
+`Pipeline.recover` carries an interrupted run on from there (task 2.24).
 
 Where later tasks plug in:
 
@@ -42,20 +43,19 @@ Where later tasks plug in:
   you. `Hooks.publish` runs once the review passes, before `awaiting_merge` (push and pull
   request). `Hooks.merge` runs in `awaiting_merge` only once your approval is recorded
   (`decisions.approve_merge`); the approval is used once, whatever the merge's outcome.
-- Feedback and crash recovery (2.23, 2.24): `advance` starts from whatever working state the run
-  is in, with a new attempt of that stage.
+- Feedback (2.23): `advance` starts from whatever working state the run is in, with a new
+  attempt of that stage. Crash recovery (2.24) is `recover`.
 """
 
 import contextlib
 import os
-import re
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import Literal, get_args
 
 from claude_agent_sdk import ClaudeSDKError
 
@@ -86,8 +86,16 @@ from factory_engine.errors import (
     GateError,
     GitError,
     PipelineError,
+    RunFileError,
 )
-from factory_engine.events import EventLog, GateResult, NeedsYou, StageFinished, StageStarted
+from factory_engine.events import (
+    EventLog,
+    GateResult,
+    NeedsYou,
+    StageFinished,
+    StageStarted,
+    read_events,
+)
 from factory_engine.gates.build import BuildGateOutcome, check_build
 from factory_engine.gates.plan import PLAN_FILE, PlanCheck, check_plan
 from factory_engine.gates.post_stage import (
@@ -109,8 +117,22 @@ from factory_engine.git_ops import (
     rebase_abort,
     rebase_continue,
     rebase_in_progress,
+    stage_message,
 )
 from factory_engine.providers import Profile
+from factory_engine.recovery import (
+    CRASH_PROMPT,
+    UPDATE_STEP,
+    AttemptRecord,
+    Recovery,
+    RetryNote,
+    SavedBaseline,
+    Step,
+    StepName,
+    load_recovery,
+    resume_point,
+    save_recovery,
+)
 from factory_engine.run import Pause, Role, Run, RunState
 from factory_engine.safety.hook import HookPolicy, make_safety_hook
 from factory_engine.safety.secrets import redact
@@ -129,19 +151,20 @@ RUNNER_ERRORS: tuple[type[Exception], ...] = (ClaudeSDKError, AgentError, OSErro
 """What a failing agent runner raises: the SDK's errors (a dropped connection, the CLI missing
 or exiting), the runner's own `AgentError` and OS errors (network, process, pipes). Anything
 else that escapes an agent run is an engine bug and is raised."""
-UPDATE_STEP = "update"
-"""The step label saved once the update before review (`Hooks.update`) is done."""
 UPDATE_GATE = "update"
 """The `gate_result` of the update before review: the rebase and the tests rerun after it."""
 TEST_LOCK_GATE = "update.test_lock"
 """The `gate_result` saying the test lock now follows main's version of a tester's file."""
 
-StepName = Literal["started", "agent", "checked", "passed", "failed", "committed"]
 PlanStop = Literal["plan_approval", "questions", "split"]
 Stop = PlanStop | Literal["needs_you", "paused", "awaiting_merge", "ended"]
 ROLES: tuple[Role, ...] = get_args(Role)
-STEP_NAMES: tuple[StepName, ...] = get_args(StepName)
-_ATTEMPT = re.compile(r"[1-9][0-9]{0,8}")
+_NEXT: Mapping[Role, RunState] = {
+    "planner": "awaiting_plan_approval",
+    "tester": "building",
+    "builder": "updating",
+}
+"""Where a passing stage goes once committed; the reviewer's stage publishes first."""
 _STOPS: Mapping[RunState, Stop] = {
     "needs_you": "needs_you",
     "paused": "paused",
@@ -155,32 +178,6 @@ def plan_stop(plan: PlanCheck) -> PlanStop:
     if plan.split:
         return "split"
     return "questions" if plan.questions else "plan_approval"
-
-
-@dataclass(frozen=True)
-class Step:
-    """A completed step of one stage attempt, saved in `run.json` as its `label`:
-    `started` (attempt counted), `agent` (the agent finished), `checked` (post-stage check
-    passed), `passed` or `failed` (the gate), `committed` (the stage commit)."""
-
-    role: Role
-    attempt: int
-    name: StepName
-
-    @property
-    def label(self) -> str:
-        return f"{self.role} {self.attempt} {self.name}"
-
-    @classmethod
-    def parse(cls, label: str | None) -> "Step | None":
-        """The step a label names; None for no label, `UPDATE_STEP` or anything else."""
-        parts = (label or "").split(" ")
-        if len(parts) != 3:
-            return None
-        role, attempt, name = parts
-        if role not in ROLES or name not in STEP_NAMES or not _ATTEMPT.fullmatch(attempt):
-            return None
-        return cls(cast(Role, role), int(attempt), cast(StepName, name))
 
 
 @dataclass(frozen=True)
@@ -245,6 +242,21 @@ class _ReviewDiff:
     path: Path
 
 
+@dataclass(frozen=True)
+class _Carry:
+    """An attempt that carries on instead of a new one starting: one that paused
+    (`resume_paused`) or one a crash or Ctrl-C interrupted (`recover`)."""
+
+    role: Role
+    attempt: int
+    pause: Pause | None = None  # a paused attempt: its session carries on (`resume_spec`)
+    note: str | None = None  # your note for the paused attempt
+    record: AttemptRecord | None = None  # an interrupted attempt's record
+    session: str | None = None  # the interrupted attempt's own session, to carry on
+    prompt: str | None = None  # what the interrupted attempt's agent is told now
+    finished: StepName | None = None  # `agent` or `checked`: its agent had finished
+
+
 class Pipeline:
     """Runs one run's stages. Everything it uses is passed in: the run's places, its effective
     settings (bootstrap applied for run 0), the provider profile, the engine's environment
@@ -291,8 +303,9 @@ class Pipeline:
         self._watchdog = Watchdog(Limits.from_caps(settings.caps), clock=clock, sleep=sleep)
         self._note: str | None = None
         self._builder_message: str | None = None
-        self._continuing: Pause | None = None  # a paused attempt the next attempt carries on
-        self._continue_note: str | None = None  # your note for the attempt that carries on
+        self._carry: _Carry | None = None  # the attempt the next attempt of its role carries on
+        self._retry: RetryNote | None = None  # what a recovered run's next attempt is told
+        self._review_tries = 0  # the reviewer's tries already used in a recovered review round
 
     @property
     def run(self) -> Run:
@@ -300,8 +313,10 @@ class Pipeline:
         return self._run
 
     def tell_builder(self, message: str) -> None:
-        """What the builder is told when it next resumes (a hook's reason to send it back)."""
+        """What the builder is told when it next resumes (a hook's reason to send it back).
+        Saved in `attempt.json` too, so a restart still tells it."""
         self._builder_message = message
+        self._save_retry(RetryNote(role="builder", message=message))
 
     # ------------------------------------------------------------------ for the hooks
 
@@ -382,15 +397,88 @@ class Pipeline:
         )
         if pause is None or pause.session_id is None:
             return await self.advance(note=note)
-        self._continuing, self._continue_note = pause, note
+        self._carry = _Carry(pause.role, pause.attempt, pause=pause, note=note)
         try:
             return await self.advance()
         finally:
-            self._continuing = self._continue_note = None
+            self._carry = None
+
+    async def recover(self, *, note: str | None = None) -> PipelineResult:
+        """Carry on a run that a crash or Ctrl-C left in pending or a working state, from the
+        last completed step in its `run.json` (`recovery.resume_point`): no stage that passed
+        runs again. An attempt whose agent was working is checked against its saved baseline,
+        then carries on in its own session, still the same attempt; one whose agent had
+        finished goes on to its check or gate. `note` goes to the first agent that runs."""
+        try:
+            saved = load_recovery(self.places.run_folder)
+        except RunFileError as err:
+            self._needs_you(self._run.stage, f"can't tell where the run stopped: {err}")
+            return self._result()
+        step = Step.parse(self._run.last_completed_step)
+        point = resume_point(self._run, saved, agent_started=self._agent_started(step))
+        self._retry, self._review_tries = saved.retry, point.review_tries
+        record = point.record
+        try:
+            if point.action == "redo" and step is not None:
+                # Counted, but its agent never started: the same attempt starts again.
+                attempts = {**self._run.attempts, step.role: step.attempt - 1}
+                self._run = self._run.model_copy(update={"attempts": attempts})
+            elif point.action == "carry_on" and record is not None:
+                session = record.own_session(self._run)
+                prompt = crash_prompt(record.prompt) if session else record.prompt
+                self._carry = _Carry(
+                    record.role,
+                    record.attempt,
+                    record=record,
+                    session=session,
+                    prompt=_with_note(prompt, note),
+                )
+                note = None
+            elif point.action in ("check", "gate") and record is not None and step is not None:
+                self._carry = _Carry(record.role, record.attempt, record=record, finished=step.name)
+            elif point.action == "commit" and step is not None:
+                committed = self._stage_committed(step)
+                if committed is not None:
+                    await self._pass_stage(step.role, committed=committed)
+            elif point.action == "publish":
+                await self._publish()
+            elif point.action == "review":
+                self._move("reviewing")
+            return await self.advance(note=note)
+        finally:
+            self._carry, self._retry, self._review_tries = None, None, 0
+
+    def _agent_started(self, step: Step | None) -> bool:
+        """Whether a `stage_started` event names `step`'s attempt: its agent was started."""
+        if step is None or step.name != "started":
+            return False
+        return any(
+            isinstance(event.body, StageStarted)
+            and (event.body.stage, event.body.attempt) == (step.role, step.attempt)
+            for event in read_events(self.places.run_folder)
+        )
+
+    def _stage_committed(self, step: Step) -> bool | None:
+        """Whether the worktree's head is already `step`'s stage commit (the engine died after
+        committing, before it saved the step); None when that can't be told (needs you)."""
+        try:
+            subject = self.git.out(["log", "-1", "--format=%s", "HEAD"], self.places.worktree)
+        except GitError as err:
+            self._needs_you(step.role, f"can't tell whether the {step.role} was committed: {err}")
+            return None
+        return subject == stage_message(self._run.id, step.role, step.attempt)
 
     def _continues(self, role: Role) -> bool:
-        """Whether `role`'s next attempt carries on a paused one."""
-        return self._continuing is not None and self._continuing.role == role
+        """Whether `role`'s next attempt carries on a paused or interrupted one."""
+        return self._carry is not None and self._carry.role == role
+
+    def _seeded(self, role: Role) -> RetryNote | None:
+        """What a recovered run's next attempt of `role` is told, once."""
+        retry = self._retry
+        if retry is None or retry.role != role:
+            return None
+        self._retry = None
+        return retry
 
     def _handler(
         self, handlers: Mapping[RunState, Callable[[], Awaitable[None]]]
@@ -414,25 +502,30 @@ class Pipeline:
     # ------------------------------------------------------------------ the stages
 
     async def _plan(self) -> None:
-        reason: str | None = None
+        seeded = self._seeded("planner")
+        reason = seeded.reason if seeded else None
         while self._may_try("planner", reason):
-            previous = None if self._continues("planner") else self._set_plan_aside()
-            if previous is False:
-                return
-            prompt = _planner_prompt(self.places, reason, self._take_note(), previous)
+            prompt: str | None = None
+            if not self._continues("planner"):
+                previous = self._set_plan_aside()
+                if previous is False:
+                    return
+                prompt = _planner_prompt(self.places, reason, self._take_note(), previous)
             if await self._attempt("planner", prompt, resume=False) is None:
                 return
             check = check_plan(self.places.run_folder / PLAN_FILE)
-            if self._gate("planner", check.event()):
-                if self._commit("planner"):
-                    self._move("awaiting_plan_approval")
+            if self._gate("planner", check.event(), RetryNote(role="planner", reason=check.reason)):
+                await self._pass_stage("planner")
                 return
             reason = check.reason
 
     async def _test(self) -> None:
-        reason: str | None = None
+        seeded = self._seeded("tester")
+        reason = seeded.reason if seeded else None
         while self._may_try("tester", reason):
-            prompt = _tester_prompt(self.places, reason, self._take_note())
+            prompt = None
+            if not self._continues("tester"):
+                prompt = _tester_prompt(self.places, reason, self._take_note())
             baseline = await self._attempt("tester", prompt, resume=False)
             if baseline is None:
                 return
@@ -452,9 +545,10 @@ class Pipeline:
             except (ConfigError, GateError, GitError) as err:
                 self._needs_you("tester", f"the tester gate couldn't run: {err}")
                 return
-            if self._gate("tester", outcome.event()):
-                if self._commit("tester"):
-                    self._move("building")
+            if self._gate(
+                "tester", outcome.event(), RetryNote(role="tester", reason=outcome.reason)
+            ):
+                await self._pass_stage("tester")
                 return
             reason = outcome.reason
 
@@ -464,20 +558,25 @@ class Pipeline:
             self._give_up_rebase()
 
     async def _build_attempts(self) -> None:
+        seeded = self._seeded("builder")
+        if seeded is not None and self._builder_message is None:
+            self._builder_message = seeded.message
         message, self._builder_message = self._builder_message, None
-        reason: str | None = None
+        reason = seeded.reason if seeded else None
         while self._may_try("builder", reason):
             done = self._attempts("builder")
-            archive = done > 0 and not self._continues("builder")
+            carry = self._carry if self._continues("builder") else None
             kept = f"handoff-builder-{done}.md"
-            if archive and not self._archive(HANDOFF_BUILDER, kept, "builder"):
+            if done > 0 and carry is None and not self._archive(HANDOFF_BUILDER, kept, "builder"):
                 return
             resolving = self._rebasing()
             if resolving is None:
                 return
             resume = done > 0 and "builder" in self._run.session_ids
-            prompt = _builder_prompt(self.places, message, self._take_note(), resume=resume)
-            baseline = await self._attempt("builder", prompt, resume=resume)
+            prompt = None
+            if carry is None:
+                prompt = _builder_prompt(self.places, message, self._take_note(), resume=resume)
+            baseline = await self._attempt("builder", prompt, resume=resume, resolving=resolving)
             if baseline is None:
                 return
             base = baseline.base
@@ -487,18 +586,29 @@ class Pipeline:
                     return
                 if isinstance(carried, tuple):
                     reason = f"the rebase onto main still has conflicts, in {', '.join(carried)}."
-                    self._gate("builder", GateResult(gate=UPDATE_GATE, passed=False, reason=reason))
                     message = conflict_message(self.places, carried)
+                    result = GateResult(gate=UPDATE_GATE, passed=False, reason=reason)
+                    self._gate(
+                        "builder", result, RetryNote(role="builder", reason=reason, message=message)
+                    )
                     continue
                 base = carried
+            elif carry is not None and carry.finished and carry.record and carry.record.resolving:
+                # The engine had carried the rebase on before it died: go on from its result.
+                rebased = self._rebased_head()
+                if rebased is None:
+                    return
+                base = rebased
             try:
                 outcome = self.build_gate(base)
             except (ConfigError, GateError, GitError) as err:
                 self._needs_you("builder", f"the builder gate couldn't run: {err}")
                 return
-            if self._gate("builder", outcome.event()):
-                if self._commit("builder"):
-                    self._move("updating")
+            retry = RetryNote(
+                role="builder", reason=outcome.reason, message=outcome.resume_message()
+            )
+            if self._gate("builder", outcome.event(), retry):
+                await self._pass_stage("builder")
                 return
             if outcome.flagged:
                 self._needs_you("builder", outcome.reason)
@@ -544,6 +654,21 @@ class Pipeline:
             self._needs_you("builder", f"the rebase onto main couldn't carry on: {err}")
             return None
 
+    def _rebased_head(self) -> str | None:
+        """After a restart: the head of the rebase the engine finished before it died, with the
+        test lock following it (as `_carry_rebase_on` does); None when that failed."""
+        places = self.places
+        try:
+            rebased = rebase_tester_files(self.git, places.run_folder, places.worktree)
+            if rebased:
+                self.events.append(lock_rebased(rebased), role="builder")
+            return self.git.out(["rev-parse", "HEAD"], places.worktree)
+        except (GitError, GateError) as err:
+            self._needs_you(
+                "builder", f"can't read the rebase onto main the engine finished: {err}"
+            )
+            return None
+
     def _give_up_rebase(self) -> None:
         """A run that stops for you mid-rebase gives the rebase up, so the run branch is back
         where it was before the update and the worktree isn't left half rebased."""
@@ -581,26 +706,30 @@ class Pipeline:
             self._persist(self._run.model_copy(update={"merge_approval": None}))
 
     async def _review(self) -> None:
-        reason: str | None = None
-        for _ in range(REVIEWER_ATTEMPTS):
-            done = self._attempts("reviewer")
-            if not self._continues("reviewer") and not self._set_review_aside(done):
-                return
-            diff = self._write_review_diff()
-            if diff is None:
-                return
-            prompt = _reviewer_prompt(self.places, diff, reason, self._take_note())
-            if await self._attempt("reviewer", prompt, resume=False) is None:
+        seeded = self._seeded("reviewer")
+        reason = seeded.reason if seeded else None
+        tried, self._review_tries = self._review_tries, 0
+        for tries in range(tried, REVIEWER_ATTEMPTS):
+            prompt = None
+            if not self._continues("reviewer"):
+                # Not for an attempt that carries on: its run folder must stay as it left it.
+                if not self._set_review_aside(self._attempts("reviewer")):
+                    return
+                diff = self._write_review_diff()
+                if diff is None:
+                    return
+                prompt = _reviewer_prompt(self.places, diff, reason, self._take_note())
+            if await self._attempt("reviewer", prompt, resume=False, review_try=tries + 1) is None:
                 return
             outcome = check_review_file(self.places.run_folder / REVIEW_FILE)
-            if self._gate("reviewer", outcome.event()):
-                if self._commit("reviewer"):
-                    self._take_hooked(await self._hooks.publish(self, self._run), "publish")
-                    if self._run.state == "reviewing":
-                        self._move("awaiting_merge")
-                return
-            if outcome.retry == "builder":
+            if not outcome.passed and outcome.retry == "builder":
+                self.events.append(outcome.event(), role="reviewer")
                 self._send_back(record_findings(self._run, outcome), outcome.reason)
+                return
+            if self._gate(
+                "reviewer", outcome.event(), RetryNote(role="reviewer", reason=outcome.reason)
+            ):
+                await self._pass_stage("reviewer")
                 return
             reason = outcome.reason
         self._needs_you(
@@ -619,8 +748,11 @@ class Pipeline:
         self._persist(run)
 
     def _send_back(self, run: Run, reason: str) -> None:
-        """Important findings: resume the builder with `review.md`, within its cap."""
-        self._persist(run)
+        """Important findings: resume the builder with `review.md`, within its cap. The
+        findings, the reviewer's failed step and the move are saved together, so a restart
+        never counts the findings twice or loses the send-back."""
+        label = Step("reviewer", self._attempts("reviewer"), "failed").label
+        self._run = run.model_copy(update={"last_completed_step": label})
         cap = self._cap("builder")
         if self._attempts("builder") >= cap:
             self._needs_you(
@@ -636,19 +768,50 @@ class Pipeline:
             self._needs_you("reviewer", f"can't read {path} to send to the builder ({err}).")
             return
         self._builder_message = _review_message(path, review)
+        self._save_retry(RetryNote(role="builder", reason=reason, message=self._builder_message))
         self._move("building")
+
+    async def _pass_stage(self, role: Role, *, committed: bool = False) -> None:
+        """After the stage's gate passed: its commit (unless `committed`, already made) and the
+        next state, saved together; the reviewer's stage then publishes."""
+        if not self._commit(role, _NEXT.get(role), made=committed):
+            return
+        if role == "reviewer":
+            await self._publish()
+
+    async def _publish(self) -> None:
+        """Push and open the pull request (`Hooks.publish`), then wait for the merge."""
+        self._take_hooked(await self._hooks.publish(self, self._run), "publish")
+        if self._run.state == "reviewing":
+            self._move("awaiting_merge")
 
     # ------------------------------------------------------------------ one attempt
 
-    async def _attempt(self, role: Role, prompt: str, *, resume: bool) -> Baseline | None:
+    async def _attempt(
+        self,
+        role: Role,
+        prompt: str | None,
+        *,
+        resume: bool,
+        resolving: bool = False,
+        review_try: int = 0,
+    ) -> Baseline | None:
         """One attempt of `role`'s agent, up to and including the post-stage check. Returns the
-        baseline when the check passed; None when the run stopped (it has moved). After
-        `resume_paused`, the first attempt carries on the paused one instead: same attempt
-        number, same session, told to carry on."""
-        paused, self._continuing = self._continuing, None
-        if paused is not None and paused.role != role:
-            paused = None
-        attempt = paused.attempt if paused is not None else self._attempts(role) + 1
+        baseline when the check passed; None when the run stopped (it has moved). `prompt` is
+        None only for an attempt that carries on (`_Carry`), which brings its own.
+
+        After `resume_paused` the first attempt carries on the paused one: same attempt number,
+        same session, told to carry on. After `recover` it carries on the interrupted one: the
+        check against its saved baseline first, then its own session carries on (or, with none
+        yet, it starts again with its saved prompt), keeping the stage's base commit for the
+        checks and the gate; or, when its agent had finished, only what was left of it runs."""
+        carry, self._carry = self._carry, None
+        if carry is not None and carry.role != role:
+            carry = None
+        self._retry = None  # an attempt starts: anything a restart seeded is used or stale
+        if carry is not None and carry.finished is not None and carry.record is not None:
+            return self._finish_interrupted(role, carry.record, carry.finished)
+        attempt = carry.attempt if carry is not None else self._attempts(role) + 1
         self._run = self._run.model_copy(
             update={
                 "stage": role,
@@ -658,30 +821,32 @@ class Pipeline:
         self._save(Step(role, attempt, "started").label)
         places = self.places
         role_settings: RoleSettings = getattr(self.settings.roles, role)
+        record = carry.record if carry is not None else None
+        session_before = self._run.session_ids.get(role)
         try:
-            locked = () if role == "tester" else tuple(load_tester_files(places.run_folder))
-            config_dir = agent_config_dir(
-                places.data, self._run.repo, self._run.id, self._run.slug, role
-            )
-            write_agent_config(
-                config_dir,
-                role=role,
-                settings=self.settings,
-                run_folder=places.run_folder,
-                skills_source=places.skills,
-            )
-            policy = HookPolicy.build(
-                role,
-                self.settings,
-                worktree=places.worktree,
-                run_folder=places.run_folder,
-                locked=locked,
-                read_only=(config_dir / SKILLS_DIR,),
-            )
+            locked, config_dir, policy = self._prepare(role)
+            watch = self._watch(config_dir)
+            if record is not None:
+                # What the interrupted attempt did so far is checked before it carries on.
+                checked = post_stage_check(
+                    self.git,
+                    watch,
+                    record.baseline.restore(),
+                    role=role,
+                    settings=role_settings,
+                    run=self._run,
+                    events=self.events,
+                    registry=self._registry,
+                    locked=locked,
+                )
+                self._run = checked.run
+                if not checked.passed:
+                    return None
+            fresh = record is not None and carry is not None and carry.session is None
             spec = build_spec(
                 role=role,
                 attempt=attempt,
-                prompt=prompt,
+                prompt=prompt or "",
                 run=self._run,
                 settings=self.settings,
                 profile=self._profile,
@@ -691,21 +856,35 @@ class Pipeline:
                 config_dir=config_dir,
                 prompts_dir=places.prompts,
                 hook=make_safety_hook(policy, self.events),
-                resume=resume and paused is None,
+                resume=record.resumed if fresh and record else resume and carry is None,
             )
-            if paused is not None:
-                spec = resume_spec(spec, paused)
-                note, self._continue_note = self._continue_note, None
-                if note:
-                    spec = replace(spec, prompt=f"{spec.prompt}\n\n{note}")
-            watch = Watch.for_stage(
-                repo=places.repo,
-                data=places.data,
-                worktree=places.worktree,
-                run_folder=places.run_folder,
-                config_dir=config_dir,
-            )
+            if carry is not None and carry.pause is not None:
+                spec = resume_spec(spec, carry.pause)
+                if carry.note:
+                    spec = replace(spec, prompt=f"{spec.prompt}\n\n{carry.note}")
+            elif carry is not None:
+                spec = replace(spec, prompt=carry.prompt or "")
+                if carry.session is not None:
+                    spec = replace(spec, resume=carry.session)
+            elif prompt is None:
+                raise PipelineError(f"the {role}'s attempt {attempt} has no prompt (engine bug).")
             baseline = take_baseline(self.git, watch)
+            if record is not None:
+                baseline = replace(baseline, base=record.baseline.base)
+            self._save_recovery(
+                Recovery(
+                    attempt=AttemptRecord(
+                        role=role,
+                        attempt=attempt,
+                        baseline=SavedBaseline.of(baseline),
+                        prompt=record.prompt if record is not None else spec.prompt,
+                        session_before=session_before,
+                        resumed=spec.resume is not None,
+                        resolving=resolving,
+                        review_try=review_try,
+                    )
+                )
+            )
         except FactoryError as err:
             self._needs_you(role, f"the {role}'s attempt {attempt} couldn't start: {err}")
             return None
@@ -742,6 +921,92 @@ class Pipeline:
             return None
         self._save(Step(role, attempt, "checked").label)
         return baseline
+
+    def _prepare(self, role: Role) -> tuple[tuple[str, ...], Path, HookPolicy]:
+        """The files locked from `role`, its agent's config folder (written) and its hook
+        policy. Raises FactoryError when one can't be made."""
+        places = self.places
+        locked = () if role == "tester" else tuple(load_tester_files(places.run_folder))
+        config_dir = agent_config_dir(
+            places.data, self._run.repo, self._run.id, self._run.slug, role
+        )
+        write_agent_config(
+            config_dir,
+            role=role,
+            settings=self.settings,
+            run_folder=places.run_folder,
+            skills_source=places.skills,
+        )
+        policy = HookPolicy.build(
+            role,
+            self.settings,
+            worktree=places.worktree,
+            run_folder=places.run_folder,
+            locked=locked,
+            read_only=(config_dir / SKILLS_DIR,),
+        )
+        return locked, config_dir, policy
+
+    def _watch(self, config_dir: Path) -> Watch:
+        places = self.places
+        return Watch.for_stage(
+            repo=places.repo,
+            data=places.data,
+            worktree=places.worktree,
+            run_folder=places.run_folder,
+            config_dir=config_dir,
+        )
+
+    def _finish_interrupted(
+        self, role: Role, record: AttemptRecord, finished: StepName
+    ) -> Baseline | None:
+        """An interrupted attempt whose agent had finished: after `agent`, the post-stage check
+        against its saved baseline (and that the agent completed its task); after `checked`,
+        nothing more. Returns its baseline for the gate; None when the run stopped."""
+        baseline = record.baseline.restore()
+        if finished != "agent":
+            return baseline
+        try:
+            locked = () if role == "tester" else tuple(load_tester_files(self.places.run_folder))
+            config_dir = agent_config_dir(
+                self.places.data, self._run.repo, self._run.id, self._run.slug, role
+            )
+        except FactoryError as err:
+            self._needs_you(role, f"the {role}'s attempt {record.attempt} can't be checked: {err}")
+            return None
+        checked = post_stage_check(
+            self.git,
+            self._watch(config_dir),
+            baseline,
+            role=role,
+            settings=getattr(self.settings.roles, role),
+            run=self._run,
+            events=self.events,
+            registry=self._registry,
+            locked=locked,
+        )
+        self._run = checked.run
+        if not checked.passed:
+            return None
+        outcome = self._finished_outcome(role, record.attempt)
+        if outcome != "completed":
+            self._needs_you(
+                role,
+                f"the {role}'s agent stopped without finishing its task ({outcome or 'unknown'}).",
+            )
+            return None
+        self._save(Step(role, record.attempt, "checked").label)
+        return baseline
+
+    def _finished_outcome(self, role: Role, attempt: int) -> str | None:
+        """How the agent of `role`'s attempt ended, from its last `stage_finished` event."""
+        outcomes = [
+            event.body.outcome
+            for event in read_events(self.places.run_folder)
+            if isinstance(event.body, StageFinished)
+            and (event.body.stage, event.body.attempt) == (role, attempt)
+        ]
+        return outcomes[-1] if outcomes else None
 
     async def _run_agent(self, spec: AgentSpec) -> "AgentResult | _AgentStop":
         """Run the agent under the watchdog. A usage limit waits for the reset and resumes the
@@ -824,31 +1089,45 @@ class Pipeline:
         self.events.append(NeedsYou(reason=reason), role=role)
         self._persist(run.model_copy(update={"pause": None}))
 
-    def _gate(self, role: Role, result: GateResult) -> bool:
-        """Log the gate's result and save the step; whether it passed."""
+    def _gate(self, role: Role, result: GateResult, retry: RetryNote | None = None) -> bool:
+        """Log the gate's result and save the step; whether it passed. On a fail, `retry` (what
+        the next attempt is told) is saved first, so a restart after the step still tells it."""
         self.events.append(result, role=role)
+        if not result.passed and retry is not None:
+            self._save_retry(retry)
         name: StepName = "passed" if result.passed else "failed"
         self._save(Step(role, self._attempts(role), name).label)
         return result.passed
 
-    def _commit(self, role: Role) -> bool:
-        """The stage's one commit. A failed commit stops the run for you."""
+    def _commit(self, role: Role, target: RunState | None, *, made: bool = False) -> bool:
+        """The stage's one commit (unless `made`), then its step and the move to `target`,
+        saved together. A failed commit stops the run for you."""
         run = self._run
         attempt = self._attempts(role)
-        try:
-            commit_stage(
-                self.git,
-                self.places.worktree,
-                run_id=run.id,
-                slug=run.slug,
-                role=role,
-                attempt=attempt,
-            )
-        except GitError as err:
-            self._needs_you(role, f"the {role}'s stage passed but couldn't be committed: {err}")
-            return False
-        self._save(Step(role, attempt, "committed").label)
+        if not made:
+            try:
+                commit_stage(
+                    self.git,
+                    self.places.worktree,
+                    run_id=run.id,
+                    slug=run.slug,
+                    role=role,
+                    attempt=attempt,
+                )
+            except GitError as err:
+                self._needs_you(role, f"the {role}'s stage passed but couldn't be committed: {err}")
+                return False
+        run = run.model_copy(update={"last_completed_step": Step(role, attempt, "committed").label})
+        self._persist(move(run, target, log=self.events) if target is not None else run)
         return True
+
+    def _save_recovery(self, recovery: Recovery) -> None:
+        save_recovery(self.places.run_folder, recovery)
+
+    def _save_retry(self, retry: RetryNote) -> None:
+        """Save what the next attempt is told in `attempt.json`, next to the last attempt."""
+        saved = load_recovery(self.places.run_folder)
+        self._save_recovery(saved.model_copy(update={"retry": retry}))
 
     # ------------------------------------------------------------------ caps and stops
 
@@ -971,6 +1250,12 @@ def _copy(source: Path, target: Path) -> None:
 
 
 # ------------------------------------------------------------------ prompts
+
+
+def crash_prompt(prompt: str) -> str:
+    """What an interrupted agent is told when its session carries on: what happened, then its
+    attempt's task again, in case the task hadn't reached it."""
+    return f"{CRASH_PROMPT}\n\nThis attempt's task, as you were first told it:\n\n{prompt}"
 
 
 def _with_note(text: str, note: str | None) -> str:
